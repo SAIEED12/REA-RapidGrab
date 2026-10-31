@@ -1,0 +1,24 @@
+mod app;
+
+use eframe::egui;
+use tracing_subscriber::EnvFilter;
+
+fn main() -> eframe::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("rg_core=info,rg_gui=info")))
+        .init();
+
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([900.0, 600.0])
+            .with_min_inner_size([700.0, 400.0])
+            .with_title("RapidGrab"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "RapidGrab",
+        native_options,
+        Box::new(|cc| Ok(Box::new(app::RapidGrabApp::new(cc)))),
+    )
+}
