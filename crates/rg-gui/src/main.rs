@@ -1,4 +1,7 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
+mod icon;
 
 use eframe::egui;
 use tracing_subscriber::EnvFilter;
@@ -12,7 +15,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 600.0])
             .with_min_inner_size([700.0, 400.0])
-            .with_title("RapidGrab"),
+            .with_title("RapidGrab")
+            .with_icon(icon::window_icon()),
         ..Default::default()
     };
 

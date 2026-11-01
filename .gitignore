@@ -1,4 +1,5 @@
 /target
+/dist
 /lab/downloads
 /lab/verify-out
 /lab/*.log

@@ -59,10 +59,11 @@ pub struct RapidGrabApp {
 
     // UI state
     selected_job: Option<usize>,
+    logo: egui::TextureHandle,
 }
 
 impl RapidGrabApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let rt = Arc::new(Runtime::new().expect("Failed to create tokio runtime"));
         let (update_tx, update_rx) = unbounded();
 
@@ -81,6 +82,7 @@ impl RapidGrabApp {
             new_user_agent: String::new(),
             show_add_panel: true,
             selected_job: None,
+            logo: crate::icon::logo_texture(&cc.egui_ctx),
         }
     }
 
@@ -181,6 +183,14 @@ impl eframe::App for RapidGrabApp {
         // Top panel - Add download
         egui::TopBottomPanel::top("add_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                ui.add(
+                    egui::Image::new(egui::load::SizedTexture::new(
+                        self.logo.id(),
+                        egui::vec2(26.0, 26.0),
+                    ))
+                    .rounding(6.0),
+                );
+                ui.add_space(4.0);
                 ui.heading("RapidGrab");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(if self.show_add_panel { "Hide" } else { "Add Download" }).clicked() {
