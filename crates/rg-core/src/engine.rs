@@ -71,6 +71,7 @@ pub struct Download {
     retry_max: Duration,
     expected_sha256: Option<String>,
     on_progress: Option<ProgressFn>,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Download {
@@ -86,6 +87,7 @@ impl Download {
             retry_max: Duration::from_secs(5),
             expected_sha256: None,
             on_progress: None,
+            cancel: None,
         }
     }
 
@@ -128,8 +130,23 @@ impl Download {
         self
     }
 
+    /// Stop the download when `flag` becomes `true`.
+    ///
+    /// Cancelling is cooperative: workers notice the flag between chunks, keep
+    /// the part files and manifest intact (so a later `run()` resumes from the
+    /// exact offsets), and never touch the final output file. `run()` then
+    /// returns [`Error::Cancelled`].
+    pub fn cancel_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(flag);
+        self
+    }
+
     pub async fn run(self) -> Result<Stats> {
         let started = Instant::now();
+        let cancel = self.cancel.clone();
+        if is_cancelled(cancel.as_ref()) {
+            return Err(Error::Cancelled);
+        }
         let expected_sha256 = self.expected_sha256.clone();
         let output_path = self.output.clone();
         let client = reqwest::Client::builder()
@@ -159,12 +176,13 @@ impl Download {
                 &self.user_agent,
                 p.total,
                 self.speed_limit,
+                cancel.clone(),
                 self.on_progress.clone(),
                 started,
             )
             .await?;
             if let Some(expected) = &expected_sha256 {
-                verify_sha256(&output_path, expected).await?;
+                verify_sha256(&output_path, expected, cancel.as_ref()).await?;
             }
             return Ok(stats);
         }
@@ -245,6 +263,7 @@ impl Download {
             finished: AtomicBool::new(false),
             range_unsupported: AtomicBool::new(false),
             on_progress: self.on_progress.clone(),
+            cancel: cancel.clone(),
         });
 
         {
@@ -289,7 +308,7 @@ impl Download {
             handles.push(tokio::spawn(worker(sh.clone())));
         }
 
-        while !sh.all_done().await && !sh.range_unsupported.load(Ordering::Relaxed) {
+        while !sh.all_done().await && !sh.range_unsupported.load(Ordering::Relaxed) && !sh.is_cancelled() {
             sleep(Duration::from_millis(200)).await;
         }
         sh.finished.store(true, Ordering::SeqCst);
@@ -298,6 +317,14 @@ impl Download {
             let _ = h.await;
         }
         progress_task.abort();
+
+        if sh.is_cancelled() {
+            info!("download cancelled; {} part file(s) kept for resume", {
+                let st = sh.state.lock().await;
+                st.segments.len()
+            });
+            return Err(Error::Cancelled);
+        }
 
         if sh.range_unsupported.load(Ordering::Relaxed) {
             warn!("server ignored Range after probe; falling back to a single stream");
@@ -309,12 +336,13 @@ impl Download {
                 &sh.user_agent,
                 sh.total,
                 self.speed_limit,
+                cancel.clone(),
                 sh.on_progress.clone(),
                 started,
             )
             .await?;
             if let Some(expected) = &expected_sha256 {
-                verify_sha256(&output_path, expected).await?;
+                verify_sha256(&output_path, expected, cancel.as_ref()).await?;
             }
             return Ok(stats);
         }
@@ -325,7 +353,7 @@ impl Download {
         };
         merge(&sh).await?;
         if let Some(expected) = &expected_sha256 {
-            verify_sha256(&output_path, expected).await?;
+            verify_sha256(&output_path, expected, cancel.as_ref()).await?;
         }
 
         Ok(Stats {
@@ -362,9 +390,18 @@ struct Shared {
     finished: AtomicBool,
     range_unsupported: AtomicBool,
     on_progress: Option<ProgressFn>,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+fn is_cancelled(flag: Option<&Arc<AtomicBool>>) -> bool {
+    flag.is_some_and(|f| f.load(Ordering::Relaxed))
 }
 
 impl Shared {
+    fn is_cancelled(&self) -> bool {
+        is_cancelled(self.cancel.as_ref())
+    }
+
     fn part_path(&self, id: u32) -> PathBuf {
         self.parts_dir.join(format!("part_{id:04}"))
     }
@@ -484,7 +521,7 @@ fn split_largest(st: &mut SegState) -> bool {
 
 async fn worker(sh: Arc<Shared>) {
     loop {
-        if sh.finished.load(Ordering::Relaxed) {
+        if sh.finished.load(Ordering::Relaxed) || sh.is_cancelled() {
             return;
         }
         match sh.claim().await {
@@ -515,6 +552,9 @@ async fn download_segment(sh: Arc<Shared>, id: u32) -> Result<()> {
         if sh.finished.load(Ordering::Relaxed) {
             return Ok(());
         }
+        if sh.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         let Some((start, pos, end)) = sh.segment_bounds(id).await else {
             return Ok(());
         };
@@ -528,6 +568,7 @@ async fn download_segment(sh: Arc<Shared>, id: u32) -> Result<()> {
                 attempt = 0;
             }
             Err(Error::RemoteChanged) => return Err(Error::RemoteChanged),
+            Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(e) => {
                 attempt = attempt.saturating_add(1);
                 let mult = 1u32 << attempt.min(5);
@@ -575,6 +616,12 @@ async fn stream_range(sh: &Arc<Shared>, id: u32, seg_start: u64, mut pos: u64, e
     let mut stream = resp.bytes_stream();
     let mut last_persist = Instant::now();
     while let Some(item) = stream.next().await {
+        if sh.is_cancelled() {
+            file.flush().await?;
+            let st = sh.state.lock().await;
+            sh.persist(&st).await;
+            return Err(Error::Cancelled);
+        }
         let chunk = item?;
         let Some((_, _, cur_end)) = sh.segment_bounds(id).await else {
             break;
@@ -614,6 +661,9 @@ async fn merge(sh: &Arc<Shared>) -> Result<()> {
 
     let mut out = File::create(&sh.output).await?;
     for s in &segments {
+        if sh.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         let part_path = sh.part_path(s.id);
         let md = fs::metadata(&part_path).await?;
         let expected = s.end - s.start + 1;
@@ -655,6 +705,7 @@ async fn single_stream(
     user_agent: &str,
     total_hint: u64,
     speed_limit: Option<u64>,
+    cancel: Option<Arc<AtomicBool>>,
     on_progress: Option<ProgressFn>,
     started: Instant,
 ) -> Result<Stats> {
@@ -685,6 +736,10 @@ async fn single_stream(
     let mut last_bytes: u64 = 0;
 
     while let Some(item) = stream.next().await {
+        if is_cancelled(cancel.as_ref()) {
+            f.flush().await?;
+            return Err(Error::Cancelled);
+        }
         let chunk = item?;
         f.write_all(&chunk).await?;
         done += chunk.len() as u64;
@@ -720,11 +775,18 @@ async fn single_stream(
 
 /// Stream the finished file through SHA-256 and compare with the expected hex
 /// digest. Deliberate improvement over IDM, which never validates content.
-async fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
+async fn verify_sha256(
+    path: &Path,
+    expected: &str,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<()> {
     let mut file = File::open(path).await?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
+        if is_cancelled(cancel) {
+            return Err(Error::Cancelled);
+        }
         let n = file.read(&mut buf).await?;
         if n == 0 {
             break;

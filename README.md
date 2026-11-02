@@ -54,6 +54,9 @@ every completed download was verified byte-for-byte.
 ```
 crates/rg-core   engine: probe, scheduler, segment store, limiter, merge
 crates/rg-cli    rapidgrab: get / status
+crates/rg-gui    rapidgrab-gui: desktop app (egui/eframe)
+assets/          logo.svg (vector), logo.png (512 master), logo.ico, app.rc
+tools/           make-ico.ps1 (rebuild .ico), build-dist.ps1 (release bundle)
 ```
 
 * **Probe** — `HEAD`, falling back to `GET Range: bytes=0-0`; records size,
@@ -78,6 +81,10 @@ crates/rg-cli    rapidgrab: get / status
   per connection, always continuing from the last persisted offset. (IDM
   retries instantly and can hammer a failing host; backoff is a safety choice.)
 * **Limiter** — global token budget shared by all workers.
+* **Cancellation** — `Download::cancel_flag(Arc<AtomicBool>)` makes the engine
+  stop cooperatively between chunks. Part files and the manifest are kept, the
+  final output is never touched, and a later run resumes from the exact offsets.
+  `run()` returns `Error::Cancelled`.
 * **Merge** — part files are concatenated in start order, size-checked, fsynced,
   then the parts directory is removed. The final file only appears on success.
 * **Verification** — optional `--sha256 <hex>` streams the finished file through
@@ -89,6 +96,27 @@ crates/rg-cli    rapidgrab: get / status
   to `<output>.rgtmp`, then atomic rename.
 
 ## 4. Usage
+
+### Desktop app
+
+Double-click `dist\RapidGrab.exe` (or the Desktop shortcut created by
+`tools\build-dist.ps1`). No console window appears: the binary is built with
+`windows_subsystem = "windows"` and ships the RapidGrab icon.
+
+* **Add Download** — URL, save-as (with `Browse…`), connections, speed cap,
+  optional SHA-256 and User-Agent; the output path is suggested from the URL
+  into the last-used folder.
+* **Queue** — `Run at once` caps how many downloads are active; the rest wait as
+  `Queued` and start in id order.
+* **Per job** — Pause / Resume, Cancel, Retry, Remove, Open File, Open Folder.
+  Pausing keeps the resumable parts; Remove on a running job stops it first and
+  only then drops the card.
+* **Progress** — per job: bytes/total, percentage, speed, connections, elapsed
+  and ETA.
+* Settings (concurrency, defaults, last folder) and window geometry persist
+  across restarts.
+
+### CLI
 
 ```powershell
 cargo build --release

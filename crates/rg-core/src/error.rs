@@ -16,6 +16,9 @@ pub enum Error {
     RemoteChanged,
     #[error("cannot resume: {0}")]
     NotResumable(String),
+    /// The caller asked the download to stop; partial state is kept for resume.
+    #[error("download cancelled")]
+    Cancelled,
     #[error("{0}")]
     Other(String),
 }
