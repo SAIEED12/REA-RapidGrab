@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 rg-core = { path = "../rg-core" }
+rg-resolve = { path = "../rg-resolve" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
