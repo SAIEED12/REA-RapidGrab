@@ -1,5 +1,6 @@
 use reqwest::header::{
-    ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE, USER_AGENT,
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE,
+    USER_AGENT,
 };
 use reqwest::StatusCode;
 
@@ -14,6 +15,7 @@ pub struct Probe {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub content_type: Option<String>,
+    pub content_disposition: Option<String>,
 }
 
 fn header_str(resp: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<String> {
@@ -63,6 +65,7 @@ pub async fn probe(client: &reqwest::Client, url: &str, user_agent: &str) -> Res
                             etag: header_str(&resp, ETAG),
                             last_modified: header_str(&resp, LAST_MODIFIED),
                             content_type: header_str(&resp, reqwest::header::CONTENT_TYPE),
+                            content_disposition: header_str(&resp, CONTENT_DISPOSITION),
                         });
                     }
                 }
@@ -73,6 +76,7 @@ pub async fn probe(client: &reqwest::Client, url: &str, user_agent: &str) -> Res
                     etag: header_str(&resp, ETAG),
                     last_modified: header_str(&resp, LAST_MODIFIED),
                     content_type: header_str(&resp, reqwest::header::CONTENT_TYPE),
+                    content_disposition: header_str(&resp, CONTENT_DISPOSITION),
                 });
             }
         }
@@ -115,5 +119,6 @@ pub async fn probe(client: &reqwest::Client, url: &str, user_agent: &str) -> Res
         etag: header_str(&resp, ETAG),
         last_modified: header_str(&resp, LAST_MODIFIED),
         content_type: header_str(&resp, reqwest::header::CONTENT_TYPE),
+        content_disposition: header_str(&resp, CONTENT_DISPOSITION),
     })
 }

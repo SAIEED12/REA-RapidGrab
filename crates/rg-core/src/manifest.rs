@@ -43,6 +43,10 @@ pub struct Manifest {
     pub last_modified: Option<String>,
     pub connections: usize,
     pub segments: Vec<Segment>,
+    /// Stable identity used for resume when the request URL is signed and
+    /// changes on every re-resolve (e.g. YouTube's `googlevideo.com` URLs).
+    #[serde(default)]
+    pub resume_key: Option<String>,
 }
 
 impl Manifest {
@@ -84,6 +88,7 @@ mod tests {
                 done: false,
                 claimed: true,
             }],
+            resume_key: Some("page|format".to_string()),
         };
 
         let encoded = serde_json::to_vec(&manifest).expect("manifest serializes");
@@ -91,6 +96,7 @@ mod tests {
         assert_eq!(decoded.version, MANIFEST_VERSION);
         assert_eq!(decoded.segments[0].pos, 625_000);
         assert_eq!(decoded.segments[0].remaining(), 375_000);
+        assert_eq!(decoded.resume_key.as_deref(), Some("page|format"));
         // Runtime claims must not leak into persisted resume state.
         assert!(!decoded.segments[0].claimed);
     }

@@ -4,7 +4,7 @@
 //! that a cancel lands mid-transfer.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rg_core::{parts_dir_for, Download, Error};
@@ -36,11 +36,12 @@ fn parse_range(request: &str) -> Option<(u64, u64)> {
     None
 }
 
-async fn serve(listener: TcpListener) {
+async fn serve(listener: TcpListener, ranges: Arc<Mutex<Vec<u64>>>) {
     loop {
         let Ok((mut sock, _)) = listener.accept().await else {
             return;
         };
+        let ranges = ranges.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
             let mut request = Vec::new();
@@ -67,6 +68,7 @@ async fn serve(listener: TcpListener) {
             }
 
             let (start, end) = parse_range(&request).unwrap_or((0, TOTAL - 1));
+            ranges.lock().expect("ranges lock").push(start);
             let len = end.saturating_sub(start) + 1;
             let header = if start == 0 && end == TOTAL - 1 && parse_range(&request).is_none() {
                 format!(
@@ -97,10 +99,15 @@ async fn serve(listener: TcpListener) {
 }
 
 async fn start_server() -> String {
+    start_server_logged().await.0
+}
+
+async fn start_server_logged() -> (String, Arc<Mutex<Vec<u64>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
-    tokio::spawn(serve(listener));
-    format!("http://{addr}/file.bin")
+    let ranges = Arc::new(Mutex::new(Vec::new()));
+    tokio::spawn(serve(listener, ranges.clone()));
+    (format!("http://{addr}/file.bin"), ranges)
 }
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -182,6 +189,54 @@ async fn resume_after_cancel_is_byte_exact() {
 
     let data = tokio::fs::read(&out).await.expect("read output");
     assert_eq!(data.len() as u64, TOTAL, "wrong final size");
+    for (i, byte) in data.iter().enumerate() {
+        assert_eq!(*byte, body_byte(i as u64), "byte {i} differs");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn resume_key_survives_a_changed_signed_url() {
+    let (base, ranges) = start_server_logged().await;
+    let dir = temp_dir("resume-key");
+    let out = dir.join("file.bin");
+    let key = "page|video|137";
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let first = Download::new(format!("{base}?sig=one"), out.clone())
+        .connections(4)
+        .resume_key(key)
+        .cancel_flag(flag.clone());
+    let handle = tokio::spawn(async move { first.run().await });
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    flag.store(true, Ordering::Relaxed);
+    let cancelled = tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("cancel timed out")
+        .expect("task panicked");
+    assert!(matches!(cancelled, Err(Error::Cancelled)));
+    assert!(parts_dir_for(&out).exists(), "parts must survive the cancel");
+
+    ranges.lock().expect("ranges lock").clear();
+
+    let stats = Download::new(format!("{base}?sig=two"), out.clone())
+        .connections(4)
+        .resume_key(key)
+        .run()
+        .await
+        .expect("resume with a new signed URL failed");
+    assert_eq!(stats.total, TOTAL);
+
+    let starts = ranges.lock().expect("ranges lock").clone();
+    assert!(
+        starts.iter().any(|&start| start > 0),
+        "new signed URL restarted from zero instead of resuming: {starts:?}"
+    );
+
+    let data = tokio::fs::read(&out).await.expect("read output");
+    assert_eq!(data.len() as u64, TOTAL);
     for (i, byte) in data.iter().enumerate() {
         assert_eq!(*byte, body_byte(i as u64), "byte {i} differs");
     }

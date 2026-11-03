@@ -4,8 +4,13 @@ pub mod engine;
 pub mod error;
 pub mod limiter;
 pub mod manifest;
+pub mod naming;
 pub mod probe;
 
 pub use engine::{Download, Progress, Stats, DEFAULT_CONNECTIONS, DEFAULT_USER_AGENT};
 pub use error::{Error, Result};
 pub use manifest::{parts_dir_for, Manifest, Segment};
+pub use naming::{
+    extension_for_content_type, filename_from_content_disposition, infer_output_path, is_web_page,
+    sanitize_filename,
+};

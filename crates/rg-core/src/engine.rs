@@ -47,6 +47,8 @@ pub struct Progress {
     pub total: u64,
     pub speed_bps: f64,
     pub connections: usize,
+    /// Path the engine is actually writing to (it may refine `download.bin`).
+    pub output: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +57,8 @@ pub struct Stats {
     pub elapsed: Duration,
     pub segments: usize,
     pub ranged: bool,
+    /// Final path written; inferred extensions can differ from the requested path.
+    pub output: PathBuf,
 }
 
 pub type ProgressFn = Arc<dyn Fn(Progress) + Send + Sync>;
@@ -66,12 +70,15 @@ pub struct Download {
     connections: usize,
     speed_limit: Option<u64>,
     user_agent: String,
+    referer: Option<String>,
+    resume_key: Option<String>,
     resume: bool,
     retry_base: Duration,
     retry_max: Duration,
     expected_sha256: Option<String>,
     on_progress: Option<ProgressFn>,
     cancel: Option<Arc<AtomicBool>>,
+    allow_html: bool,
 }
 
 impl Download {
@@ -82,12 +89,15 @@ impl Download {
             connections: DEFAULT_CONNECTIONS,
             speed_limit: None,
             user_agent: DEFAULT_USER_AGENT.to_string(),
+            referer: None,
+            resume_key: None,
             resume: true,
             retry_base: Duration::from_millis(100),
             retry_max: Duration::from_secs(5),
             expected_sha256: None,
             on_progress: None,
             cancel: None,
+            allow_html: false,
         }
     }
 
@@ -103,6 +113,19 @@ impl Download {
 
     pub fn user_agent(mut self, ua: impl Into<String>) -> Self {
         self.user_agent = ua.into();
+        self
+    }
+
+    /// Override the `Referer` header; by default it is derived from the URL.
+    pub fn referer(mut self, referer: impl Into<String>) -> Self {
+        self.referer = Some(referer.into());
+        self
+    }
+
+    /// Stable resume identity when the request URL is signed and changes
+    /// between runs (for example YouTube media URLs).
+    pub fn resume_key(mut self, key: impl Into<String>) -> Self {
+        self.resume_key = Some(key.into());
         self
     }
 
@@ -141,6 +164,16 @@ impl Download {
         self
     }
 
+    /// Save HTML responses instead of rejecting them as web pages.
+    ///
+    /// By default a `text/html` response is refused with [`Error::WebPage`]:
+    /// URL-based downloaders are often pointed at pages (YouTube's `/watch`,
+    /// for example) where saving the HTML is never what the user wanted.
+    pub fn allow_html(mut self, yes: bool) -> Self {
+        self.allow_html = yes;
+        self
+    }
+
     pub async fn run(self) -> Result<Stats> {
         let started = Instant::now();
         let cancel = self.cancel.clone();
@@ -148,7 +181,6 @@ impl Download {
             return Err(Error::Cancelled);
         }
         let expected_sha256 = self.expected_sha256.clone();
-        let output_path = self.output.clone();
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(20))
             .pool_max_idle_per_host(self.connections)
@@ -156,11 +188,39 @@ impl Download {
 
         let p = probe::probe(&client, &self.url, &self.user_agent).await?;
         info!(
-            "probe: size={} ranges={} etag={:?}",
-            p.total, p.accept_ranges, p.etag
+            "probe: size={} ranges={} etag={:?} type={:?}",
+            p.total, p.accept_ranges, p.etag, p.content_type
         );
 
-        if let Some(parent) = self.output.parent() {
+        if !self.allow_html {
+            if let Some(content_type) = p.content_type.as_deref() {
+                if crate::naming::is_web_page(content_type) {
+                    return Err(Error::WebPage {
+                        content_type: content_type.to_string(),
+                        url: p.final_url.clone(),
+                    });
+                }
+            }
+        }
+
+        let output = crate::naming::infer_output_path(
+            &self.output,
+            p.content_type.as_deref(),
+            p.content_disposition.as_deref(),
+        );
+        if output != self.output {
+            info!(
+                "saving to {} (inferred from the response; requested {})",
+                output.display(),
+                self.output.display()
+            );
+        }
+        let referer = self
+            .referer
+            .clone()
+            .or_else(|| referer_for(&p.final_url));
+
+        if let Some(parent) = output.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).await?;
             }
@@ -172,8 +232,9 @@ impl Download {
             let stats = single_stream(
                 &client,
                 &p.final_url,
-                &self.output,
+                &output,
                 &self.user_agent,
+                referer.as_deref(),
                 p.total,
                 self.speed_limit,
                 cancel.clone(),
@@ -182,12 +243,12 @@ impl Download {
             )
             .await?;
             if let Some(expected) = &expected_sha256 {
-                verify_sha256(&output_path, expected, cancel.as_ref()).await?;
+                verify_sha256(&output, expected, cancel.as_ref()).await?;
             }
             return Ok(stats);
         }
 
-        let parts_dir = parts_dir_for(&self.output);
+        let parts_dir = parts_dir_for(&output);
         fs::create_dir_all(&parts_dir).await?;
         let manifest_path = parts_dir.join("manifest.json");
 
@@ -196,7 +257,11 @@ impl Download {
 
         if self.resume {
             if let Some(m) = Manifest::load(&manifest_path)? {
-                if m.url == p.final_url && m.total == p.total && !m.segments.is_empty() {
+                let same_identity = match (&m.resume_key, &self.resume_key) {
+                    (Some(old), Some(new)) => old == new,
+                    _ => m.url == p.final_url,
+                };
+                if same_identity && m.total == p.total && !m.segments.is_empty() {
                     if let (Some(old), Some(new)) = (&m.etag, &p.etag) {
                         if old != new {
                             return Err(Error::RemoteChanged);
@@ -246,12 +311,13 @@ impl Download {
         let sh = Arc::new(Shared {
             client,
             url: p.final_url.clone(),
-            referer: referer_for(&p.final_url),
+            referer,
             total: p.total,
             etag: p.etag.clone(),
             last_modified: p.last_modified.clone(),
+            resume_key: self.resume_key.clone(),
             user_agent: self.user_agent.clone(),
-            output: self.output.clone(),
+            output: output.clone(),
             parts_dir: parts_dir.clone(),
             connections: self.connections,
             retry_base: self.retry_base,
@@ -295,6 +361,7 @@ impl Download {
                             total: sh.total,
                             speed_bps: speed,
                             connections: sh.connections,
+                            output: sh.output.clone(),
                         });
                     }
                     let st = sh.state.lock().await;
@@ -334,6 +401,7 @@ impl Download {
                 &sh.url,
                 &sh.output,
                 &sh.user_agent,
+                sh.referer.as_deref(),
                 sh.total,
                 self.speed_limit,
                 cancel.clone(),
@@ -342,7 +410,7 @@ impl Download {
             )
             .await?;
             if let Some(expected) = &expected_sha256 {
-                verify_sha256(&output_path, expected, cancel.as_ref()).await?;
+                verify_sha256(&output, expected, cancel.as_ref()).await?;
             }
             return Ok(stats);
         }
@@ -353,7 +421,7 @@ impl Download {
         };
         merge(&sh).await?;
         if let Some(expected) = &expected_sha256 {
-            verify_sha256(&output_path, expected, cancel.as_ref()).await?;
+            verify_sha256(&output, expected, cancel.as_ref()).await?;
         }
 
         Ok(Stats {
@@ -361,6 +429,7 @@ impl Download {
             elapsed: started.elapsed(),
             segments,
             ranged: true,
+            output,
         })
     }
 }
@@ -377,6 +446,7 @@ struct Shared {
     total: u64,
     etag: Option<String>,
     last_modified: Option<String>,
+    resume_key: Option<String>,
     user_agent: String,
     output: PathBuf,
     parts_dir: PathBuf,
@@ -416,6 +486,7 @@ impl Shared {
             last_modified: self.last_modified.clone(),
             connections: self.connections,
             segments: st.segments.clone(),
+            resume_key: self.resume_key.clone(),
         };
         if let Ok(json) = serde_json::to_vec_pretty(&m) {
             let tmp = self.parts_dir.join("manifest.json.tmp");
@@ -703,6 +774,7 @@ async fn single_stream(
     url: &str,
     output: &Path,
     user_agent: &str,
+    referer: Option<&str>,
     total_hint: u64,
     speed_limit: Option<u64>,
     cancel: Option<Arc<AtomicBool>>,
@@ -712,9 +784,12 @@ async fn single_stream(
     let resp = client
         .get(url)
         .header(USER_AGENT, user_agent)
-        .header(ACCEPT_ENCODING, "identity")
-        .send()
-        .await?;
+        .header(ACCEPT_ENCODING, "identity");
+    let resp = match referer {
+        Some(referer) => resp.header(REFERER, referer),
+        None => resp,
+    };
+    let resp = resp.send().await?;
     if !resp.status().is_success() {
         return Err(Error::BadStatus(resp.status().as_u16()));
     }
@@ -754,6 +829,7 @@ async fn single_stream(
                     total,
                     speed_bps: done.saturating_sub(last_bytes) as f64 / dt,
                     connections: 1,
+                    output: output.to_path_buf(),
                 });
                 last_t = Instant::now();
                 last_bytes = done;
@@ -770,6 +846,7 @@ async fn single_stream(
         elapsed: started.elapsed(),
         segments: 1,
         ranged: false,
+        output: output.to_path_buf(),
     })
 }
 
