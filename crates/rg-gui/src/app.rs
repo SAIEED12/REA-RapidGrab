@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
 use rg_core::{Download, Progress};
+use rg_resolve::{MediaEvent, MediaProgress, MediaRequest, MediaStage, Tools};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -21,6 +22,8 @@ pub enum JobStatus {
     Queued,
     Starting,
     Downloading,
+    Resolving,
+    Merging,
     Pausing,
     Paused,
     Completed,
@@ -31,7 +34,10 @@ pub enum JobStatus {
 impl JobStatus {
     /// A job that owns a running tokio task.
     fn is_active(&self) -> bool {
-        matches!(self, Self::Starting | Self::Downloading | Self::Pausing)
+        matches!(
+            self,
+            Self::Starting | Self::Downloading | Self::Resolving | Self::Merging | Self::Pausing
+        )
     }
 
     fn is_terminal(&self) -> bool {
@@ -43,6 +49,8 @@ impl JobStatus {
             Self::Queued => "Queued",
             Self::Starting => "Starting…",
             Self::Downloading => "Downloading",
+            Self::Resolving => "Resolving…",
+            Self::Merging => "Merging…",
             Self::Pausing => "Pausing…",
             Self::Paused => "Paused",
             Self::Completed => "Completed",
@@ -66,6 +74,10 @@ pub struct DownloadUpdate {
     pub progress: Option<Progress>,
     pub status: JobStatus,
     pub error: Option<String>,
+    /// Effective output path, when it differs from the requested one.
+    pub output: Option<PathBuf>,
+    /// Combined resolver progress, when the job fell back to yt-dlp.
+    pub media: Option<MediaProgress>,
 }
 
 pub struct DownloadJob {
@@ -80,6 +92,7 @@ pub struct DownloadJob {
     pub restart: bool,
     pub status: JobStatus,
     pub progress: Option<Progress>,
+    pub media: Option<MediaProgress>,
     pub error: Option<String>,
     pub started_at: Option<Instant>,
     /// Accumulated run time of finished/previous runs (pauses).
@@ -105,6 +118,7 @@ struct JobView {
     speed_limit: Option<u64>,
     status: JobStatus,
     progress: Option<Progress>,
+    media: Option<MediaProgress>,
     error: Option<String>,
     elapsed: Duration,
 }
@@ -116,6 +130,24 @@ struct Settings {
     limit_kbps: String,
     user_agent: String,
     last_dir: String,
+    #[serde(default = "default_auto_resolve")]
+    auto_resolve: bool,
+    #[serde(default = "default_max_height")]
+    max_height: u32,
+    #[serde(default)]
+    yt_dlp_path: String,
+    #[serde(default)]
+    ffmpeg_path: String,
+    #[serde(default)]
+    yt_dlp_args: String,
+}
+
+fn default_auto_resolve() -> bool {
+    true
+}
+
+fn default_max_height() -> u32 {
+    rg_resolve::DEFAULT_MAX_HEIGHT
 }
 
 impl Default for Settings {
@@ -128,6 +160,11 @@ impl Default for Settings {
             last_dir: dirs::download_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
+            auto_resolve: default_auto_resolve(),
+            max_height: default_max_height(),
+            yt_dlp_path: String::new(),
+            ffmpeg_path: String::new(),
+            yt_dlp_args: String::new(),
         }
     }
 }
@@ -253,6 +290,7 @@ impl RapidGrabApp {
                 restart: self.new_restart,
                 status: JobStatus::Queued,
                 progress: None,
+                media: None,
                 error: None,
                 started_at: None,
                 elapsed: Duration::ZERO,
@@ -277,12 +315,24 @@ impl RapidGrabApp {
         let cancel = Arc::new(AtomicBool::new(false));
         let tx = self.update_tx.clone();
 
+        let auto_resolve = self.settings.auto_resolve;
+        let max_height = (self.settings.max_height > 0).then_some(self.settings.max_height);
+        let yt_dlp_path = non_empty(&self.settings.yt_dlp_path).map(PathBuf::from);
+        let ffmpeg_path = non_empty(&self.settings.ffmpeg_path).map(PathBuf::from);
+        let yt_dlp_args: Vec<String> = self
+            .settings
+            .yt_dlp_args
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+
         let Some(params) = self.jobs.get_mut(&id).map(|job| {
             job.run += 1;
             job.cancel = cancel.clone();
             job.status = JobStatus::Starting;
             job.error = None;
             job.progress = None;
+            job.media = None;
             job.intent = None;
             job.remove_after_stop = false;
             job.started_at = Some(Instant::now());
@@ -304,20 +354,26 @@ impl RapidGrabApp {
         let task_cancel = cancel.clone();
 
         let handle = self.rt.spawn(async move {
-            let send = |progress: Option<Progress>, status: JobStatus, error: Option<String>| {
+            let send = |progress: Option<Progress>,
+                        status: JobStatus,
+                        error: Option<String>,
+                        output: Option<PathBuf>,
+                        media: Option<MediaProgress>| {
                 let _ = tx.send(DownloadUpdate {
                     id,
                     run,
                     progress,
                     status,
                     error,
+                    output,
+                    media,
                 });
             };
 
-            let mut dl = Download::new(url, output)
+            let mut dl = Download::new(url.clone(), output.clone())
                 .connections(connections)
                 .resume(!restart)
-                .cancel_flag(task_cancel);
+                .cancel_flag(task_cancel.clone());
 
             if let Some(limit) = speed_limit {
                 dl = dl.speed_limit(limit);
@@ -331,19 +387,95 @@ impl RapidGrabApp {
 
             let tx2 = tx.clone();
             dl = dl.on_progress(move |p: Progress| {
+                let output = p.output.clone();
                 let _ = tx2.send(DownloadUpdate {
                     id,
                     run,
                     progress: Some(p),
                     status: JobStatus::Downloading,
                     error: None,
+                    output: Some(output),
+                    media: None,
                 });
             });
 
             match dl.run().await {
-                Ok(_) => send(None, JobStatus::Completed, None),
-                Err(rg_core::Error::Cancelled) => send(None, JobStatus::Cancelled, None),
-                Err(e) => send(None, JobStatus::Failed, Some(e.to_string())),
+                Ok(stats) => {
+                    send(None, JobStatus::Completed, None, Some(stats.output), None);
+                }
+                Err(rg_core::Error::Cancelled) => {
+                    send(None, JobStatus::Cancelled, None, None, None);
+                }
+                Err(rg_core::Error::WebPage { .. }) if auto_resolve => {
+                    send(None, JobStatus::Resolving, None, None, None);
+                    let tools = match Tools::resolve_paths(yt_dlp_path, ffmpeg_path) {
+                        Ok(tools) => tools,
+                        Err(error) => {
+                            send(None, JobStatus::Failed, Some(error.to_string()), None, None);
+                            return;
+                        }
+                    };
+
+                    let mut request = MediaRequest::new(url, output)
+                        .connections(connections)
+                        .restart(restart)
+                        .extra_args(yt_dlp_args);
+                    if let Some(limit) = speed_limit {
+                        request = request.speed_limit(limit);
+                    }
+                    if let Some(height) = max_height {
+                        request = request.max_height(height);
+                    }
+                    request = request.cancel_flag(task_cancel);
+
+                    let tx_media = tx.clone();
+                    let callback = move |event: MediaEvent| {
+                        let (status, progress, output, media) = match event {
+                            MediaEvent::Resolving => {
+                                (JobStatus::Resolving, None, None, None)
+                            }
+                            MediaEvent::Resolved { output, .. } => {
+                                (JobStatus::Resolving, None, Some(output), None)
+                            }
+                            MediaEvent::Progress(progress) => {
+                                let status = if progress.stage == MediaStage::Merging {
+                                    JobStatus::Merging
+                                } else {
+                                    JobStatus::Downloading
+                                };
+                                (status, None, None, Some(progress))
+                            }
+                            MediaEvent::Merging => (JobStatus::Merging, None, None, None),
+                            MediaEvent::Done { output, .. } => {
+                                (JobStatus::Merging, None, Some(output), None)
+                            }
+                        };
+                        let _ = tx_media.send(DownloadUpdate {
+                            id,
+                            run,
+                            progress,
+                            status,
+                            error: None,
+                            output,
+                            media,
+                        });
+                    };
+
+                    match rg_resolve::download_media(&tools, request, callback).await {
+                        Ok(path) => {
+                            send(None, JobStatus::Completed, None, Some(path), None);
+                        }
+                        Err(error) if error.is_cancelled() => {
+                            send(None, JobStatus::Cancelled, None, None, None);
+                        }
+                        Err(error) => {
+                            send(None, JobStatus::Failed, Some(error.to_string()), None, None);
+                        }
+                    }
+                }
+                Err(e) => {
+                    send(None, JobStatus::Failed, Some(e.to_string()), None, None);
+                }
             }
         });
 
@@ -365,7 +497,11 @@ impl RapidGrabApp {
     fn stop_job(&mut self, id: usize) {
         if let Some(job) = self.jobs.get_mut(&id) {
             match job.status {
-                JobStatus::Starting | JobStatus::Downloading | JobStatus::Pausing => {
+                JobStatus::Starting
+                | JobStatus::Downloading
+                | JobStatus::Resolving
+                | JobStatus::Merging
+                | JobStatus::Pausing => {
                     job.intent = Some(CancelIntent::Stop);
                     job.status = JobStatus::Pausing;
                     job.cancel.store(true, Ordering::Relaxed);
@@ -454,21 +590,29 @@ impl RapidGrabApp {
         if job.run != update.run {
             return; // stale update from a previous run
         }
+        if let Some(output) = update.output.clone() {
+            job.output = output;
+        }
 
         match update.status {
-            JobStatus::Starting | JobStatus::Downloading => {
+            JobStatus::Starting
+            | JobStatus::Downloading
+            | JobStatus::Resolving
+            | JobStatus::Merging => {
                 if job.status != JobStatus::Pausing {
                     job.status = update.status;
                 }
                 if let Some(p) = update.progress {
                     job.progress = Some(p);
                 }
+                job.media = update.media;
             }
             JobStatus::Cancelled => {
                 if let Some(started) = job.started_at.take() {
                     job.elapsed += started.elapsed();
                 }
                 job.progress = None;
+                job.media = None;
                 let intent = job.intent.take();
                 job.status = match intent {
                     Some(CancelIntent::Pause) => JobStatus::Paused,
@@ -483,6 +627,7 @@ impl RapidGrabApp {
                     job.elapsed += started.elapsed();
                 }
                 job.progress = None;
+                job.media = None;
                 job.status = JobStatus::Completed;
                 job.error = None;
             }
@@ -491,6 +636,7 @@ impl RapidGrabApp {
                     job.elapsed += started.elapsed();
                 }
                 job.progress = None;
+                job.media = None;
                 job.status = JobStatus::Failed;
                 job.error = update.error;
             }
@@ -547,6 +693,7 @@ impl RapidGrabApp {
                 speed_limit: j.speed_limit,
                 status: j.status.clone(),
                 progress: j.progress.clone(),
+                media: j.media.clone(),
                 error: j.error.clone(),
                 elapsed: j.total_elapsed(),
             })
@@ -564,6 +711,11 @@ impl eframe::App for RapidGrabApp {
             limit_kbps: self.new_limit_kbps.clone(),
             user_agent: self.new_user_agent.clone(),
             last_dir: self.settings.last_dir.clone(),
+            auto_resolve: self.settings.auto_resolve,
+            max_height: self.settings.max_height,
+            yt_dlp_path: self.settings.yt_dlp_path.clone(),
+            ffmpeg_path: self.settings.ffmpeg_path.clone(),
+            yt_dlp_args: self.settings.yt_dlp_args.clone(),
         };
         eframe::set_value(storage, SETTINGS_KEY, &settings);
     }
@@ -661,6 +813,55 @@ impl eframe::App for RapidGrabApp {
                         ui.end_row();
                     });
 
+                egui::CollapsingHeader::new("Media resolver (YouTube and other video pages)")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.checkbox(
+                            &mut self.settings.auto_resolve,
+                            "Resolve media pages automatically with yt-dlp",
+                        );
+                        egui::Grid::new("resolver_grid")
+                            .num_columns(2)
+                            .spacing([10.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label("Max video height:");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.settings.max_height)
+                                            .speed(10.0)
+                                            .range(0..=4320)
+                                            .suffix("p"),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("0 = best available")
+                                            .small()
+                                            .weak(),
+                                    );
+                                });
+                                ui.end_row();
+
+                                ui.label("yt-dlp path:");
+                                ui.text_edit_singleline(&mut self.settings.yt_dlp_path);
+                                ui.end_row();
+
+                                ui.label("ffmpeg path:");
+                                ui.text_edit_singleline(&mut self.settings.ffmpeg_path);
+                                ui.end_row();
+
+                                ui.label("Extra yt-dlp args:");
+                                ui.text_edit_singleline(&mut self.settings.yt_dlp_args);
+                                ui.end_row();
+                            });
+                        ui.label(
+                            egui::RichText::new(
+                                "Leave the paths blank to search PATH, pip, WinGet and Scoop. \
+                                 Extra args are space-separated, e.g. --cookies-from-browser chrome",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    });
+
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.new_restart, "Restart (ignore existing parts)");
                     let can_start =
@@ -679,6 +880,15 @@ impl eframe::App for RapidGrabApp {
                         );
                     }
                 });
+                if self.settings.auto_resolve {
+                    ui.label(
+                        egui::RichText::new(
+                            "YouTube and similar pages are resolved with yt-dlp; direct file URLs skip it.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
                 ui.separator();
             }
         });
@@ -735,48 +945,78 @@ impl eframe::App for RapidGrabApp {
                                 .weak(),
                         );
 
-                        match &view.progress {
-                            Some(p) if p.total > 0 => {
-                                let frac = (p.downloaded as f32 / p.total as f32).clamp(0.0, 1.0);
-                                ui.add(
-                                    egui::ProgressBar::new(frac).text(format!(
+                        if let Some(media) = &view.media {
+                            let frac = (media.overall as f32).clamp(0.0, 1.0);
+                            let stage = media_stage_label(media.stage);
+                            let text = if media.stage == MediaStage::Merging {
+                                format!("merging audio and video… ({:.0}%)", frac * 100.0)
+                            } else if media.total > 0 {
+                                format!(
+                                    "{} · {} / {}  ({:.0}%)",
+                                    stage,
+                                    human_bytes(media.downloaded),
+                                    human_bytes(media.total),
+                                    frac * 100.0
+                                )
+                            } else {
+                                format!("{} · {:.0}%", stage, frac * 100.0)
+                            };
+                            ui.add(egui::ProgressBar::new(frac).text(text));
+                            let mut line = format!(
+                                "{stage} · {} conns · {}",
+                                view.connections,
+                                fmt_duration(view.elapsed)
+                            );
+                            if media.speed_bps > 1.0 {
+                                line.push_str(&format!(
+                                    " · {}/s",
+                                    human_bytes(media.speed_bps.max(0.0) as u64)
+                                ));
+                            }
+                            ui.label(egui::RichText::new(line).small().weak());
+                        } else {
+                            match &view.progress {
+                                Some(p) if p.total > 0 => {
+                                    let frac =
+                                        (p.downloaded as f32 / p.total as f32).clamp(0.0, 1.0);
+                                    ui.add(egui::ProgressBar::new(frac).text(format!(
                                         "{} / {}  ({:.0}%)",
                                         human_bytes(p.downloaded),
                                         human_bytes(p.total),
                                         frac * 100.0
-                                    )),
-                                );
-                                let eta = if p.speed_bps > 1.0 && p.total > p.downloaded {
-                                    let secs =
-                                        (p.total - p.downloaded) as f64 / p.speed_bps;
-                                    format!(" · ETA {}", fmt_duration(Duration::from_secs_f64(secs.max(0.0))))
-                                } else {
-                                    String::new()
-                                };
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{}/s · {} conns · {}{eta}",
-                                        human_bytes(p.speed_bps.max(0.0) as u64),
-                                        p.connections,
-                                        fmt_duration(view.elapsed),
-                                    ))
-                                    .small()
-                                    .weak(),
-                                );
-                            }
-                            _ => {
-                                let mut line = format!(
-                                    "{} conns · elapsed {}",
-                                    view.connections,
-                                    fmt_duration(view.elapsed)
-                                );
-                                if let Some(limit) = view.speed_limit {
-                                    line.push_str(&format!(
-                                        " · cap {}/s",
-                                        human_bytes(limit)
-                                    ));
+                                    )));
+                                    let eta = if p.speed_bps > 1.0 && p.total > p.downloaded {
+                                        let secs =
+                                            (p.total - p.downloaded) as f64 / p.speed_bps;
+                                        format!(" · ETA {}", fmt_duration(Duration::from_secs_f64(secs.max(0.0))))
+                                    } else {
+                                        String::new()
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{}/s · {} conns · {}{eta}",
+                                            human_bytes(p.speed_bps.max(0.0) as u64),
+                                            p.connections,
+                                            fmt_duration(view.elapsed),
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
                                 }
-                                ui.label(egui::RichText::new(line).small().weak());
+                                _ => {
+                                    let mut line = format!(
+                                        "{} conns · elapsed {}",
+                                        view.connections,
+                                        fmt_duration(view.elapsed)
+                                    );
+                                    if let Some(limit) = view.speed_limit {
+                                        line.push_str(&format!(
+                                            " · cap {}/s",
+                                            human_bytes(limit)
+                                        ));
+                                    }
+                                    ui.label(egui::RichText::new(line).small().weak());
+                                }
                             }
                         }
 
@@ -794,7 +1034,10 @@ impl eframe::App for RapidGrabApp {
                                         actions.push(Action::Remove(view.id));
                                     }
                                 }
-                                JobStatus::Starting | JobStatus::Downloading => {
+                                JobStatus::Starting
+                                | JobStatus::Downloading
+                                | JobStatus::Resolving
+                                | JobStatus::Merging => {
                                     if ui.button("Pause").clicked() {
                                         actions.push(Action::Pause(view.id));
                                     }
@@ -888,6 +1131,14 @@ fn non_empty(value: &str) -> Option<String> {
     }
 }
 
+fn media_stage_label(stage: MediaStage) -> &'static str {
+    match stage {
+        MediaStage::Video => "video",
+        MediaStage::Audio => "audio",
+        MediaStage::Merging => "merge",
+    }
+}
+
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
@@ -954,5 +1205,29 @@ mod tests {
     fn non_empty_trims_and_drops_blank() {
         assert_eq!(non_empty("   "), None);
         assert_eq!(non_empty("  abc "), Some("abc".to_string()));
+    }
+
+    #[test]
+    fn old_settings_gain_resolver_defaults() {
+        let old = r#"{
+            "max_concurrent": 2,
+            "connections": 8,
+            "limit_kbps": "",
+            "user_agent": "",
+            "last_dir": "C:\\Downloads"
+        }"#;
+        let settings: Settings = serde_json::from_str(old).expect("old settings still load");
+        assert!(settings.auto_resolve);
+        assert_eq!(settings.max_height, rg_resolve::DEFAULT_MAX_HEIGHT);
+        assert!(settings.yt_dlp_path.is_empty());
+        assert!(settings.ffmpeg_path.is_empty());
+        assert!(settings.yt_dlp_args.is_empty());
+    }
+
+    #[test]
+    fn labels_media_stages() {
+        assert_eq!(media_stage_label(MediaStage::Video), "video");
+        assert_eq!(media_stage_label(MediaStage::Audio), "audio");
+        assert_eq!(media_stage_label(MediaStage::Merging), "merge");
     }
 }
