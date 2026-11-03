@@ -78,6 +78,8 @@ pub struct DownloadUpdate {
     pub output: Option<PathBuf>,
     /// Combined resolver progress, when the job fell back to yt-dlp.
     pub media: Option<MediaProgress>,
+    /// Informational message for the job card (not a failure).
+    pub notice: Option<String>,
 }
 
 pub struct DownloadJob {
@@ -94,6 +96,9 @@ pub struct DownloadJob {
     pub progress: Option<Progress>,
     pub media: Option<MediaProgress>,
     pub error: Option<String>,
+    /// Informational message shown under the status (for example a skipped
+    /// checksum); cleared when the job starts again.
+    pub notice: Option<String>,
     pub started_at: Option<Instant>,
     /// Accumulated run time of finished/previous runs (pauses).
     pub elapsed: Duration,
@@ -120,6 +125,7 @@ struct JobView {
     progress: Option<Progress>,
     media: Option<MediaProgress>,
     error: Option<String>,
+    notice: Option<String>,
     elapsed: Duration,
 }
 
@@ -292,6 +298,7 @@ impl RapidGrabApp {
                 progress: None,
                 media: None,
                 error: None,
+                notice: None,
                 started_at: None,
                 elapsed: Duration::ZERO,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -319,18 +326,14 @@ impl RapidGrabApp {
         let max_height = (self.settings.max_height > 0).then_some(self.settings.max_height);
         let yt_dlp_path = non_empty(&self.settings.yt_dlp_path).map(PathBuf::from);
         let ffmpeg_path = non_empty(&self.settings.ffmpeg_path).map(PathBuf::from);
-        let yt_dlp_args: Vec<String> = self
-            .settings
-            .yt_dlp_args
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
+        let yt_dlp_args = crate::args::split_args(&self.settings.yt_dlp_args);
 
         let Some(params) = self.jobs.get_mut(&id).map(|job| {
             job.run += 1;
             job.cancel = cancel.clone();
             job.status = JobStatus::Starting;
             job.error = None;
+            job.notice = None;
             job.progress = None;
             job.media = None;
             job.intent = None;
@@ -367,6 +370,7 @@ impl RapidGrabApp {
                     error,
                     output,
                     media,
+                    notice: None,
                 });
             };
 
@@ -396,6 +400,7 @@ impl RapidGrabApp {
                     error: None,
                     output: Some(output),
                     media: None,
+                    notice: None,
                 });
             });
 
@@ -407,6 +412,22 @@ impl RapidGrabApp {
                     send(None, JobStatus::Cancelled, None, None, None);
                 }
                 Err(rg_core::Error::WebPage { .. }) if auto_resolve => {
+                    if sha256.is_some() {
+                        let _ = tx.send(DownloadUpdate {
+                            id,
+                            run,
+                            progress: None,
+                            status: JobStatus::Resolving,
+                            error: None,
+                            output: None,
+                            media: None,
+                            notice: Some(
+                                "SHA-256 is not verified for media resolved by yt-dlp; \
+                                 restart with --allow-html or --no-resolve to check a direct file."
+                                    .to_string(),
+                            ),
+                        });
+                    }
                     send(None, JobStatus::Resolving, None, None, None);
                     let tools = match Tools::resolve_paths(yt_dlp_path, ffmpeg_path) {
                         Ok(tools) => tools,
@@ -458,6 +479,7 @@ impl RapidGrabApp {
                             error: None,
                             output,
                             media,
+                            notice: None,
                         });
                     };
 
@@ -593,6 +615,9 @@ impl RapidGrabApp {
         if let Some(output) = update.output.clone() {
             job.output = output;
         }
+        if let Some(notice) = update.notice {
+            job.notice = Some(notice);
+        }
 
         match update.status {
             JobStatus::Starting
@@ -695,6 +720,7 @@ impl RapidGrabApp {
                 progress: j.progress.clone(),
                 media: j.media.clone(),
                 error: j.error.clone(),
+                notice: j.notice.clone(),
                 elapsed: j.total_elapsed(),
             })
             .collect();
@@ -855,7 +881,8 @@ impl eframe::App for RapidGrabApp {
                         ui.label(
                             egui::RichText::new(
                                 "Leave the paths blank to search PATH, pip, WinGet and Scoop. \
-                                 Extra args are space-separated, e.g. --cookies-from-browser chrome",
+                                 Extra args are space-separated and may be quoted, e.g. \
+                                 --cookies \"C:\\Users\\me\\cookies.txt\"",
                             )
                             .small()
                             .weak(),
@@ -1022,6 +1049,14 @@ impl eframe::App for RapidGrabApp {
 
                         if let Some(err) = &view.error {
                             ui.label(egui::RichText::new(err).small().color(egui::Color32::LIGHT_RED));
+                        }
+
+                        if let Some(notice) = &view.notice {
+                            ui.label(
+                                egui::RichText::new(notice)
+                                    .small()
+                                    .color(egui::Color32::from_rgb(214, 170, 72)),
+                            );
                         }
 
                         ui.horizontal(|ui| {

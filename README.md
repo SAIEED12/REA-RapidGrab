@@ -148,7 +148,10 @@ Double-click `dist\RapidGrab.exe` (or the Desktop shortcut created by
   (for example `Walk Through Text.mp4`) and **Open File** opens the merged MP4.
   The `Media resolver` section of the add panel controls auto-resolve, the
   maximum height (default 1080p, `0` = best), tool paths and extra yt-dlp
-  arguments. Direct file URLs never invoke the resolver.
+  arguments. Extra arguments may be quoted (`--cookies "C:\Users\me\cookies.txt"`),
+  so paths with spaces work. A SHA-256 entered for a job that falls back to the
+  resolver is not applied; the card says so instead of silently skipping the
+  check. Direct file URLs never invoke the resolver.
 * Settings (concurrency, defaults, last folder, resolver options) and window
   geometry persist across restarts.
 
@@ -221,7 +224,7 @@ threshold, minimum-chunk floor), segment accounting, Referer derivation,
 filename inference, HTML refusal, cancellation/resume against a local server,
 `yt-dlp -J` format selection (muxed/DASH/height cap/HLS exclusion/audio
 container matching), and full resolver orchestration with a fake tool runner and
-a local HTTP server (51 tests).
+a local HTTP server (58 tests).
 
 ## 7. Roadmap
 
