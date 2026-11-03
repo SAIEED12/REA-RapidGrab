@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rg-core", "crates/rg-cli", "crates/rg-gui"]
+members = ["crates/rg-core", "crates/rg-resolve", "crates/rg-cli", "crates/rg-gui"]
 
 [workspace.package]
 version = "0.1.0"

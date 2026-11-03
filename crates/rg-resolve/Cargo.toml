@@ -1,0 +1,18 @@
+[package]
+name = "rg-resolve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Optional yt-dlp/ffmpeg media resolution for RapidGrab"
+
+[dependencies]
+rg-core = { path = "../rg-core" }
+tokio = { version = "1", features = ["process", "fs", "sync", "time", "io-util", "rt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }

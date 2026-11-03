@@ -2719,6 +2719,7 @@ dependencies = [
  "anyhow",
  "clap",
  "rg-core",
+ "rg-resolve",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2752,11 +2753,25 @@ dependencies = [
  "png",
  "rfd",
  "rg-core",
+ "rg-resolve",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rg-resolve"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "rg-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3292,6 +3307,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
