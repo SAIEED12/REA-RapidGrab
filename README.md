@@ -52,11 +52,12 @@ every completed download was verified byte-for-byte.
 ## 3. Clone design
 
 ```
-crates/rg-core   engine: probe, scheduler, segment store, limiter, merge
-crates/rg-cli    rapidgrab: get / status
-crates/rg-gui    rapidgrab-gui: desktop app (egui/eframe)
-assets/          logo.svg (vector), logo.png (512 master), logo.ico, app.rc
-tools/           make-ico.ps1 (rebuild .ico), build-dist.ps1 (release bundle)
+crates/rg-core     engine: probe, scheduler, segment store, limiter, merge
+crates/rg-resolve  optional yt-dlp/ffmpeg resolver for media pages
+crates/rg-cli      rapidgrab: get / resolve / status
+crates/rg-gui      rapidgrab-gui: desktop app (egui/eframe)
+assets/            logo.svg (vector), logo.png (512 master), logo.ico, app.rc
+tools/             make-ico.ps1 (rebuild .ico), build-dist.ps1 (release bundle)
 ```
 
 * **Probe** — `HEAD`, falling back to `GET Range: bytes=0-0`; records size,
@@ -94,6 +95,33 @@ tools/           make-ico.ps1 (rebuild .ico), build-dist.ps1 (release bundle)
   silently returns wrong bytes produces a "successful" download.
 * **Fallback** — no range support or unknown length → single streaming download
   to `<output>.rgtmp`, then atomic rename.
+* **Content handling** — when the save path has no extension or ends in `.bin`,
+  the output name is refined from `Content-Disposition` first and `Content-Type`
+  second (so `download.bin` becomes `download.mp4`). HTML responses are refused
+  with `Error::WebPage` instead of being saved as a file, because URL-based
+  downloaders are frequently pointed at pages rather than media; use
+  `--allow-html` (CLI) to save the page anyway.
+* **Media resolver** — when a download fails with `Error::WebPage` (or the user
+  runs `rapidgrab resolve`), `rg-resolve` asks an external `yt-dlp -J` for the
+  signed stream URLs and title, then downloads every stream through the same
+  `rg-core` engine. Format selection prefers a muxed MP4, otherwise the best
+  H.264 (`avc1`) video-only stream within the height cap plus the
+  original-language M4A audio. HLS/DASH manifests are skipped so the engine
+  always receives a direct HTTPS URL. If audio is separate, `ffmpeg -c copy
+  -movflags +faststart` muxes the two files; otherwise the stream is renamed
+  into place. The media bytes are never downloaded by yt-dlp.
+* **Resume across re-resolution** — signed `googlevideo.com` URLs change on every
+  resolve, so media streams carry a stable resume key (page URL + stream role +
+  format id). The manifest compares that key instead of the signed URL, letting
+  Pause/Resume continue from the stored offsets.
+* **Tool discovery** — `yt-dlp` and `ffmpeg` are looked up in `PATH`, pip
+  `Scripts` directories, WinGet `Links` and package folders, Scoop shims,
+  Chocolatey, and the usual ffmpeg install folders. Explicit paths can be set in
+  the GUI/CLI; a missing tool produces an actionable error, not a stack trace.
+  If a video plays in the browser but yt-dlp says it is unavailable, it probably
+  requires sign-in: close the browser and add
+  `--cookies-from-browser chrome` to the extra yt-dlp arguments, or point
+  yt-dlp at an exported cookies file.
 
 ## 4. Usage
 
@@ -112,9 +140,17 @@ Double-click `dist\RapidGrab.exe` (or the Desktop shortcut created by
   Pausing keeps the resumable parts; Remove on a running job stops it first and
   only then drops the card.
 * **Progress** — per job: bytes/total, percentage, speed, connections, elapsed
-  and ETA.
-* Settings (concurrency, defaults, last folder) and window geometry persist
-  across restarts.
+  and ETA. Resolved media uses one combined bar: video 0–80 %, audio 80–97 %,
+  merge 97–100 %.
+* **Video pages** — pointing a job at a YouTube (or other supported) page starts
+  the resolver automatically: the status becomes `Resolving…`, then
+  `Downloading`, then `Merging…`. The card follows the title-derived filename
+  (for example `Walk Through Text.mp4`) and **Open File** opens the merged MP4.
+  The `Media resolver` section of the add panel controls auto-resolve, the
+  maximum height (default 1080p, `0` = best), tool paths and extra yt-dlp
+  arguments. Direct file URLs never invoke the resolver.
+* Settings (concurrency, defaults, last folder, resolver options) and window
+  geometry persist across restarts.
 
 ### CLI
 
@@ -125,8 +161,20 @@ target\release\rapidgrab.exe get https://example.com/big.iso -o D:\Downloads\big
 target\release\rapidgrab.exe get <same url> -o <same path>      # resumes from parts
 target\release\rapidgrab.exe get <url> -o <path> --restart      # discard parts
 target\release\rapidgrab.exe get <url> -o <path> --sha256 <hex> # verify content
+target\release\rapidgrab.exe get <url> -o <path> --allow-html   # save an HTML page
 target\release\rapidgrab.exe status D:\Downloads\big.iso        # segment map
+
+# Media pages: yt-dlp resolves, RapidGrab downloads, ffmpeg merges.
+target\release\rapidgrab.exe get "https://www.youtube.com/watch?v=SrJOE2pEp7A" -o D:\Downloads\download.bin
+target\release\rapidgrab.exe get <url> -o <path> --max-height 720
+target\release\rapidgrab.exe get <url> -o <path> --no-resolve     # keep the HTML refusal
+target\release\rapidgrab.exe get <url> -o <path> --yt-dlp <path> --ffmpeg <path>
+target\release\rapidgrab.exe resolve <url>                        # print selected streams
 ```
+
+Media downloads default to 1080p H.264/AAC for compatibility. `yt-dlp` is
+required only to resolve pages; `ffmpeg` is required only when the video and
+audio arrive as separate streams.
 
 ## 5. Test harness
 
@@ -169,8 +217,11 @@ Effect of the 46,721-byte split threshold: a 600 KiB download now reaches
 saturate all connections the way IDM does.
 
 `cargo test` covers the split policy (midpoint, current-position, IDM's 46,721
-threshold, minimum-chunk floor), segment accounting and Referer derivation
-(7 tests).
+threshold, minimum-chunk floor), segment accounting, Referer derivation,
+filename inference, HTML refusal, cancellation/resume against a local server,
+`yt-dlp -J` format selection (muxed/DASH/height cap/HLS exclusion/audio
+container matching), and full resolver orchestration with a fake tool runner and
+a local HTTP server (51 tests).
 
 ## 7. Roadmap
 
@@ -181,4 +232,5 @@ threshold, minimum-chunk floor), segment accounting and Referer derivation
    neither of which is a portable format).
 3. Browser integration via WebExtension + native messaging (modern, documented
    APIs — no browser hooks needed).
-4. Media grabber (HLS/DASH manifests) and UI.
+4. Native HLS/DASH manifest parsing and AES-128 decryption, so live and
+   segmented streams do not need an external extractor.
