@@ -333,14 +333,27 @@ pub fn alert(ui: &mut Ui, text: &str, color: Color32) {
 
 /// Small info line with an icon, used for helper text.
 pub fn info_line(ui: &mut Ui, text: &str) {
+    note_line(ui, text, TEXT_TERTIARY);
+}
+
+/// Inline warning note, used for "this will be replaced" style hints.
+pub fn warning_line(ui: &mut Ui, text: &str) {
+    note_line(ui, text, WARNING);
+}
+
+fn note_line(ui: &mut Ui, text: &str, color: Color32) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = SP_XS + 2.0;
         ui.add(egui::Label::new(
             RichText::new(Icon::Info.glyph())
                 .font(icon_font(CAPTION_SIZE))
-                .color(TEXT_TERTIARY),
+                .color(color),
         ));
-        ui.add(egui::Label::new(caption_tertiary(text)));
+        ui.add(egui::Label::new(
+            RichText::new(text)
+                .font(FontId::new(CAPTION_SIZE, proportional()))
+                .color(color),
+        ));
     });
 }
 

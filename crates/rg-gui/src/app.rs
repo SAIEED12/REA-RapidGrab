@@ -187,8 +187,17 @@ pub struct RapidGrabApp {
     show_add_panel: bool,
     /// Set when a button should move keyboard focus back to the URL field.
     focus_url: bool,
+    /// Cached result of the "output path already exists" probe.
+    output_probe: Option<OutputProbe>,
 
     logo: egui::TextureHandle,
+}
+
+/// Cached filesystem probe for the Save-as path, refreshed at most every 500 ms.
+struct OutputProbe {
+    path: String,
+    checked: Instant,
+    exists: bool,
 }
 
 impl RapidGrabApp {
@@ -226,6 +235,7 @@ impl RapidGrabApp {
             new_sha256: String::new(),
             show_add_panel: true,
             focus_url: false,
+            output_probe: None,
             logo: crate::icon::logo_texture(&cc.egui_ctx),
         }
     }
@@ -251,6 +261,36 @@ impl RapidGrabApp {
             PathBuf::from(&self.settings.last_dir)
         };
         self.new_output = dir.join(name).display().to_string();
+    }
+
+    /// Whether Start would replace an existing file at the current output path.
+    ///
+    /// The probe is cached per path and refreshed at most every 500 ms. A
+    /// leftover parts manifest means the run would resume instead of replace,
+    /// so no warning is shown in that case.
+    fn output_would_replace(&mut self) -> bool {
+        let path = self.new_output.trim();
+        if path.is_empty() {
+            return false;
+        }
+        let now = Instant::now();
+        if let Some(probe) = &self.output_probe {
+            if probe.path == path && now.duration_since(probe.checked) < Duration::from_millis(500)
+            {
+                return probe.exists;
+            }
+        }
+        let target = PathBuf::from(path);
+        let resumable = rg_core::parts_dir_for(&target)
+            .join("manifest.json")
+            .is_file();
+        let exists = target.is_file() && !resumable;
+        self.output_probe = Some(OutputProbe {
+            path: path.to_string(),
+            checked: now,
+            exists,
+        });
+        exists
     }
 
     fn add_download(&mut self) {
@@ -976,6 +1016,12 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
                 app.browse_output();
             }
         });
+        if app.output_would_replace() {
+            widgets::warning_line(
+                ui,
+                "A file with this name already exists and will be replaced.",
+            );
+        }
 
         ui.add_space(theme::SP_XS);
         ui.horizontal_top(|ui| {
