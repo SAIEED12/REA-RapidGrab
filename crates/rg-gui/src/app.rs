@@ -32,31 +32,11 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
-    /// A job that owns a running tokio task.
     fn is_active(&self) -> bool {
         matches!(
             self,
             Self::Starting | Self::Downloading | Self::Resolving | Self::Merging | Self::Pausing
         )
-    }
-
-    fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
-    }
-
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Queued => "Queued",
-            Self::Starting => "Starting…",
-            Self::Downloading => "Downloading",
-            Self::Resolving => "Resolving…",
-            Self::Merging => "Merging…",
-            Self::Pausing => "Pausing…",
-            Self::Paused => "Paused",
-            Self::Completed => "Completed",
-            Self::Failed => "Failed",
-            Self::Cancelled => "Cancelled",
-        }
     }
 }
 
@@ -209,6 +189,7 @@ pub struct RapidGrabApp {
 
 impl RapidGrabApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        crate::ui::apply_theme(&cc.egui_ctx);
         let rt = Arc::new(Runtime::new().expect("Failed to create tokio runtime"));
         let (update_tx, update_rx) = unbounded();
 
@@ -747,410 +728,294 @@ impl eframe::App for RapidGrabApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. Drain engine updates.
         while let Ok(update) = self.update_rx.try_recv() {
             self.apply_update(update);
         }
-
-        // 2. Watchdog: a task that vanished without a terminal message.
         for job in self.jobs.values_mut() {
-            if job.status.is_active() {
-                if let Some(handle) = &job.handle {
-                    if handle.is_finished() {
-                        if let Some(started) = job.started_at.take() {
-                            job.elapsed += started.elapsed();
-                        }
-                        job.status = JobStatus::Failed;
-                        job.error = Some("download worker exited unexpectedly".to_string());
-                    }
-                }
+            if job.status.is_active() && job.handle.as_ref().is_some_and(|h| h.is_finished()) {
+                if let Some(started) = job.started_at.take() { job.elapsed += started.elapsed(); }
+                job.status = JobStatus::Failed;
+                job.error = Some("download worker exited unexpectedly".to_string());
             }
         }
-
-        // 3. Keep the queue moving.
         self.pump_queue();
-
         let mut actions: Vec<Action> = Vec::new();
+        let views = self.job_views();
+        let active = views.iter().filter(|v| v.status.is_active()).count();
+        let queued = views.iter().filter(|v| v.status == JobStatus::Queued).count();
+        let total_speed: f64 = views.iter().filter_map(|v| v.media.as_ref().map(|m| m.speed_bps).or_else(|| v.progress.as_ref().map(|p| p.speed_bps))).sum();
+        let summary = if views.is_empty() {
+            "Fast, segmented downloads".to_string()
+        } else if active > 0 {
+            format!(
+                "{} active · {} queued · max {}",
+                active, queued, self.settings.max_concurrent
+            )
+        } else if queued > 0 {
+            format!("{} queued · max {}", queued, self.settings.max_concurrent)
+        } else {
+            format!("{} in list · max {}", views.len(), self.settings.max_concurrent)
+        };
 
-        // --- top panel: branding + add form -------------------------------
-        egui::TopBottomPanel::top("add_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::Image::new(egui::load::SizedTexture::new(
-                        self.logo.id(),
-                        egui::vec2(26.0, 26.0),
-                    ))
-                    .rounding(6.0),
-                );
-                ui.add_space(4.0);
-                ui.heading("RapidGrab");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .button(if self.show_add_panel { "Hide" } else { "Add Download" })
-                        .clicked()
-                    {
-                        self.show_add_panel = !self.show_add_panel;
-                    }
+        // --- header -------------------------------------------------------
+        egui::TopBottomPanel::top("rapidgrab_header")
+            .frame(crate::ui::panel_frame().inner_margin(egui::Margin {
+                left: 20.0,
+                right: 20.0,
+                top: 14.0,
+                bottom: 12.0,
+            }))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Image::new(egui::load::SizedTexture::new(
+                            self.logo.id(),
+                            egui::vec2(34.0, 34.0),
+                        ))
+                        .rounding(8.0),
+                    );
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.add(egui::Label::new(crate::ui::title("RapidGrab")));
+                        ui.add(egui::Label::new(crate::ui::caption(summary.clone())));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(crate::ui::primary_button(if self.show_add_panel {
+                                "Hide"
+                            } else {
+                                "+ New download"
+                            }))
+                            .clicked()
+                        {
+                            self.show_add_panel = !self.show_add_panel;
+                        }
+                        if active > 0 {
+                            ui.add_space(4.0);
+                            crate::ui::pill(
+                                ui,
+                                &format!("{}/s", human_bytes(total_speed.max(0.0) as u64)),
+                                crate::ui::ACCENT,
+                                true,
+                            );
+                        }
+                    });
                 });
-            });
 
-            if self.show_add_panel {
-                ui.separator();
-                egui::Grid::new("add_grid")
-                    .num_columns(2)
-                    .spacing([10.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("URL:");
-                        if ui.text_edit_singleline(&mut self.new_url).lost_focus() {
+                // --- add-download card ------------------------------------
+                if self.show_add_panel {
+                    ui.add_space(12.0);
+                    crate::ui::card_frame().show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        ui.add(egui::Label::new(crate::ui::heading("New download")));
+                        ui.add_space(4.0);
+
+                        ui.add(egui::Label::new(crate::ui::caption("URL")));
+                        let url_response = ui.add(
+                            egui::TextEdit::singleline(&mut self.new_url)
+                                .hint_text("https://example.com/file.iso")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if url_response.lost_focus() {
                             self.suggest_output();
                         }
-                        ui.end_row();
 
-                        ui.label("Save as:");
+                        ui.add_space(2.0);
+                        ui.add(egui::Label::new(crate::ui::caption("Save as")));
                         ui.horizontal(|ui| {
-                            ui.text_edit_singleline(&mut self.new_output);
-                            if ui.button("Browse...").clicked() {
+                            let browse_width = 82.0;
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.new_output)
+                                    .hint_text("C:\\Downloads\\download.bin")
+                                    .desired_width((ui.available_width() - browse_width - 8.0).max(120.0)),
+                            );
+                            if ui.add(crate::ui::ghost_button("Browse…")).clicked() {
                                 self.browse_output();
                             }
                         });
-                        ui.end_row();
 
-                        ui.label("Connections:");
-                        ui.add(egui::Slider::new(&mut self.new_connections, 1..=16));
-                        ui.end_row();
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add(egui::Label::new(crate::ui::caption("Connections")));
+                            ui.add(egui::Slider::new(&mut self.new_connections, 1..=16));
+                            ui.add_space(10.0);
+                            ui.add(egui::Label::new(crate::ui::caption("Speed cap")));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.new_limit_kbps)
+                                    .hint_text("KB/s")
+                                    .desired_width(64.0),
+                            );
+                            ui.add_space(10.0);
+                            ui.add(egui::Label::new(crate::ui::caption("Run at once")));
+                            ui.add(egui::Slider::new(&mut self.settings.max_concurrent, 1..=8));
+                        });
 
-                        ui.label("Speed limit (KB/s):");
-                        ui.text_edit_singleline(&mut self.new_limit_kbps);
-                        ui.end_row();
-
-                        ui.label("SHA256 (optional):");
-                        ui.text_edit_singleline(&mut self.new_sha256);
-                        ui.end_row();
-
-                        ui.label("User-Agent (optional):");
-                        ui.text_edit_singleline(&mut self.new_user_agent);
-                        ui.end_row();
-
-                        ui.label("Run at once:");
-                        ui.add(egui::Slider::new(
-                            &mut self.settings.max_concurrent,
-                            1..=8,
-                        ));
-                        ui.end_row();
-                    });
-
-                egui::CollapsingHeader::new("Media resolver (YouTube and other video pages)")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        ui.checkbox(
-                            &mut self.settings.auto_resolve,
-                            "Resolve media pages automatically with yt-dlp",
-                        );
-                        egui::Grid::new("resolver_grid")
-                            .num_columns(2)
-                            .spacing([10.0, 4.0])
+                        ui.add_space(6.0);
+                        egui::CollapsingHeader::new(crate::ui::small("Advanced"))
                             .show(ui, |ui| {
-                                ui.label("Max video height:");
+                                ui.spacing_mut().item_spacing.y = 4.0;
+                                ui.add(egui::Label::new(crate::ui::caption(
+                                    "SHA-256 checksum (optional)",
+                                )));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.new_sha256)
+                                        .hint_text("expected digest")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.add(egui::Label::new(crate::ui::caption(
+                                    "User-Agent (optional)",
+                                )));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.new_user_agent)
+                                        .hint_text("Mozilla/5.0…")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.add_space(2.0);
+                                ui.checkbox(
+                                    &mut self.new_restart,
+                                    "Restart — ignore existing parts",
+                                );
+                            });
+
+                        egui::CollapsingHeader::new(crate::ui::small("Media resolver"))
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 4.0;
+                                ui.checkbox(
+                                    &mut self.settings.auto_resolve,
+                                    "Resolve video pages automatically with yt-dlp",
+                                );
                                 ui.horizontal(|ui| {
+                                    ui.add(egui::Label::new(crate::ui::caption(
+                                        "Max height",
+                                    )));
                                     ui.add(
                                         egui::DragValue::new(&mut self.settings.max_height)
                                             .speed(10.0)
                                             .range(0..=4320)
                                             .suffix("p"),
                                     );
-                                    ui.label(
-                                        egui::RichText::new("0 = best available")
-                                            .small()
-                                            .weak(),
-                                    );
+                                    ui.add(egui::Label::new(crate::ui::caption(
+                                        "0 = best available",
+                                    )));
                                 });
-                                ui.end_row();
-
-                                ui.label("yt-dlp path:");
-                                ui.text_edit_singleline(&mut self.settings.yt_dlp_path);
-                                ui.end_row();
-
-                                ui.label("ffmpeg path:");
-                                ui.text_edit_singleline(&mut self.settings.ffmpeg_path);
-                                ui.end_row();
-
-                                ui.label("Extra yt-dlp args:");
-                                ui.text_edit_singleline(&mut self.settings.yt_dlp_args);
-                                ui.end_row();
+                                ui.add(egui::Label::new(crate::ui::caption("yt-dlp path")));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.settings.yt_dlp_path)
+                                        .hint_text("auto-detected")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.add(egui::Label::new(crate::ui::caption("ffmpeg path")));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.settings.ffmpeg_path)
+                                        .hint_text("auto-detected")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.add(egui::Label::new(crate::ui::caption(
+                                    "Extra yt-dlp args",
+                                )));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.settings.yt_dlp_args)
+                                        .hint_text("--cookies \"C:\\Users\\me\\cookies.txt\"")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.add(egui::Label::new(crate::ui::caption(
+                                    "Leave paths blank to search PATH, pip, WinGet and Scoop.",
+                                )));
                             });
-                        ui.label(
-                            egui::RichText::new(
-                                "Leave the paths blank to search PATH, pip, WinGet and Scoop. \
-                                 Extra args are space-separated and may be quoted, e.g. \
-                                 --cookies \"C:\\Users\\me\\cookies.txt\"",
-                            )
-                            .small()
-                            .weak(),
-                        );
-                    });
 
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.new_restart, "Restart (ignore existing parts)");
-                    let can_start =
-                        !self.new_url.trim().is_empty() && !self.new_output.trim().is_empty();
-                    if ui
-                        .add_enabled(can_start, egui::Button::new("Start Download"))
-                        .clicked()
-                    {
-                        self.add_download();
-                    }
-                    if self.new_restart {
-                        ui.label(
-                            egui::RichText::new("restart discards resumable parts")
-                                .small()
-                                .weak(),
-                        );
-                    }
-                });
-                if self.settings.auto_resolve {
-                    ui.label(
-                        egui::RichText::new(
-                            "YouTube and similar pages are resolved with yt-dlp; direct file URLs skip it.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                }
-                ui.separator();
-            }
-        });
-
-        // --- central panel: job list --------------------------------------
-        let views = self.job_views();
-        let active = views.iter().filter(|v| v.status.is_active()).count();
-        let queued = views
-            .iter()
-            .filter(|v| v.status == JobStatus::Queued)
-            .count();
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Downloads");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{active} active · {queued} queued · max {}",
-                            self.settings.max_concurrent
-                        ))
-                        .small()
-                        .weak(),
-                    );
-                });
-            });
-
-            if views.is_empty() {
-                ui.label("No downloads yet. Add one above.");
-                return;
-            }
-
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for view in &views {
-                    ui.group(|ui| {
+                        ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            ui.label(format!("#{} ", view.id));
-                            ui.strong(truncate_url(&view.url, 60));
+                            if self.settings.auto_resolve {
+                                ui.add(egui::Label::new(crate::ui::caption(
+                                    "Video pages are resolved with yt-dlp; direct file URLs skip it.",
+                                )));
+                            }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    ui.label(
-                                        egui::RichText::new(view.status.label())
-                                            .small()
-                                            .weak(),
-                                    );
+                                    let can_start = !self.new_url.trim().is_empty()
+                                        && !self.new_output.trim().is_empty();
+                                    if ui
+                                        .add_enabled(
+                                            can_start,
+                                            crate::ui::primary_button("Start download"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.add_download();
+                                    }
                                 },
                             );
                         });
-
-                        ui.label(
-                            egui::RichText::new(view.output.display().to_string())
-                                .small()
-                                .weak(),
-                        );
-
-                        if let Some(media) = &view.media {
-                            let frac = (media.overall as f32).clamp(0.0, 1.0);
-                            let stage = media_stage_label(media.stage);
-                            let text = if media.stage == MediaStage::Merging {
-                                format!("merging audio and video… ({:.0}%)", frac * 100.0)
-                            } else if media.total > 0 {
-                                format!(
-                                    "{} · {} / {}  ({:.0}%)",
-                                    stage,
-                                    human_bytes(media.downloaded),
-                                    human_bytes(media.total),
-                                    frac * 100.0
-                                )
-                            } else {
-                                format!("{} · {:.0}%", stage, frac * 100.0)
-                            };
-                            ui.add(egui::ProgressBar::new(frac).text(text));
-                            let mut line = format!(
-                                "{stage} · {} conns · {}",
-                                view.connections,
-                                fmt_duration(view.elapsed)
-                            );
-                            if media.speed_bps > 1.0 {
-                                line.push_str(&format!(
-                                    " · {}/s",
-                                    human_bytes(media.speed_bps.max(0.0) as u64)
-                                ));
-                            }
-                            ui.label(egui::RichText::new(line).small().weak());
-                        } else {
-                            match &view.progress {
-                                Some(p) if p.total > 0 => {
-                                    let frac =
-                                        (p.downloaded as f32 / p.total as f32).clamp(0.0, 1.0);
-                                    ui.add(egui::ProgressBar::new(frac).text(format!(
-                                        "{} / {}  ({:.0}%)",
-                                        human_bytes(p.downloaded),
-                                        human_bytes(p.total),
-                                        frac * 100.0
-                                    )));
-                                    let eta = if p.speed_bps > 1.0 && p.total > p.downloaded {
-                                        let secs =
-                                            (p.total - p.downloaded) as f64 / p.speed_bps;
-                                        format!(" · ETA {}", fmt_duration(Duration::from_secs_f64(secs.max(0.0))))
-                                    } else {
-                                        String::new()
-                                    };
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{}/s · {} conns · {}{eta}",
-                                            human_bytes(p.speed_bps.max(0.0) as u64),
-                                            p.connections,
-                                            fmt_duration(view.elapsed),
-                                        ))
-                                        .small()
-                                        .weak(),
-                                    );
-                                }
-                                _ => {
-                                    let mut line = format!(
-                                        "{} conns · elapsed {}",
-                                        view.connections,
-                                        fmt_duration(view.elapsed)
-                                    );
-                                    if let Some(limit) = view.speed_limit {
-                                        line.push_str(&format!(
-                                            " · cap {}/s",
-                                            human_bytes(limit)
-                                        ));
-                                    }
-                                    ui.label(egui::RichText::new(line).small().weak());
-                                }
-                            }
-                        }
-
-                        if let Some(err) = &view.error {
-                            ui.label(egui::RichText::new(err).small().color(egui::Color32::LIGHT_RED));
-                        }
-
-                        if let Some(notice) = &view.notice {
-                            ui.label(
-                                egui::RichText::new(notice)
-                                    .small()
-                                    .color(egui::Color32::from_rgb(214, 170, 72)),
-                            );
-                        }
-
-                        ui.horizontal(|ui| {
-                            match view.status {
-                                JobStatus::Queued => {
-                                    if ui.button("Start now").clicked() {
-                                        actions.push(Action::StartNow(view.id));
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        actions.push(Action::Remove(view.id));
-                                    }
-                                }
-                                JobStatus::Starting
-                                | JobStatus::Downloading
-                                | JobStatus::Resolving
-                                | JobStatus::Merging => {
-                                    if ui.button("Pause").clicked() {
-                                        actions.push(Action::Pause(view.id));
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        actions.push(Action::Stop(view.id));
-                                    }
-                                }
-                                JobStatus::Pausing => {
-                                    ui.label(egui::RichText::new("stopping…").small().weak());
-                                }
-                                JobStatus::Paused => {
-                                    if ui.button("Resume").clicked() {
-                                        actions.push(Action::Resume(view.id));
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        actions.push(Action::Stop(view.id));
-                                    }
-                                }
-                                JobStatus::Failed => {
-                                    if ui.button("Retry").clicked() {
-                                        actions.push(Action::Retry(view.id));
-                                    }
-                                    if ui.button("Open Folder").clicked() {
-                                        let dir = view
-                                            .output
-                                            .parent()
-                                            .map(|p| p.to_path_buf())
-                                            .unwrap_or_else(|| PathBuf::from("."));
-                                        Self::open_path(&dir);
-                                    }
-                                }
-                                JobStatus::Completed => {
-                                    if ui.button("Open File").clicked() {
-                                        Self::open_path(&view.output);
-                                    }
-                                    if ui.button("Open Folder").clicked() {
-                                        let dir = view
-                                            .output
-                                            .parent()
-                                            .map(|p| p.to_path_buf())
-                                            .unwrap_or_else(|| PathBuf::from("."));
-                                        Self::open_path(&dir);
-                                    }
-                                }
-                                JobStatus::Cancelled => {
-                                    if ui.button("Resume").clicked() {
-                                        actions.push(Action::Resume(view.id));
-                                    }
-                                    if ui.button("Open Folder").clicked() {
-                                        let dir = view
-                                            .output
-                                            .parent()
-                                            .map(|p| p.to_path_buf())
-                                            .unwrap_or_else(|| PathBuf::from("."));
-                                        Self::open_path(&dir);
-                                    }
-                                }
-                            }
-
-                            let removable = view.status.is_terminal()
-                                || matches!(view.status, JobStatus::Paused | JobStatus::Queued);
-                            if removable && ui.button("Remove").clicked() {
-                                actions.push(Action::Remove(view.id));
-                            }
-                        });
-
-                        if matches!(view.status, JobStatus::Pausing) {
-                            ctx.request_repaint();
-                        }
                     });
                 }
             });
-        });
+
+        // --- downloads ----------------------------------------------------
+        egui::CentralPanel::default()
+            .frame(crate::ui::panel_frame().inner_margin(egui::Margin {
+                left: 20.0,
+                right: 20.0,
+                top: 16.0,
+                bottom: 16.0,
+            }))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new(crate::ui::heading("Downloads")));
+                    if !views.is_empty() {
+                        ui.add(egui::Label::new(crate::ui::small(format!(
+                            "{active} active · {queued} queued"
+                        ))));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(crate::ui::caption(format!(
+                            "max {} at once",
+                            self.settings.max_concurrent
+                        ))));
+                    });
+                });
+                ui.add_space(10.0);
+
+                if views.is_empty() {
+                    ui.add_space(72.0);
+                    ui.vertical_centered(|ui| {
+                        ui.add(egui::Label::new(crate::ui::heading("No downloads yet")));
+                        ui.add(egui::Label::new(crate::ui::small(
+                            "Paste a file URL or a video page link to get started.",
+                        )));
+                        ui.add_space(10.0);
+                        if ui
+                            .add(crate::ui::primary_button("+ New download"))
+                            .clicked()
+                        {
+                            self.show_add_panel = true;
+                        }
+                    });
+                    return;
+                }
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for view in &views {
+                            job_card(ui, view, &mut actions);
+                            ui.add_space(10.0);
+                        }
+                    });
+            });
 
         self.handle_actions(actions);
         self.pump_queue();
 
         // Repaint while anything is in flight so timers stay live.
+        if self
+            .jobs
+            .values()
+            .any(|j| j.status == JobStatus::Pausing)
+        {
+            ctx.request_repaint();
+        }
         if self.jobs.values().any(|j| j.status.is_active()) {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
@@ -1205,6 +1070,225 @@ fn truncate_url(url: &str, max: usize) -> String {
     } else {
         format!("{}…", url.chars().take(max - 1).collect::<String>())
     }
+}
+
+fn view_name(url: &str, output: &std::path::Path) -> String {
+    if let Some(name) = output.file_name().and_then(|s| s.to_str()) {
+        if !name.is_empty() && name != "download.bin" {
+            return name.to_string();
+        }
+    }
+    url.rsplit('/').next().unwrap_or(url).to_string()
+}
+
+/// One download card in the queue.
+fn job_card(ui: &mut egui::Ui, view: &JobView, actions: &mut Vec<Action>) {
+    use crate::ui;
+
+    ui::card_frame().show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 6.0;
+
+        // Title row: file name, tooltip with the full source, status pill.
+        ui.horizontal(|ui| {
+            let name = view_name(&view.url, &view.output);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(truncate_url(&name, 72))
+                        .size(13.0)
+                        .strong(),
+                ),
+            )
+            .on_hover_text(format!("{}\n{}", view.url, view.output.display()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui::status_pill(ui, &view.status);
+            });
+        });
+
+        ui.add(egui::Label::new(ui::caption(format!(
+            "#{}  ·  {}",
+            view.id,
+            truncate_url(&view.output.display().to_string(), 110)
+        ))));
+
+        // Progress.
+        if view.status == JobStatus::Completed {
+            let size = std::fs::metadata(&view.output)
+                .map(|m| m.len())
+                .unwrap_or_default();
+            ui::progress_bar(
+                ui,
+                1.0,
+                &format!("done · {}", human_bytes(size)),
+                ui::GREEN,
+            );
+        } else if let Some(media) = &view.media {
+            let frac = media.overall.clamp(0.0, 1.0) as f32;
+            let stage = media_stage_label(media.stage);
+            let text = if media.stage == MediaStage::Merging {
+                format!("merging audio + video · {:.0}%", frac * 100.0)
+            } else if media.total > 0 {
+                format!(
+                    "{:.0}%  ·  {} / {}  ·  {}",
+                    frac * 100.0,
+                    human_bytes(media.downloaded),
+                    human_bytes(media.total),
+                    stage
+                )
+            } else {
+                format!("{stage} · {:.0}%", frac * 100.0)
+            };
+            ui::progress_bar(ui, frac, &text, ui::ACCENT);
+        } else if let Some(p) = view.progress.as_ref() {
+            let frac = if p.total > 0 {
+                (p.downloaded as f64 / p.total as f64).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            let text = if p.total > 0 {
+                format!(
+                    "{:.0}%  ·  {} / {}",
+                    frac * 100.0,
+                    human_bytes(p.downloaded),
+                    human_bytes(p.total)
+                )
+            } else {
+                format!("{} received", human_bytes(p.downloaded))
+            };
+            ui::progress_bar(ui, frac, &text, ui::ACCENT);
+        }
+
+        // Stats line.
+        let mut stats = String::new();
+        match view.status {
+            JobStatus::Completed => {
+                stats.push_str(&format!(
+                    "{} conns · {} elapsed",
+                    view.connections,
+                    fmt_duration(view.elapsed)
+                ));
+            }
+            _ => {
+                let speed = view
+                    .media
+                    .as_ref()
+                    .map(|m| m.speed_bps)
+                    .or_else(|| view.progress.as_ref().map(|p| p.speed_bps))
+                    .unwrap_or(0.0);
+                if speed > 1.0 {
+                    stats.push_str(&format!("{}/s · ", human_bytes(speed as u64)));
+                }
+                let conns = view
+                    .progress
+                    .as_ref()
+                    .map(|p| p.connections)
+                    .unwrap_or(view.connections);
+                stats.push_str(&format!("{conns} conns · {}", fmt_duration(view.elapsed)));
+                if let Some(p) = view.progress.as_ref() {
+                    if p.speed_bps > 1.0 && p.total > p.downloaded && p.total > 0 {
+                        let secs = (p.total - p.downloaded) as f64 / p.speed_bps;
+                        stats.push_str(&format!(
+                            " · ETA {}",
+                            fmt_duration(Duration::from_secs_f64(secs.max(0.0)))
+                        ));
+                    }
+                }
+                if let Some(limit) = view.speed_limit {
+                    stats.push_str(&format!(" · cap {}/s", human_bytes(limit)));
+                }
+            }
+        }
+        ui.add(egui::Label::new(ui::small(stats)));
+
+        // Feedback.
+        if let Some(err) = &view.error {
+            ui.add_space(2.0);
+            ui::alert_bar(ui, err, ui::RED, "!");
+        }
+        if let Some(notice) = &view.notice {
+            ui.add_space(2.0);
+            ui::alert_bar(ui, notice, ui::AMBER, "i");
+        }
+
+        ui.add_space(2.0);
+
+        // Actions.
+        ui.horizontal(|ui| {
+            let folder = |view: &JobView| {
+                let dir = view
+                    .output
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                RapidGrabApp::open_path(&dir);
+            };
+
+            match view.status {
+                JobStatus::Queued => {
+                    if ui.add(ui::text_button("Start now")).clicked() {
+                        actions.push(Action::StartNow(view.id));
+                    }
+                    if ui.add(ui::destructive_button("Remove")).clicked() {
+                        actions.push(Action::Remove(view.id));
+                    }
+                }
+                JobStatus::Starting
+                | JobStatus::Downloading
+                | JobStatus::Resolving
+                | JobStatus::Merging => {
+                    if ui.add(ui::text_button("Pause")).clicked() {
+                        actions.push(Action::Pause(view.id));
+                    }
+                    if ui.add(ui::destructive_button("Cancel")).clicked() {
+                        actions.push(Action::Stop(view.id));
+                    }
+                }
+                JobStatus::Pausing => {
+                    ui.add(egui::Label::new(ui::caption("stopping…")));
+                }
+                JobStatus::Paused => {
+                    if ui.add(ui::text_button("Resume")).clicked() {
+                        actions.push(Action::Resume(view.id));
+                    }
+                    if ui.add(ui::destructive_button("Remove")).clicked() {
+                        actions.push(Action::Remove(view.id));
+                    }
+                }
+                JobStatus::Failed => {
+                    if ui.add(ui::text_button("Retry")).clicked() {
+                        actions.push(Action::Retry(view.id));
+                    }
+                    if ui.add(ui::ghost_button("Open folder")).clicked() {
+                        folder(view);
+                    }
+                    if ui.add(ui::destructive_button("Remove")).clicked() {
+                        actions.push(Action::Remove(view.id));
+                    }
+                }
+                JobStatus::Completed => {
+                    if ui.add(ui::success_button("Open file")).clicked() {
+                        RapidGrabApp::open_path(&view.output);
+                    }
+                    if ui.add(ui::ghost_button("Open folder")).clicked() {
+                        folder(view);
+                    }
+                    if ui.add(ui::destructive_button("Remove")).clicked() {
+                        actions.push(Action::Remove(view.id));
+                    }
+                }
+                JobStatus::Cancelled => {
+                    if ui.add(ui::text_button("Resume")).clicked() {
+                        actions.push(Action::Resume(view.id));
+                    }
+                    if ui.add(ui::ghost_button("Open folder")).clicked() {
+                        folder(view);
+                    }
+                    if ui.add(ui::destructive_button("Remove")).clicked() {
+                        actions.push(Action::Remove(view.id));
+                    }
+                }
+            }
+        });
+    });
 }
 
 #[cfg(test)]

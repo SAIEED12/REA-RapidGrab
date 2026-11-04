@@ -3,6 +3,7 @@
 mod app;
 mod args;
 mod icon;
+mod ui;
 
 use eframe::egui;
 use tracing_subscriber::EnvFilter;
@@ -14,8 +15,8 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 600.0])
-            .with_min_inner_size([700.0, 400.0])
+            .with_inner_size([1080.0, 720.0])
+            .with_min_inner_size([760.0, 480.0])
             .with_title("RapidGrab")
             .with_icon(icon::window_icon()),
         ..Default::default()
