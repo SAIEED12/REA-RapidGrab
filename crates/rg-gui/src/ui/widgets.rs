@@ -317,7 +317,7 @@ pub fn alert(ui: &mut Ui, text: &str, color: Color32) {
         .rounding(Rounding::same(R_SMALL))
         .inner_margin(egui::Margin::symmetric(SP_S, SP_XS + 2.0))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = SP_XS + 2.0;
                 ui.add(egui::Label::new(
                     RichText::new(Icon::Info.glyph())
