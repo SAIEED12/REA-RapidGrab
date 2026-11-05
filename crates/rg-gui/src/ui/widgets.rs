@@ -98,28 +98,62 @@ pub enum ButtonKind {
     Ghost,
 }
 
-/// Fluent button with animated hover/press states and an explicit disabled look.
+/// Fixed-width Secondary (or other-kind) button: the exact width is painted,
+/// so callers can derive a neighbouring field width from it.
+pub fn button_fixed_width(
+    ui: &mut Ui,
+    label: &str,
+    kind: ButtonKind,
+    enabled: bool,
+    width: f32,
+) -> Response {
+    draw_button(
+        ui,
+        label,
+        kind,
+        enabled,
+        Vec2::new(
+            width,
+            if kind == ButtonKind::Ghost { CONTROL_H } else { BTN_H },
+        ),
+    )
+}
+
+/// Width the Secondary (SP_L-padded) button paints for `label`, including the
+/// caller-visible padding but *without* any min-width. Helper so a row layout
+/// can derive a matching field width from the painted button size.
+pub fn button_width_for(ui: &Ui, label: &str) -> f32 {
+    text_width(ui, label, FontId::new(BODY_SIZE, proportional())) + SP_L * 2.0
+}
+
+/// Real button: Primary / Secondary / Ghost, with animated hover and pressed
+/// fill, focus ring, and an explicit disabled state.
 pub fn button(ui: &mut Ui, label: &str, kind: ButtonKind, enabled: bool) -> Response {
     let font = FontId::new(BODY_SIZE, proportional());
     let pad_x = if kind == ButtonKind::Ghost { SP_S } else { SP_L };
     let min_w = if kind == ButtonKind::Primary { BUTTON_MIN_W } else { 0.0 };
     let size = Vec2::new(
         (text_width(ui, label, font.clone()) + pad_x * 2.0).max(min_w),
-        if kind == ButtonKind::Ghost {
-            CONTROL_H
-        } else {
-            BTN_H
-        },
+        if kind == ButtonKind::Ghost { CONTROL_H } else { BTN_H },
     );
+    draw_button(ui, label, kind, enabled, size)
+}
+
+fn draw_button(
+    ui: &mut Ui,
+    label: &str,
+    kind: ButtonKind,
+    enabled: bool,
+    size: Vec2,
+) -> Response {
+    let font = FontId::new(BODY_SIZE, proportional());
 
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, response) = ui.allocate_exact_size(size, sense);
 
     let hovered = enabled && response.hovered();
     let pressed = enabled && response.is_pointer_button_down_on();
-    let t = ui
-        .ctx()
-        .animate_bool_with_time(response.id, hovered, ANIM);
+    let t = ui.ctx().animate_bool_with_time(response.id, hovered, ANIM);
 
     let rounding = Rounding::same(R_MEDIUM);
     let (fill, text_color, stroke) = match kind {
@@ -135,7 +169,7 @@ pub fn button(ui: &mut Ui, label: &str, kind: ButtonKind, enabled: bool) -> Resp
             let stroke = if enabled {
                 Stroke::NONE
             } else {
-                Stroke::new(1.0_f32, STROKE_SOFT)
+                Stroke::new(1.0_f32, STROKE)
             };
             (fill, text, stroke)
         }
@@ -150,12 +184,14 @@ pub fn button(ui: &mut Ui, label: &str, kind: ButtonKind, enabled: bool) -> Resp
             (
                 fill,
                 if enabled { TEXT } else { TEXT_DISABLED },
-                Stroke::new(1.0_f32, STROKE),
+                Stroke::new(1.0_f32, if enabled { STROKE } else { STROKE_SOFT }),
             )
         }
         ButtonKind::Ghost => {
             let fill = if !enabled {
                 transparent()
+            } else if pressed {
+                CONTROL_PRESSED
             } else {
                 mix(transparent(), CONTROL_HOVER, t)
             };
@@ -175,11 +211,7 @@ pub fn button(ui: &mut Ui, label: &str, kind: ButtonKind, enabled: bool) -> Resp
         painter.rect_stroke(rect, rounding, stroke);
     }
     if response.has_focus() {
-        let ring = if kind == ButtonKind::Primary {
-            TEXT
-        } else {
-            ACCENT
-        };
+        let ring = if kind == ButtonKind::Primary { TEXT } else { ACCENT };
         painter.rect_stroke(
             rect.expand(2.0),
             rounding,
@@ -203,7 +235,14 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str, enabled: bool) -> Res
         .ctx()
         .animate_bool_with_time(response.id, enabled && response.hovered(), ANIM);
 
-    if t > 0.0 {
+    let pressed = enabled && response.is_pointer_button_down_on();
+    if pressed {
+        ui.painter().rect_filled(
+            rect,
+            Rounding::same(R_SMALL),
+            CONTROL_PRESSED,
+        );
+    } else if t > 0.0 {
         ui.painter().rect_filled(
             rect,
             Rounding::same(R_SMALL),
@@ -312,10 +351,12 @@ pub fn progress(ui: &mut Ui, id: Id, fraction: f32, color: Color32) {
     let shown = ui.ctx().animate_value_with_time(id, target, 0.3);
     let rounding = Rounding::same(PROGRESS_H * 0.5);
 
-    ui.painter().rect_filled(rect, rounding, TRACK);
+    ui.painter().rect_filled(rect, rounding, TRACK_FILL);
+    ui.painter()
+        .rect_stroke(rect, rounding, Stroke::new(1.0_f32, STROKE));
     if shown > 0.001 {
         let width = (rect.width() * shown).max(PROGRESS_H);
-        let fill = Rect::from_min_size(rect.min, Vec2::new(width, rect.height()));
+        let fill = Rect::from_min_size(rect.min + Vec2::splat(1.0), Vec2::new(width - 2.0, rect.height() - 2.0));
         ui.painter().rect_filled(fill, rounding, color);
     }
 }
@@ -427,8 +468,14 @@ pub struct FieldResponse {
     pub submitted: bool,
 }
 
+/// A dim hint that sits clearly below real text (unlike the egui hint,
+/// which uses the global weak text colour).
+const HINT_COLOR: Color32 = Color32::from_rgba_premultiplied(0x8B, 0x8B, 0x8B, 0x6F);
+
 /// Fluent text field: filled surface, accent focus border/underline, optional
-/// leading icon and trailing suffix.
+/// leading icon and trailing suffix. When the buffer is empty and the field
+/// is unfocused, the hint is painted in a dim colour so it can never be
+/// mistaken for a real value.
 pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldResponse {
     let width = field.width.unwrap_or_else(|| ui.available_width());
 
@@ -436,7 +483,7 @@ pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldRespo
         let (rect, background) =
             ui.allocate_exact_size(Vec2::new(width, field.height), Sense::click());
         let painter = ui.painter().clone();
-        painter.rect_filled(rect, Rounding::same(R_SMALL), FIELD);
+        painter.rect_filled(rect, Rounding::same(R_SMALL), CONTROL);
 
         let icon_w = if field.icon.is_some() { FIELD_ICON_W } else { 0.0 };
         let suffix_w = field
@@ -447,8 +494,8 @@ pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldRespo
         let left = rect.left() + SP_M + icon_w;
         let right = rect.right() - SP_M - suffix_w;
         let text_rect = Rect::from_min_max(
-            egui::pos2(left, rect.center().y - 11.0),
-            egui::pos2(right.max(left + 24.0), rect.center().y + 11.0),
+            egui::pos2(left, rect.center().y - (field.height * 0.5).min(16.0)),
+            egui::pos2(right.max(left + 24.0), rect.center().y + (field.height * 0.5).min(16.0)),
         );
 
         let response = ui.put(
@@ -458,9 +505,18 @@ pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldRespo
                 .frame(false)
                 .margin(egui::Margin::symmetric(0.0, 0.0))
                 .vertical_align(Align::Center)
-                .hint_text(field.hint)
                 .text_color(TEXT),
         );
+
+        if buf.is_empty() && !response.has_focus() {
+            painter.text(
+                egui::pos2(left, rect.center().y),
+                Align2::LEFT_CENTER,
+                field.hint,
+                FontId::new(BODY_SIZE, proportional()),
+                HINT_COLOR,
+            );
+        }
 
         if let Some(icon) = field.icon {
             painter.text(
@@ -487,7 +543,7 @@ pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldRespo
         } else if focused {
             (ACCENT, 1.5)
         } else {
-            (STROKE_SOFT, 1.0_f32)
+            (STROKE, 1.0_f32)
         };
         painter.rect_stroke(rect, Rounding::same(R_SMALL), Stroke::new(width_px, color));
         if focused && !field.invalid {
@@ -535,7 +591,9 @@ pub fn stepper(
 
             let (rect, _) = ui.allocate_exact_size(Vec2::new(STEP_VALUE_W, FIELD_H), Sense::hover());
             ui.painter()
-                .rect_filled(rect, Rounding::same(R_SMALL), FIELD);
+                .rect_filled(rect, Rounding::same(R_SMALL), CONTROL);
+            ui.painter()
+                .rect_stroke(rect, Rounding::same(R_SMALL), Stroke::new(1.0_f32, STROKE));
             ui.painter().text(
                 rect.center(),
                 Align2::CENTER_CENTER,
@@ -677,13 +735,13 @@ pub fn dropdown(
         if hovered {
             mix(FIELD, CONTROL_HOVER, t)
         } else {
-            FIELD
+            CONTROL
         },
     );
     let border = if open || response.has_focus() {
         (ACCENT, 1.5_f32)
     } else {
-        (STROKE_SOFT, 1.0_f32)
+        (STROKE, 1.0_f32)
     };
     painter.rect_stroke(
         rect,

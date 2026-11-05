@@ -26,8 +26,8 @@ pub const FIELD: Color32 = Color32::from_rgb(0x37, 0x37, 0x37);
 pub const STROKE: Color32 = Color32::from_rgb(0x33, 0x33, 0x33);
 /// Softer border for nested layers.
 pub const STROKE_SOFT: Color32 = Color32::from_rgb(0x2A, 0x2A, 0x2A);
-/// Progress track / inert fill.
-pub const TRACK: Color32 = Color32::from_rgb(0x3A, 0x3A, 0x3A);
+/// Visible empty-track fill (~#FFFFFF1F over CARD).
+pub const TRACK_FILL: Color32 = Color32::from_rgb(0x4A, 0x4A, 0x4A);
 
 // --- text ------------------------------------------------------------------
 
@@ -116,6 +116,8 @@ pub const TITLE_SIZE: f32 = 20.0;
 pub const SECTION_SIZE: f32 = 16.0;
 pub const BODY_SIZE: f32 = 14.0;
 pub const CAPTION_SIZE: f32 = 12.0;
+/// Form-field label size.
+pub const LABEL_SIZE: f32 = 13.0;
 
 const SEMIBOLD_FAMILY: &str = "rg-semibold";
 const ICON_FAMILY: &str = "rg-icons";
@@ -159,6 +161,13 @@ pub fn caption(text: impl Into<String>) -> RichText {
     RichText::new(text)
         .font(FontId::new(CAPTION_SIZE, proportional()))
         .color(TEXT_SECONDARY)
+}
+
+/// 13px caption for form-field labels, slightly brighter than a caption.
+pub fn label(text: impl Into<String>) -> RichText {
+    RichText::new(text)
+        .font(FontId::new(LABEL_SIZE, proportional()))
+        .color(TEXT)
 }
 
 pub fn caption_tertiary(text: impl Into<String>) -> RichText {

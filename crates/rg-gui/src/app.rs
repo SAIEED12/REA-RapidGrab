@@ -948,7 +948,7 @@ fn header(
             } else {
                 "New download"
             };
-            if widgets::button(ui, label, widgets::ButtonKind::Ghost, true).clicked() {
+            if widgets::button(ui, label, widgets::ButtonKind::Secondary, true).clicked() {
                 app.show_add_panel = !app.show_add_panel;
                 if app.show_add_panel {
                     app.focus_url = true;
@@ -971,6 +971,106 @@ fn header(
     });
 }
 
+/// Save-as row: field + Browse in one full-width row. The field width is
+/// derived from the button's *painted* width, so the row's right edge is
+/// exactly the card's inner right edge — the same edge as the URL field
+/// above and the right-aligned "Start download" button below.
+fn save_as_row(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
+    ui.add(egui::Label::new(theme::label("Save as")));
+
+    // Space between the field and the button; the field width is derived
+    // from the same gap so the row spans exactly the available width.
+    let gap = theme::SP_S;
+
+    // The button's real painted width (label + 2×SP_L), floored at BROWSE_W
+    // so it never renders narrower than intended. field_w is computed from
+    // the *same* number the button paints, so the row's right edge is
+    // exactly the card's inner right edge — same as the URL field and the
+    // right-aligned Start button.
+    let button_w = widgets::button_width_for(ui, "Browse…").max(theme::BROWSE_W);
+    let field_w = (ui.available_width() - button_w - gap).max(140.0);
+
+    ui.horizontal(|ui| {
+        widgets::text_field(
+            ui,
+            widgets::Field::new("rg-output", "C:\\Downloads\\download.bin").width(field_w),
+            &mut app.new_output,
+        );
+        if widgets::button_fixed_width(
+            ui,
+            "Browse…",
+            widgets::ButtonKind::Secondary,
+            true,
+            button_w,
+        )
+        .clicked()
+        {
+            app.browse_output();
+        }
+    });
+}
+
+/// The Connections / Speed cap / Run at once settings, laid out as three
+/// equal columns across the card width, stacked below ~480px.
+fn settings_row(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
+    let header = |ui: &mut egui::Ui, text: &str| {
+        ui.add(egui::Label::new(theme::label(text)));
+    };
+    if ui.available_width() >= 480.0 {
+        ui.columns(3, |cols| {
+            cols[0].vertical(|ui| {
+                header(ui, "Connections");
+                widgets::stepper(ui, "rg-connections", &mut app.new_connections, 1..=16);
+            });
+            cols[1].vertical(|ui| {
+                header(ui, "Speed cap");
+                widgets::text_field(
+                    ui,
+                    widgets::Field::new("rg-limit", "Unlimited")
+                        .suffix("KB/s")
+                        .width(theme::LIMIT_W),
+                    &mut app.new_limit_kbps,
+                );
+            });
+            cols[2].vertical(|ui| {
+                header(ui, "Run at once");
+                widgets::stepper(
+                    ui,
+                    "rg-concurrent",
+                    &mut app.settings.max_concurrent,
+                    1..=8,
+                );
+            });
+        });
+    } else {
+        ui.vertical(|ui| {
+            ui.add(egui::Label::new(theme::label("Connections")));
+            widgets::stepper(ui, "rg-connections", &mut app.new_connections, 1..=16);
+        });
+        ui.add_space(theme::SP_S);
+        ui.vertical(|ui| {
+            ui.add(egui::Label::new(theme::label("Speed cap")));
+            widgets::text_field(
+                ui,
+                widgets::Field::new("rg-limit", "Unlimited")
+                    .suffix("KB/s")
+                    .width(theme::LIMIT_W),
+                &mut app.new_limit_kbps,
+            );
+        });
+        ui.add_space(theme::SP_S);
+        ui.vertical(|ui| {
+            ui.add(egui::Label::new(theme::label("Run at once")));
+            widgets::stepper(
+                ui,
+                "rg-concurrent",
+                &mut app.settings.max_concurrent,
+                1..=8,
+            );
+        });
+    }
+}
+
 /// The "New download" form card.
 fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
     let invalid = url_error(&app.new_url);
@@ -983,7 +1083,7 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
         ui.add(egui::Label::new(theme::section("New download")));
         ui.add_space(theme::SP_XS);
 
-        ui.add(egui::Label::new(theme::caption("URL")));
+        ui.add(egui::Label::new(theme::label("URL")));
         if std::mem::take(&mut app.focus_url) {
             ui.memory_mut(|m| m.request_focus(egui::Id::new("rg-url")));
         }
@@ -1010,19 +1110,7 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
             ));
         }
 
-        ui.add(egui::Label::new(theme::caption("Save as")));
-        ui.horizontal(|ui| {
-            let browse_width = theme::BROWSE_W;
-            let field_width = (ui.available_width() - browse_width - theme::SP_S).max(140.0);
-            widgets::text_field(
-                ui,
-                widgets::Field::new("rg-output", "C:\\Downloads\\download.bin").width(field_width),
-                &mut app.new_output,
-            );
-            if widgets::button(ui, "Browse…", widgets::ButtonKind::Secondary, true).clicked() {
-                app.browse_output();
-            }
-        });
+        save_as_row(ui, app);
         if app.output_would_replace() {
             widgets::warning_line(
                 ui,
@@ -1031,33 +1119,7 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
         }
 
         ui.add_space(theme::SP_XS);
-        ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.add(egui::Label::new(theme::caption("Connections")));
-                widgets::stepper(ui, "rg-connections", &mut app.new_connections, 1..=16);
-            });
-            ui.add_space(theme::SP_L);
-            ui.vertical(|ui| {
-                ui.add(egui::Label::new(theme::caption("Speed cap")));
-                widgets::text_field(
-                    ui,
-                    widgets::Field::new("rg-limit", "Unlimited")
-                        .suffix("KB/s")
-                        .width(theme::LIMIT_W),
-                    &mut app.new_limit_kbps,
-                );
-            });
-            ui.add_space(theme::SP_L);
-            ui.vertical(|ui| {
-                ui.add(egui::Label::new(theme::caption("Run at once")));
-                widgets::stepper(
-                    ui,
-                    "rg-concurrent",
-                    &mut app.settings.max_concurrent,
-                    1..=8,
-                );
-            });
-        });
+        settings_row(ui, app);
 
         widgets::divider(ui);
 
@@ -1068,7 +1130,7 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
             form_columns(
                 ui,
                 |ui| {
-                    ui.add(egui::Label::new(theme::caption(
+                    ui.add(egui::Label::new(theme::label(
                         "SHA-256 checksum (optional)",
                     )));
                     widgets::text_field(
@@ -1078,7 +1140,7 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
                     );
                 },
                 |ui| {
-                    ui.add(egui::Label::new(theme::caption("User-Agent (optional)")));
+                    ui.add(egui::Label::new(theme::label("User-Agent (optional)")));
                     widgets::text_field(
                         ui,
                         widgets::Field::new("rg-ua", "Mozilla/5.0…"),
@@ -1113,7 +1175,7 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
             form_columns(
                 ui,
                 |ui| {
-                    ui.add(egui::Label::new(theme::caption("yt-dlp path")));
+                    ui.add(egui::Label::new(theme::label("yt-dlp path")));
                     widgets::text_field(
                         ui,
                         widgets::Field::new("rg-ytdlp", "auto-detected"),
@@ -1121,7 +1183,7 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
                     );
                 },
                 |ui| {
-                    ui.add(egui::Label::new(theme::caption("ffmpeg path")));
+                    ui.add(egui::Label::new(theme::label("ffmpeg path")));
                     widgets::text_field(
                         ui,
                         widgets::Field::new("rg-ffmpeg", "auto-detected"),
@@ -1129,7 +1191,7 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
                     );
                 },
             );
-            ui.add(egui::Label::new(theme::caption("Extra yt-dlp args")));
+            ui.add(egui::Label::new(theme::label("Extra yt-dlp args")));
             widgets::text_field(
                 ui,
                 widgets::Field::new("rg-ytargs", "--cookies \"C:\\Users\\me\\cookies.txt\""),
@@ -1228,7 +1290,7 @@ fn max_height_picker(ui: &mut egui::Ui, value: &mut u32) {
     let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
 
     ui.horizontal(|ui| {
-        ui.add(egui::Label::new(theme::caption("Max height")));
+        ui.add(egui::Label::new(theme::label("Max height")));
         if let Some(index) = widgets::dropdown(
             ui,
             "rg-max-height",
@@ -1238,9 +1300,6 @@ fn max_height_picker(ui: &mut egui::Ui, value: &mut u32) {
         ) {
             *value = values[index];
         }
-        ui.add(egui::Label::new(theme::caption_tertiary(
-            "0 = best available",
-        )));
     });
 }
 
@@ -1256,12 +1315,12 @@ fn downloads_section(
         if !views.is_empty() {
             widgets::chip(ui, &views.len().to_string(), theme::ACCENT);
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add(egui::Label::new(theme::caption(format!(
-                "max {} at once",
-                app.settings.max_concurrent
-            ))));
-        });
+        ui.add_space(theme::SP_S);
+        widgets::chip(
+            ui,
+            &format!("max {} at once", app.settings.max_concurrent),
+            theme::TEXT_SECONDARY,
+        );
     });
     ui.add_space(theme::SP_S);
 
