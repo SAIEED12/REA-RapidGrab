@@ -10,7 +10,10 @@ use tracing_subscriber::EnvFilter;
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("rg_core=info,rg_gui=info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("rg_core=info,rg_gui=info")),
+        )
         .init();
 
     let native_options = eframe::NativeOptions {

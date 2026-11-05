@@ -21,10 +21,7 @@ pub enum Error {
         "refusing to save a web page: server returned {content_type} for {url}; \
          use an extractor such as yt-dlp for video pages"
     )]
-    WebPage {
-        content_type: String,
-        url: String,
-    },
+    WebPage { content_type: String, url: String },
     /// The caller asked the download to stop; partial state is kept for resume.
     #[error("download cancelled")]
     Cancelled,

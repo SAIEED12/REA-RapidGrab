@@ -1,0 +1,13 @@
+[package]
+name = "rg-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Browser-capture bridge: native-messaging framing and the named-pipe client/server between the extension and the GUI"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winbase", "winnt", "fileapi", "errhandlingapi", "handleapi", "namedpipeapi"] }

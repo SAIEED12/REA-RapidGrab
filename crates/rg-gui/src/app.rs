@@ -84,6 +84,8 @@ pub struct DownloadJob {
     pub speed_limit: Option<u64>,
     pub sha256: Option<String>,
     pub user_agent: Option<String>,
+    pub referer: Option<String>,
+    pub cookie: Option<String>,
     pub restart: bool,
     pub status: JobStatus,
     pub progress: Option<Progress>,
@@ -193,6 +195,9 @@ pub struct RapidGrabApp {
     rt: Arc<Runtime>,
     update_rx: Receiver<DownloadUpdate>,
     update_tx: Sender<DownloadUpdate>,
+    capture_rx: Receiver<rg_bridge::CaptureRequest>,
+    #[allow(dead_code)]
+    pipe_guard: Option<rg_bridge::PipeGuard>,
     jobs: HashMap<usize, DownloadJob>,
     next_id: usize,
 
@@ -206,6 +211,8 @@ pub struct RapidGrabApp {
     new_restart: bool,
     new_sha256: String,
     new_user_agent: String,
+    new_referer: String,
+    new_cookie: String,
     show_add_panel: bool,
     /// Set when a button should move keyboard focus back to the URL field.
     focus_url: bool,
@@ -233,6 +240,15 @@ impl RapidGrabApp {
             .send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
         let rt = Arc::new(Runtime::new().expect("Failed to create tokio runtime"));
         let (update_tx, update_rx) = unbounded();
+        let (capture_tx, capture_rx) = unbounded::<rg_bridge::CaptureRequest>();
+        let pipe_guard = if cfg!(windows) {
+            rg_bridge::listen(move |req| {
+                let _ = capture_tx.send(req);
+            })
+            .ok()
+        } else {
+            None
+        };
 
         let settings: Settings = cc
             .storage
@@ -248,6 +264,8 @@ impl RapidGrabApp {
             rt,
             update_rx,
             update_tx,
+            capture_rx,
+            pipe_guard,
             jobs: HashMap::new(),
             next_id: 1,
             new_connections: settings.connections,
@@ -258,6 +276,8 @@ impl RapidGrabApp {
             new_output: String::new(),
             new_restart: false,
             new_sha256: String::new(),
+            new_referer: String::new(),
+            new_cookie: String::new(),
             show_add_panel: true,
             focus_url: false,
             output_probe: None,
@@ -348,6 +368,8 @@ impl RapidGrabApp {
                 speed_limit,
                 sha256,
                 user_agent,
+                referer: non_empty(&self.new_referer),
+                cookie: non_empty(&self.new_cookie),
                 restart: self.new_restart,
                 status: JobStatus::Queued,
                 progress: None,
@@ -372,6 +394,8 @@ impl RapidGrabApp {
 
         self.new_url.clear();
         self.new_sha256.clear();
+        self.new_referer.clear();
+        self.new_cookie.clear();
         // The next download starts from a clean form: re-suggest the save path
         // from the next URL instead of silently reusing this one, and never
         // carry a one-shot "ignore existing parts" flag into another job.
@@ -415,13 +439,26 @@ impl RapidGrabApp {
                 job.speed_limit,
                 job.sha256.clone(),
                 job.user_agent.clone(),
+                job.referer.clone(),
+                job.cookie.clone(),
                 restart,
             )
         }) else {
             return;
         };
 
-        let (run, url, output, connections, speed_limit, sha256, user_agent, restart) = params;
+        let (
+            run,
+            url,
+            output,
+            connections,
+            speed_limit,
+            sha256,
+            user_agent,
+            referer,
+            cookie,
+            restart,
+        ) = params;
         let task_cancel = cancel.clone();
 
         let handle = self.rt.spawn(async move {
@@ -456,6 +493,12 @@ impl RapidGrabApp {
             }
             if let Some(ref ua) = user_agent {
                 dl = dl.user_agent(ua.clone());
+            }
+            if let Some(ref r) = referer {
+                dl = dl.referer(r.clone());
+            }
+            if let Some(ref c) = cookie {
+                dl = dl.cookie(c.clone());
             }
 
             let tx2 = tx.clone();
@@ -523,9 +566,7 @@ impl RapidGrabApp {
                     let tx_media = tx.clone();
                     let callback = move |event: MediaEvent| {
                         let (status, progress, output, media) = match event {
-                            MediaEvent::Resolving => {
-                                (JobStatus::Resolving, None, None, None)
-                            }
+                            MediaEvent::Resolving => (JobStatus::Resolving, None, None, None),
                             MediaEvent::Resolved { output, .. } => {
                                 (JobStatus::Resolving, None, Some(output), None)
                             }
@@ -643,7 +684,10 @@ impl RapidGrabApp {
 
     fn restart_job(&mut self, id: usize) {
         if let Some(job) = self.jobs.get_mut(&id) {
-            if matches!(job.status, JobStatus::Paused | JobStatus::Cancelled | JobStatus::Failed) {
+            if matches!(
+                job.status,
+                JobStatus::Paused | JobStatus::Cancelled | JobStatus::Failed
+            ) {
                 job.status = JobStatus::Queued;
                 job.restart = true;
                 job.error = None;
@@ -655,7 +699,10 @@ impl RapidGrabApp {
 
     fn resume_job(&mut self, id: usize) {
         if let Some(job) = self.jobs.get_mut(&id) {
-            if matches!(job.status, JobStatus::Paused | JobStatus::Cancelled | JobStatus::Failed) {
+            if matches!(
+                job.status,
+                JobStatus::Paused | JobStatus::Cancelled | JobStatus::Failed
+            ) {
                 job.status = JobStatus::Queued;
                 job.error = None;
                 job.intent = None;
@@ -684,11 +731,7 @@ impl RapidGrabApp {
     /// Starts queued jobs while the concurrency budget allows.
     fn pump_queue(&mut self) {
         let max = self.settings.max_concurrent.max(1);
-        let active = self
-            .jobs
-            .values()
-            .filter(|j| j.status.is_active())
-            .count();
+        let active = self.jobs.values().filter(|j| j.status.is_active()).count();
         if active >= max {
             return;
         }
@@ -834,7 +877,11 @@ impl RapidGrabApp {
                 error: j.error.clone(),
                 failure: j.failure,
                 notice: j.notice.clone(),
-                speed_bps: if j.status.is_active() { j.last_speed } else { 0.0 },
+                speed_bps: if j.status.is_active() {
+                    j.last_speed
+                } else {
+                    0.0
+                },
                 elapsed: j.total_elapsed(),
             })
             .collect();
@@ -864,6 +911,33 @@ impl eframe::App for RapidGrabApp {
         while let Ok(update) = self.update_rx.try_recv() {
             self.apply_update(update);
         }
+        // Browser captures: pre-fill the form (confirm-first, never auto-start).
+        while let Ok(capture) = self.capture_rx.try_recv() {
+            self.new_url = capture.url;
+            if let Some(filename) = capture.filename {
+                if !filename.trim().is_empty() {
+                    // Suggest just the filename; the user picks the folder by
+                    // confirming (no auto-write outside Downloads).
+                    let dir = if self.settings.last_dir.is_empty() {
+                        dirs::download_dir().unwrap_or_else(|| PathBuf::from("."))
+                    } else {
+                        PathBuf::from(&self.settings.last_dir)
+                    };
+                    self.new_output = dir.join(filename).display().to_string();
+                }
+            }
+            if let Some(referer) = capture.referer {
+                self.new_referer = referer;
+            }
+            if let Some(cookies) = capture.cookies {
+                self.new_cookie = cookies;
+            }
+            if let Some(ua) = capture.user_agent {
+                self.new_user_agent = ua;
+            }
+            self.show_add_panel = true;
+            self.focus_url = true;
+        }
         for job in self.jobs.values_mut() {
             if job.status.is_active() && job.handle.as_ref().is_some_and(|h| h.is_finished()) {
                 if let Some(started) = job.started_at.take() {
@@ -883,7 +957,10 @@ impl eframe::App for RapidGrabApp {
         let mut actions: Vec<Action> = Vec::new();
         let views = self.job_views();
         let active = views.iter().filter(|v| v.status.is_active()).count();
-        let queued = views.iter().filter(|v| v.status == JobStatus::Queued).count();
+        let queued = views
+            .iter()
+            .filter(|v| v.status == JobStatus::Queued)
+            .count();
         let total_speed: f64 = views.iter().map(|v| v.speed_bps).sum();
 
         egui::CentralPanel::default()
@@ -906,18 +983,18 @@ impl eframe::App for RapidGrabApp {
                     self.page_reset_done = true;
                 }
                 area.show(ui, |ui| {
-                        widgets::content_column(ui, |ui| {
-                            header(ui, self, active, queued, total_speed);
-                            ui.add_space(theme::SP_M);
+                    widgets::content_column(ui, |ui| {
+                        header(ui, self, active, queued, total_speed);
+                        ui.add_space(theme::SP_M);
 
-                            if self.show_add_panel {
-                                add_download_card(ui, self);
-                                ui.add_space(theme::SP_XL);
-                            }
+                        if self.show_add_panel {
+                            add_download_card(ui, self);
+                            ui.add_space(theme::SP_XL);
+                        }
 
-                            downloads_section(ui, self, &views, &mut actions);
-                        });
+                        downloads_section(ui, self, &views, &mut actions);
                     });
+                });
             });
 
         self.handle_actions(actions);
@@ -1112,12 +1189,7 @@ fn settings_row(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
             });
             cols[2].vertical(|ui| {
                 header(ui, "Run at once");
-                widgets::stepper(
-                    ui,
-                    "rg-concurrent",
-                    &mut app.settings.max_concurrent,
-                    1..=8,
-                );
+                widgets::stepper(ui, "rg-concurrent", &mut app.settings.max_concurrent, 1..=8);
             });
         });
     } else {
@@ -1139,12 +1211,7 @@ fn settings_row(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
         ui.add_space(theme::SP_S);
         ui.vertical(|ui| {
             ui.add(egui::Label::new(theme::label("Run at once")));
-            widgets::stepper(
-                ui,
-                "rg-concurrent",
-                &mut app.settings.max_concurrent,
-                1..=8,
-            );
+            widgets::stepper(ui, "rg-concurrent", &mut app.settings.max_concurrent, 1..=8);
         });
     }
 }
@@ -1213,19 +1280,11 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
                     ui.add(egui::Label::new(theme::label(
                         "SHA-256 checksum (optional)",
                     )));
-                    widgets::text_field(
-                        ui,
-                        widgets::Field::new("rg-sha", "expected digest"),
-                        sha,
-                    );
+                    widgets::text_field(ui, widgets::Field::new("rg-sha", "expected digest"), sha);
                 },
                 |ui| {
                     ui.add(egui::Label::new(theme::label("User-Agent (optional)")));
-                    widgets::text_field(
-                        ui,
-                        widgets::Field::new("rg-ua", "Mozilla/5.0…"),
-                        ua,
-                    );
+                    widgets::text_field(ui, widgets::Field::new("rg-ua", "Mozilla/5.0…"), ua);
                 },
             );
             ui.add_space(theme::SP_XS);
@@ -1294,8 +1353,7 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
 
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let can_start = url_error(&app.new_url).is_none()
-                    && !app.new_url.trim().is_empty();
+                let can_start = url_error(&app.new_url).is_none() && !app.new_url.trim().is_empty();
                 if widgets::button(
                     ui,
                     "Start download",
@@ -1371,13 +1429,9 @@ fn max_height_picker(ui: &mut egui::Ui, value: &mut u32) {
 
     ui.horizontal(|ui| {
         ui.add(egui::Label::new(theme::label("Max height")));
-        if let Some(index) = widgets::dropdown(
-            ui,
-            "rg-max-height",
-            selected,
-            &labels,
-            theme::DROPDOWN_W,
-        ) {
+        if let Some(index) =
+            widgets::dropdown(ui, "rg-max-height", selected, &labels, theme::DROPDOWN_W)
+        {
             *value = values[index];
         }
     });
@@ -1674,17 +1728,13 @@ fn job_card(ui: &mut egui::Ui, view: &JobView, actions: &mut Vec<Action>) {
 
         ui.horizontal(|ui| {
             let buttons = action_count(&view.status) as f32;
-            let icons_width =
-                buttons * theme::ICON_BTN + (buttons - 1.0).max(0.0) * theme::SP_XS;
+            let icons_width = buttons * theme::ICON_BTN + (buttons - 1.0).max(0.0) * theme::SP_XS;
             let text_width = (ui.available_width() - icons_width).max(80.0);
             ui.allocate_ui_with_layout(
                 egui::vec2(text_width, theme::ICON_BTN),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    ui.add(
-                        egui::Label::new(theme::caption(progress.detail.clone()))
-                            .truncate(),
-                    );
+                    ui.add(egui::Label::new(theme::caption(progress.detail.clone())).truncate());
                 },
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

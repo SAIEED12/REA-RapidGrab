@@ -4,9 +4,7 @@
 
 use std::sync::OnceLock;
 
-use eframe::egui::{
-    self, Color32, FontData, FontDefinitions, FontFamily, FontId, RichText,
-};
+use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, FontId, RichText};
 
 // --- surfaces --------------------------------------------------------------
 
@@ -148,7 +146,14 @@ pub fn icons_available() -> bool {
 }
 
 pub fn icon_font(size: f32) -> FontId {
-    FontId::new(size, if icons_available() { icon_family() } else { proportional() })
+    FontId::new(
+        size,
+        if icons_available() {
+            icon_family()
+        } else {
+            proportional()
+        },
+    )
 }
 
 pub fn title(text: &str) -> RichText {
@@ -258,10 +263,8 @@ impl Icon {
 // --- theme application -----------------------------------------------------
 
 fn font_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(
-        std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string()),
-    )
-    .join("Fonts")
+    std::path::PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string()))
+        .join("Fonts")
 }
 
 fn read_font(names: &[&str]) -> Option<FontData> {
@@ -438,10 +441,22 @@ fn style() -> egui::Style {
             egui::TextStyle::Heading,
             FontId::new(SECTION_SIZE, semibold_family()),
         ),
-        (egui::TextStyle::Body, FontId::new(BODY_SIZE, proportional())),
-        (egui::TextStyle::Button, FontId::new(BODY_SIZE, proportional())),
-        (egui::TextStyle::Small, FontId::new(CAPTION_SIZE, proportional())),
-        (egui::TextStyle::Monospace, FontId::monospace(BODY_SIZE - 1.0)),
+        (
+            egui::TextStyle::Body,
+            FontId::new(BODY_SIZE, proportional()),
+        ),
+        (
+            egui::TextStyle::Button,
+            FontId::new(BODY_SIZE, proportional()),
+        ),
+        (
+            egui::TextStyle::Small,
+            FontId::new(CAPTION_SIZE, proportional()),
+        ),
+        (
+            egui::TextStyle::Monospace,
+            FontId::monospace(BODY_SIZE - 1.0),
+        ),
         (
             egui::TextStyle::Name("Title".into()),
             FontId::new(TITLE_SIZE, semibold_family()),

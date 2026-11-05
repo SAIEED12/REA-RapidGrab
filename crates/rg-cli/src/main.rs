@@ -3,11 +3,16 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use rg_bridge::CaptureRequest;
 use rg_core::{Download, Progress};
 use rg_resolve::{MediaEvent, MediaRequest, MediaStage, Tools};
 
 #[derive(Parser)]
-#[command(name = "rapidgrab", version, about = "Multi-segment resumable HTTP downloader")]
+#[command(
+    name = "rapidgrab",
+    version,
+    about = "Multi-segment resumable HTTP downloader"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -70,6 +75,9 @@ enum Command {
     },
     /// Show the persisted segment map for an output file
     Status { output: PathBuf },
+    /// Native-messaging host: read one capture frame from stdin (length-
+    /// prefixed JSON) and forward it to the GUI named pipe.
+    Host,
 }
 
 #[tokio::main]
@@ -240,6 +248,21 @@ async fn main() -> Result<()> {
                 }
                 None => println!("no partial download at {}", path.display()),
             }
+        }
+        Command::Host => {
+            let request = rg_bridge::read_frame(std::io::stdin())?;
+            rg_bridge::send_capture(&request)?;
+            // Native messaging expects a response frame.
+            rg_bridge::write_frame(
+                std::io::stdout(),
+                &CaptureRequest {
+                    url: String::new(),
+                    filename: None,
+                    referer: None,
+                    cookies: None,
+                    user_agent: None,
+                },
+            )?;
         }
     }
 

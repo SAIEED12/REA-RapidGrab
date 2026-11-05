@@ -1,0 +1,9 @@
+{
+  "name": "RapidGrab native host",
+  "description": "Forwards browser captures to the RapidGrab GUI via the named pipe.",
+  "path": "C:\\Program Files\\RapidGrab\\rapidgrab-host.exe",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://<EXTENSION_ID>/"
+  ]
+}

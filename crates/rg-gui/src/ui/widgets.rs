@@ -114,7 +114,11 @@ pub fn button_fixed_width(
         enabled,
         Vec2::new(
             width,
-            if kind == ButtonKind::Ghost { CONTROL_H } else { BTN_H },
+            if kind == ButtonKind::Ghost {
+                CONTROL_H
+            } else {
+                BTN_H
+            },
         ),
     )
 }
@@ -130,25 +134,35 @@ pub fn button_width_for(ui: &Ui, label: &str) -> f32 {
 /// fill, focus ring, and an explicit disabled state.
 pub fn button(ui: &mut Ui, label: &str, kind: ButtonKind, enabled: bool) -> Response {
     let font = FontId::new(BODY_SIZE, proportional());
-    let pad_x = if kind == ButtonKind::Ghost { SP_S } else { SP_L };
-    let min_w = if kind == ButtonKind::Primary { BUTTON_MIN_W } else { 0.0 };
+    let pad_x = if kind == ButtonKind::Ghost {
+        SP_S
+    } else {
+        SP_L
+    };
+    let min_w = if kind == ButtonKind::Primary {
+        BUTTON_MIN_W
+    } else {
+        0.0
+    };
     let size = Vec2::new(
         (text_width(ui, label, font.clone()) + pad_x * 2.0).max(min_w),
-        if kind == ButtonKind::Ghost { CONTROL_H } else { BTN_H },
+        if kind == ButtonKind::Ghost {
+            CONTROL_H
+        } else {
+            BTN_H
+        },
     );
     draw_button(ui, label, kind, enabled, size)
 }
 
-fn draw_button(
-    ui: &mut Ui,
-    label: &str,
-    kind: ButtonKind,
-    enabled: bool,
-    size: Vec2,
-) -> Response {
+fn draw_button(ui: &mut Ui, label: &str, kind: ButtonKind, enabled: bool, size: Vec2) -> Response {
     let font = FontId::new(BODY_SIZE, proportional());
 
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, response) = ui.allocate_exact_size(size, sense);
 
     let hovered = enabled && response.hovered();
@@ -197,7 +211,11 @@ fn draw_button(
             };
             (
                 fill,
-                if enabled { TEXT_SECONDARY } else { TEXT_DISABLED },
+                if enabled {
+                    TEXT_SECONDARY
+                } else {
+                    TEXT_DISABLED
+                },
                 Stroke::NONE,
             )
         }
@@ -211,14 +229,20 @@ fn draw_button(
         painter.rect_stroke(rect, rounding, stroke);
     }
     if response.has_focus() {
-        let ring = if kind == ButtonKind::Primary { TEXT } else { ACCENT };
-        painter.rect_stroke(
-            rect.expand(2.0),
-            rounding,
-            Stroke::new(1.5_f32, ring),
-        );
+        let ring = if kind == ButtonKind::Primary {
+            TEXT
+        } else {
+            ACCENT
+        };
+        painter.rect_stroke(rect.expand(2.0), rounding, Stroke::new(1.5_f32, ring));
     }
-    painter.text(rect.center(), Align2::CENTER_CENTER, label, font, text_color);
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        font,
+        text_color,
+    );
 
     if enabled {
         response.on_hover_cursor(CursorIcon::PointingHand)
@@ -229,7 +253,11 @@ fn draw_button(
 
 /// 28x28 borderless icon button with hover fill and tooltip.
 pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str, enabled: bool) -> Response {
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(ICON_BTN), sense);
     let t = ui
         .ctx()
@@ -237,11 +265,8 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str, enabled: bool) -> Res
 
     let pressed = enabled && response.is_pointer_button_down_on();
     if pressed {
-        ui.painter().rect_filled(
-            rect,
-            Rounding::same(R_SMALL),
-            CONTROL_PRESSED,
-        );
+        ui.painter()
+            .rect_filled(rect, Rounding::same(R_SMALL), CONTROL_PRESSED);
     } else if t > 0.0 {
         ui.painter().rect_filled(
             rect,
@@ -281,7 +306,11 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str, enabled: bool) -> Res
 /// animated hover and pressed fills, disabled state at the range limits, and
 /// the same radius as the fields it sits next to.
 pub fn filled_icon_button(ui: &mut Ui, icon: Icon, tooltip: &str, enabled: bool) -> Response {
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(ICON_BTN), sense);
     let hovered = enabled && response.hovered();
     let pressed = enabled && response.is_pointer_button_down_on();
@@ -344,7 +373,11 @@ pub fn status_chip(ui: &mut Ui, status: &JobStatus) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, STATUS_CHIP_H), Sense::hover());
 
     let painter = ui.painter();
-    painter.rect_filled(rect, Rounding::same(STATUS_CHIP_H * 0.5), mix(transparent(), color, 0.12));
+    painter.rect_filled(
+        rect,
+        Rounding::same(STATUS_CHIP_H * 0.5),
+        mix(transparent(), color, 0.12),
+    );
     if matches!(status, JobStatus::Completed) {
         painter.text(
             egui::pos2(rect.left() + SP_S + 4.0, rect.center().y),
@@ -428,7 +461,9 @@ pub fn alert(ui: &mut Ui, text: &str, color: Color32) {
                         .color(color),
                 ));
                 ui.add(egui::Label::new(
-                    RichText::new(text).font(FontId::new(CAPTION_SIZE, proportional())).color(color),
+                    RichText::new(text)
+                        .font(FontId::new(CAPTION_SIZE, proportional()))
+                        .color(color),
                 ));
             });
         });
@@ -545,7 +580,11 @@ pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldRespo
         let painter = ui.painter().clone();
         painter.rect_filled(rect, Rounding::same(R_SMALL), CONTROL);
 
-        let icon_w = if field.icon.is_some() { FIELD_ICON_W } else { 0.0 };
+        let icon_w = if field.icon.is_some() {
+            FIELD_ICON_W
+        } else {
+            0.0
+        };
         let suffix_w = field
             .suffix
             .map(|s| text_width(ui, s, FontId::new(CAPTION_SIZE, proportional())) + SP_S)
@@ -555,7 +594,10 @@ pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldRespo
         let right = rect.right() - SP_M - suffix_w;
         let text_rect = Rect::from_min_max(
             egui::pos2(left, rect.center().y - (field.height * 0.5).min(16.0)),
-            egui::pos2(right.max(left + 24.0), rect.center().y + (field.height * 0.5).min(16.0)),
+            egui::pos2(
+                right.max(left + 24.0),
+                rect.center().y + (field.height * 0.5).min(16.0),
+            ),
         );
 
         let response = ui.put(
@@ -574,7 +616,11 @@ pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldRespo
                 Align2::LEFT_CENTER,
                 field.hint,
                 FontId::new(BODY_SIZE, proportional()),
-                if field.dim_hint { HINT_COLOR_DIM } else { HINT_COLOR },
+                if field.dim_hint {
+                    HINT_COLOR_DIM
+                } else {
+                    HINT_COLOR
+                },
             );
         }
 
@@ -649,11 +695,15 @@ pub fn stepper(
                 changed = true;
             }
 
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(STEP_VALUE_W, FIELD_H), Sense::hover());
+            let (rect, _) =
+                ui.allocate_exact_size(Vec2::new(STEP_VALUE_W, FIELD_H), Sense::hover());
             ui.painter()
                 .rect_filled(rect, Rounding::same(R_SMALL), CONTROL);
-            ui.painter()
-                .rect_stroke(rect, Rounding::same(R_SMALL), Stroke::new(1.0_f32, STROKE_CONTROL));
+            ui.painter().rect_stroke(
+                rect,
+                Rounding::same(R_SMALL),
+                Stroke::new(1.0_f32, STROKE_CONTROL),
+            );
             ui.painter().text(
                 rect.center(),
                 Align2::CENTER_CENTER,
@@ -678,7 +728,11 @@ pub fn checkbox(ui: &mut Ui, id_salt: &str, checked: &mut bool, label: &str) -> 
     let enabled = ui.is_enabled();
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), CHECKBOX_ROW_H),
-        if enabled { Sense::click() } else { Sense::hover() },
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
     );
 
     let hovered = enabled && response.hovered();
@@ -687,10 +741,7 @@ pub fn checkbox(ui: &mut Ui, id_salt: &str, checked: &mut bool, label: &str) -> 
     let t = ui.ctx().animate_bool_with_time(anim_id, hovered, ANIM);
 
     let box_rect = Rect::from_center_size(
-        egui::pos2(
-            rect.left() + CHECKBOX_SIZE * 0.5,
-            rect.center().y,
-        ),
+        egui::pos2(rect.left() + CHECKBOX_SIZE * 0.5, rect.center().y),
         Vec2::splat(CHECKBOX_SIZE),
     );
     let painter = ui.painter().clone();
@@ -785,7 +836,11 @@ pub fn dropdown(
     let popup_id = ui.make_persistent_id(id_salt).with("popup");
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(width, FIELD_H),
-        if enabled { Sense::click() } else { Sense::hover() },
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
     );
 
     let open = ui.memory(|m| m.is_popup_open(popup_id));
@@ -826,7 +881,11 @@ pub fn dropdown(
         Align2::RIGHT_CENTER,
         Icon::ChevronDown.glyph(),
         icon_font(ICON_SIZE_SM),
-        if enabled { TEXT_SECONDARY } else { TEXT_DISABLED },
+        if enabled {
+            TEXT_SECONDARY
+        } else {
+            TEXT_DISABLED
+        },
     );
 
     if enabled && response.clicked() {

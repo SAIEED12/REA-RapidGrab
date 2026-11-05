@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use reqwest::header::{ACCEPT_ENCODING, IF_RANGE, RANGE, REFERER, USER_AGENT};
+use reqwest::header::{ACCEPT_ENCODING, COOKIE, IF_RANGE, RANGE, REFERER, USER_AGENT};
 use reqwest::StatusCode;
 use sha2::{Digest, Sha256};
 use tokio::fs::{self, File, OpenOptions};
@@ -71,6 +71,7 @@ pub struct Download {
     speed_limit: Option<u64>,
     user_agent: String,
     referer: Option<String>,
+    cookie: Option<String>,
     resume_key: Option<String>,
     resume: bool,
     retry_base: Duration,
@@ -90,6 +91,7 @@ impl Download {
             speed_limit: None,
             user_agent: DEFAULT_USER_AGENT.to_string(),
             referer: None,
+            cookie: None,
             resume_key: None,
             resume: true,
             retry_base: Duration::from_millis(100),
@@ -122,6 +124,18 @@ impl Download {
         self
     }
 
+    /// Send a `Cookie` header on every request (probe, ranges, single stream).
+    /// Used for browser captures where the site requires session cookies.
+    pub fn cookie(mut self, cookie: impl Into<String>) -> Self {
+        let value = cookie.into();
+        self.cookie = if value.trim().is_empty() {
+            None
+        } else {
+            Some(value)
+        };
+        self
+    }
+
     /// Stable resume identity when the request URL is signed and changes
     /// between runs (for example YouTube media URLs).
     pub fn resume_key(mut self, key: impl Into<String>) -> Self {
@@ -141,7 +155,11 @@ impl Download {
     pub fn sha256(mut self, expected: impl Into<String>) -> Self {
         let value = expected.into();
         let trimmed = value.trim().to_string();
-        self.expected_sha256 = if trimmed.is_empty() { None } else { Some(trimmed) };
+        self.expected_sha256 = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
         self
     }
 
@@ -186,7 +204,8 @@ impl Download {
             .pool_max_idle_per_host(self.connections)
             .build()?;
 
-        let p = probe::probe(&client, &self.url, &self.user_agent).await?;
+        let p =
+            probe::probe_with(&client, &self.url, &self.user_agent, self.cookie.as_deref()).await?;
         info!(
             "probe: size={} ranges={} etag={:?} type={:?}",
             p.total, p.accept_ranges, p.etag, p.content_type
@@ -215,10 +234,7 @@ impl Download {
                 self.output.display()
             );
         }
-        let referer = self
-            .referer
-            .clone()
-            .or_else(|| referer_for(&p.final_url));
+        let referer = self.referer.clone().or_else(|| referer_for(&p.final_url));
 
         if let Some(parent) = output.parent() {
             if !parent.as_os_str().is_empty() {
@@ -235,6 +251,7 @@ impl Download {
                 &output,
                 &self.user_agent,
                 referer.as_deref(),
+                self.cookie.as_deref(),
                 p.total,
                 self.speed_limit,
                 cancel.clone(),
@@ -252,7 +269,10 @@ impl Download {
         fs::create_dir_all(&parts_dir).await?;
         let manifest_path = parts_dir.join("manifest.json");
 
-        let mut st = SegState { segments: Vec::new(), next_id: 1 };
+        let mut st = SegState {
+            segments: Vec::new(),
+            next_id: 1,
+        };
         let mut fresh = true;
 
         if self.resume {
@@ -317,6 +337,7 @@ impl Download {
             last_modified: p.last_modified.clone(),
             resume_key: self.resume_key.clone(),
             user_agent: self.user_agent.clone(),
+            cookie: self.cookie.clone(),
             output: output.clone(),
             parts_dir: parts_dir.clone(),
             connections: self.connections,
@@ -375,7 +396,10 @@ impl Download {
             handles.push(tokio::spawn(worker(sh.clone())));
         }
 
-        while !sh.all_done().await && !sh.range_unsupported.load(Ordering::Relaxed) && !sh.is_cancelled() {
+        while !sh.all_done().await
+            && !sh.range_unsupported.load(Ordering::Relaxed)
+            && !sh.is_cancelled()
+        {
             sleep(Duration::from_millis(200)).await;
         }
         sh.finished.store(true, Ordering::SeqCst);
@@ -402,6 +426,7 @@ impl Download {
                 &sh.output,
                 &sh.user_agent,
                 sh.referer.as_deref(),
+                sh.cookie.as_deref(),
                 sh.total,
                 self.speed_limit,
                 cancel.clone(),
@@ -448,6 +473,7 @@ struct Shared {
     last_modified: Option<String>,
     resume_key: Option<String>,
     user_agent: String,
+    cookie: Option<String>,
     output: PathBuf,
     parts_dir: PathBuf,
     connections: usize,
@@ -651,13 +677,22 @@ async fn download_segment(sh: Arc<Shared>, id: u32) -> Result<()> {
     }
 }
 
-async fn stream_range(sh: &Arc<Shared>, id: u32, seg_start: u64, mut pos: u64, end: u64) -> Result<()> {
+async fn stream_range(
+    sh: &Arc<Shared>,
+    id: u32,
+    seg_start: u64,
+    mut pos: u64,
+    end: u64,
+) -> Result<()> {
     let mut req = sh
         .client
         .get(&sh.url)
         .header(USER_AGENT, sh.user_agent.as_str())
         .header(ACCEPT_ENCODING, "identity")
         .header(RANGE, format!("bytes={pos}-{end}"));
+    if let Some(c) = &sh.cookie {
+        req = req.header(COOKIE, c.as_str());
+    }
     if let Some(r) = &sh.referer {
         req = req.header(REFERER, r.as_str());
     }
@@ -775,6 +810,7 @@ async fn single_stream(
     output: &Path,
     user_agent: &str,
     referer: Option<&str>,
+    cookie: Option<&str>,
     total_hint: u64,
     speed_limit: Option<u64>,
     cancel: Option<Arc<AtomicBool>>,
@@ -787,6 +823,10 @@ async fn single_stream(
         .header(ACCEPT_ENCODING, "identity");
     let resp = match referer {
         Some(referer) => resp.header(REFERER, referer),
+        None => resp,
+    };
+    let resp = match cookie {
+        Some(cookie) => resp.header(COOKIE, cookie),
         None => resp,
     };
     let resp = resp.send().await?;

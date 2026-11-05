@@ -20,7 +20,11 @@ fn logo() -> &'static Logo {
     LOGO.get_or_init(|| {
         let (rgba, width, height) =
             decode_png(LOGO_PNG).expect("assets/logo.png must be a valid PNG");
-        Logo { rgba, width, height }
+        Logo {
+            rgba,
+            width,
+            height,
+        }
     })
 }
 
@@ -60,17 +64,12 @@ fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
             .chunks_exact(3)
             .flat_map(|p| [p[0], p[1], p[2], 0xff])
             .collect(),
-        png::ColorType::Grayscale => pixels
-            .iter()
-            .flat_map(|&g| [g, g, g, 0xff])
-            .collect(),
+        png::ColorType::Grayscale => pixels.iter().flat_map(|&g| [g, g, g, 0xff]).collect(),
         png::ColorType::GrayscaleAlpha => pixels
             .chunks_exact(2)
             .flat_map(|p| [p[0], p[0], p[0], p[1]])
             .collect(),
-        png::ColorType::Indexed => {
-            return Err("indexed PNG was not expanded to RGB".to_string())
-        }
+        png::ColorType::Indexed => return Err("indexed PNG was not expanded to RGB".to_string()),
     };
 
     Ok((rgba, info.width, info.height))

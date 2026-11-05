@@ -1,6 +1,6 @@
 use reqwest::header::{
-    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE,
-    USER_AGENT,
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, COOKIE, ETAG, LAST_MODIFIED,
+    RANGE, USER_AGENT,
 };
 use reqwest::StatusCode;
 
@@ -37,11 +37,21 @@ fn content_length_header(resp: &reqwest::Response) -> u64 {
 /// This mirrors the capability discovery IDM performs with its first plain GET,
 /// but avoids downloading a body when the server supports HEAD.
 pub async fn probe(client: &reqwest::Client, url: &str, user_agent: &str) -> Result<Probe> {
-    let head = client
-        .head(url)
-        .header(USER_AGENT, user_agent)
-        .send()
-        .await;
+    probe_with(client, url, user_agent, None).await
+}
+
+/// Like [`probe`], with an optional `Cookie` header for browser captures.
+pub async fn probe_with(
+    client: &reqwest::Client,
+    url: &str,
+    user_agent: &str,
+    cookie: Option<&str>,
+) -> Result<Probe> {
+    let mut head = client.head(url).header(USER_AGENT, user_agent);
+    if let Some(c) = cookie {
+        head = head.header(COOKIE, c);
+    }
+    let head = head.send().await;
 
     if let Ok(resp) = head {
         if resp.status().is_success() {
@@ -51,12 +61,14 @@ pub async fn probe(client: &reqwest::Client, url: &str, user_agent: &str) -> Res
                 .unwrap_or(false);
             if total > 0 {
                 if accept {
-                    let range_probe = client
+                    let mut range_probe = client
                         .get(url)
                         .header(USER_AGENT, user_agent)
-                        .header(RANGE, "bytes=0-0")
-                        .send()
-                        .await?;
+                        .header(RANGE, "bytes=0-0");
+                    if let Some(c) = cookie {
+                        range_probe = range_probe.header(COOKIE, c);
+                    }
+                    let range_probe = range_probe.send().await?;
                     if range_probe.status() != StatusCode::PARTIAL_CONTENT {
                         return Ok(Probe {
                             final_url: resp.url().to_string(),
@@ -83,12 +95,14 @@ pub async fn probe(client: &reqwest::Client, url: &str, user_agent: &str) -> Res
     }
 
     // Fallback: one-byte ranged GET. Some servers reject HEAD or omit Content-Length.
-    let resp = client
+    let mut get = client
         .get(url)
         .header(USER_AGENT, user_agent)
-        .header(RANGE, "bytes=0-0")
-        .send()
-        .await?;
+        .header(RANGE, "bytes=0-0");
+    if let Some(c) = cookie {
+        get = get.header(COOKIE, c);
+    }
+    let resp = get.send().await?;
 
     let status = resp.status();
     if status != StatusCode::PARTIAL_CONTENT && !status.is_success() {

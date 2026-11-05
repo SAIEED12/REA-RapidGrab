@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 
 /// True for responses that are HTML documents rather than downloadable files.
 pub fn is_web_page(content_type: &str) -> bool {
-    matches!(mime(content_type).as_str(), "text/html" | "application/xhtml+xml")
+    matches!(
+        mime(content_type).as_str(),
+        "text/html" | "application/xhtml+xml"
+    )
 }
 
 /// Map a MIME type to a file extension (without the dot).
@@ -147,7 +150,8 @@ pub fn sanitize_filename(name: &str) -> Option<String> {
     }
 }
 
-fn mime(content_type: &str) -> String {    content_type
+fn mime(content_type: &str) -> String {
+    content_type
         .split(';')
         .next()
         .unwrap_or("")
@@ -166,7 +170,9 @@ fn safe_basename(name: &str) -> Option<String> {
     }
     let cleaned: String = base
         .chars()
-        .filter(|c| !c.is_control() && !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
+        .filter(|c| {
+            !c.is_control() && !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+        })
         .collect();
     let cleaned = cleaned.trim().trim_end_matches('.').trim();
     if cleaned.is_empty() {
@@ -208,7 +214,10 @@ mod tests {
     #[test]
     fn maps_common_content_types() {
         assert_eq!(extension_for_content_type("video/mp4"), Some("mp4"));
-        assert_eq!(extension_for_content_type("audio/mpeg; charset=binary"), Some("mp3"));
+        assert_eq!(
+            extension_for_content_type("audio/mpeg; charset=binary"),
+            Some("mp3")
+        );
         assert_eq!(extension_for_content_type("application/pdf"), Some("pdf"));
         assert_eq!(extension_for_content_type("application/octet-stream"), None);
     }
@@ -246,11 +255,19 @@ mod tests {
     #[test]
     fn replaces_the_bin_placeholder_from_content_type() {
         assert_eq!(
-            infer_output_path(Path::new("C:/Users/me/Desktop/download.bin"), Some("video/mp4"), None),
+            infer_output_path(
+                Path::new("C:/Users/me/Desktop/download.bin"),
+                Some("video/mp4"),
+                None
+            ),
             PathBuf::from("C:/Users/me/Desktop/download.mp4")
         );
         assert_eq!(
-            infer_output_path(Path::new("C:/Users/me/Desktop/extensionless"), Some("audio/mpeg"), None),
+            infer_output_path(
+                Path::new("C:/Users/me/Desktop/extensionless"),
+                Some("audio/mpeg"),
+                None
+            ),
             PathBuf::from("C:/Users/me/Desktop/extensionless.mp3")
         );
     }
@@ -270,7 +287,11 @@ mod tests {
     #[test]
     fn leaves_unknown_types_alone() {
         assert_eq!(
-            infer_output_path(Path::new("download.bin"), Some("application/octet-stream"), None),
+            infer_output_path(
+                Path::new("download.bin"),
+                Some("application/octet-stream"),
+                None
+            ),
             PathBuf::from("download.bin")
         );
     }

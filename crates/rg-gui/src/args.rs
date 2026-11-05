@@ -107,10 +107,7 @@ mod tests {
 
     #[test]
     fn escapes_only_the_double_quote() {
-        assert_eq!(
-            split_args(r#""a\"b" "c\d""#),
-            vec![r#"a"b"#, r"c\d"]
-        );
+        assert_eq!(split_args(r#""a\"b" "c\d""#), vec![r#"a"b"#, r"c\d"]);
     }
 
     #[test]

@@ -217,7 +217,10 @@ async fn resume_key_survives_a_changed_signed_url() {
         .expect("cancel timed out")
         .expect("task panicked");
     assert!(matches!(cancelled, Err(Error::Cancelled)));
-    assert!(parts_dir_for(&out).exists(), "parts must survive the cancel");
+    assert!(
+        parts_dir_for(&out).exists(),
+        "parts must survive the cancel"
+    );
 
     ranges.lock().expect("ranges lock").clear();
 

@@ -20,7 +20,14 @@ pub struct Segment {
 
 impl Segment {
     pub fn new(id: u32, start: u64, end: u64) -> Self {
-        Self { id, start, end, pos: start, done: false, claimed: false }
+        Self {
+            id,
+            start,
+            end,
+            pos: start,
+            done: false,
+            claimed: false,
+        }
     }
 
     pub fn remaining(&self) -> u64 {

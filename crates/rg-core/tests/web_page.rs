@@ -99,7 +99,10 @@ async fn allow_html_infers_the_extension() {
     .expect("allow_html download failed");
 
     let expected = dir.join("download.html");
-    assert_eq!(stats.output, expected, "extension should come from Content-Type");
+    assert_eq!(
+        stats.output, expected,
+        "extension should come from Content-Type"
+    );
     assert!(!out.exists(), "the .bin placeholder must not be written");
     assert_eq!(
         tokio::fs::read(&expected).await.expect("read output"),

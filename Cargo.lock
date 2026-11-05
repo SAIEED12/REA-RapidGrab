@@ -2713,11 +2713,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rg-bridge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "winapi",
+]
+
+[[package]]
 name = "rg-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "rg-bridge",
  "rg-core",
  "rg-resolve",
  "tokio",
@@ -2752,6 +2763,7 @@ dependencies = [
  "open",
  "png",
  "rfd",
+ "rg-bridge",
  "rg-core",
  "rg-resolve",
  "serde",
