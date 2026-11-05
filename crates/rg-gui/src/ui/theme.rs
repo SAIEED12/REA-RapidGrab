@@ -85,6 +85,14 @@ pub const STEP_VALUE_W: f32 = 44.0;
 
 pub const CHIP_H: f32 = 20.0;
 pub const STATUS_CHIP_H: f32 = 22.0;
+/// Fluent checkbox box edge.
+pub const CHECKBOX_SIZE: f32 = 20.0;
+/// Clickable height of a checkbox row.
+pub const CHECKBOX_ROW_H: f32 = 32.0;
+/// Width of the compact Max-height dropdown.
+pub const DROPDOWN_W: f32 = 160.0;
+/// Below this content width, form fields collapse to a single column.
+pub const FORM_COLUMN_MIN: f32 = 560.0;
 /// Square reserved for the large empty-state glyph.
 pub const EMPTY_ICON_BOX: f32 = 30.0;
 /// Leading icon gutter inside a text field.

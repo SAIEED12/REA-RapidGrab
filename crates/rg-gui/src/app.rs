@@ -189,6 +189,9 @@ pub struct RapidGrabApp {
     focus_url: bool,
     /// Cached result of the "output path already exists" probe.
     output_probe: Option<OutputProbe>,
+    /// Per-launch salt so the page starts at the top instead of restoring the
+    /// previous session's scroll offset.
+    page_nonce: u64,
 
     logo: egui::TextureHandle,
 }
@@ -236,6 +239,10 @@ impl RapidGrabApp {
             show_add_panel: true,
             focus_url: false,
             output_probe: None,
+            page_nonce: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0),
             logo: crate::icon::logo_texture(&cc.egui_ctx),
         }
     }
@@ -822,7 +829,7 @@ impl eframe::App for RapidGrabApp {
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
-                    .id_source("rapidgrab-page")
+                    .id_source(("rapidgrab-page", self.page_nonce))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         widgets::content_column(ui, |ui| {
@@ -1056,53 +1063,71 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
 
         widgets::collapsible(ui, "rg-advanced", "Advanced", false, |ui| {
             ui.spacing_mut().item_spacing.y = theme::SP_XS;
-            ui.add(egui::Label::new(theme::caption(
-                "SHA-256 checksum (optional)",
-            )));
-            widgets::text_field(
+            let sha = &mut app.new_sha256;
+            let ua = &mut app.new_user_agent;
+            form_columns(
                 ui,
-                widgets::Field::new("rg-sha", "expected digest"),
-                &mut app.new_sha256,
-            );
-            ui.add(egui::Label::new(theme::caption("User-Agent (optional)")));
-            widgets::text_field(
-                ui,
-                widgets::Field::new("rg-ua", "Mozilla/5.0…"),
-                &mut app.new_user_agent,
+                |ui| {
+                    ui.add(egui::Label::new(theme::caption(
+                        "SHA-256 checksum (optional)",
+                    )));
+                    widgets::text_field(
+                        ui,
+                        widgets::Field::new("rg-sha", "expected digest"),
+                        sha,
+                    );
+                },
+                |ui| {
+                    ui.add(egui::Label::new(theme::caption("User-Agent (optional)")));
+                    widgets::text_field(
+                        ui,
+                        widgets::Field::new("rg-ua", "Mozilla/5.0…"),
+                        ua,
+                    );
+                },
             );
             ui.add_space(theme::SP_XS);
-            ui.checkbox(&mut app.new_restart, "Restart — ignore existing parts");
+            widgets::checkbox(
+                ui,
+                "rg-restart",
+                &mut app.new_restart,
+                "Restart — ignore existing parts",
+            );
         });
+
+        widgets::divider(ui);
 
         widgets::collapsible(ui, "rg-resolver", "Media resolver", false, |ui| {
             ui.spacing_mut().item_spacing.y = theme::SP_XS;
-            ui.checkbox(
+            widgets::checkbox(
+                ui,
+                "rg-auto-resolve",
                 &mut app.settings.auto_resolve,
                 "Resolve video pages automatically with yt-dlp",
             );
-            ui.horizontal(|ui| {
-                ui.add(egui::Label::new(theme::caption("Max height")));
-                ui.add(
-                    egui::DragValue::new(&mut app.settings.max_height)
-                        .speed(10.0)
-                        .range(0..=4320)
-                        .suffix("p"),
-                );
-                ui.add(egui::Label::new(theme::caption_tertiary(
-                    "0 = best available",
-                )));
-            });
-            ui.add(egui::Label::new(theme::caption("yt-dlp path")));
-            widgets::text_field(
+            ui.add_space(theme::SP_XS);
+            max_height_picker(ui, &mut app.settings.max_height);
+            ui.add_space(theme::SP_XS);
+            let yt_dlp = &mut app.settings.yt_dlp_path;
+            let ffmpeg = &mut app.settings.ffmpeg_path;
+            form_columns(
                 ui,
-                widgets::Field::new("rg-ytdlp", "auto-detected"),
-                &mut app.settings.yt_dlp_path,
-            );
-            ui.add(egui::Label::new(theme::caption("ffmpeg path")));
-            widgets::text_field(
-                ui,
-                widgets::Field::new("rg-ffmpeg", "auto-detected"),
-                &mut app.settings.ffmpeg_path,
+                |ui| {
+                    ui.add(egui::Label::new(theme::caption("yt-dlp path")));
+                    widgets::text_field(
+                        ui,
+                        widgets::Field::new("rg-ytdlp", "auto-detected"),
+                        yt_dlp,
+                    );
+                },
+                |ui| {
+                    ui.add(egui::Label::new(theme::caption("ffmpeg path")));
+                    widgets::text_field(
+                        ui,
+                        widgets::Field::new("rg-ffmpeg", "auto-detected"),
+                        ffmpeg,
+                    );
+                },
             );
             ui.add(egui::Label::new(theme::caption("Extra yt-dlp args")));
             widgets::text_field(
@@ -1115,7 +1140,8 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
             )));
         });
 
-        ui.add_space(theme::SP_XS);
+        widgets::divider(ui);
+
         if app.settings.auto_resolve {
             widgets::info_line(
                 ui,
@@ -1156,6 +1182,66 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
             app.focus_url = true;
         }
     }
+}
+
+/// Two fields side by side when there is room; stacked below
+/// [`theme::FORM_COLUMN_MIN`].
+fn form_columns(
+    ui: &mut egui::Ui,
+    left: impl FnOnce(&mut egui::Ui),
+    right: impl FnOnce(&mut egui::Ui),
+) {
+    if ui.available_width() >= theme::FORM_COLUMN_MIN {
+        ui.columns(2, |columns| {
+            left(&mut columns[0]);
+            right(&mut columns[1]);
+        });
+    } else {
+        left(ui);
+        ui.add_space(theme::SP_S);
+        right(ui);
+    }
+}
+
+/// Max-height dropdown. Values outside the preset list stay selectable as a
+/// custom entry so an existing config is never lost.
+fn max_height_picker(ui: &mut egui::Ui, value: &mut u32) {
+    const HEIGHTS: [(u32, &str); 6] = [
+        (0, "Best available"),
+        (2160, "2160p"),
+        (1440, "1440p"),
+        (1080, "1080p"),
+        (720, "720p"),
+        (480, "480p"),
+    ];
+
+    let mut values: Vec<u32> = HEIGHTS.iter().map(|(height, _)| *height).collect();
+    let mut labels: Vec<String> = HEIGHTS.iter().map(|(_, label)| label.to_string()).collect();
+    let selected = match values.iter().position(|height| height == value) {
+        Some(index) => index,
+        None => {
+            values.push(*value);
+            labels.push(format!("{value}p (custom)"));
+            values.len() - 1
+        }
+    };
+    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+
+    ui.horizontal(|ui| {
+        ui.add(egui::Label::new(theme::caption("Max height")));
+        if let Some(index) = widgets::dropdown(
+            ui,
+            "rg-max-height",
+            selected,
+            &labels,
+            theme::DROPDOWN_W,
+        ) {
+            *value = values[index];
+        }
+        ui.add(egui::Label::new(theme::caption_tertiary(
+            "0 = best available",
+        )));
+    });
 }
 
 /// Downloads heading plus either the empty state or the scrolling card list.

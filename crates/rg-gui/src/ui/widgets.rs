@@ -32,6 +32,19 @@ fn text_width(ui: &Ui, text: &str, font: FontId) -> f32 {
         .x
 }
 
+/// Paints a check mark inside `rect`.
+fn paint_check(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let p = |x: f32, y: f32| {
+        egui::pos2(
+            rect.left() + rect.width() * x,
+            rect.top() + rect.height() * y,
+        )
+    };
+    let stroke = Stroke::new((rect.height() * 0.12).clamp(1.6_f32, 2.4_f32), color);
+    painter.line_segment([p(0.22, 0.52), p(0.42, 0.71)], stroke);
+    painter.line_segment([p(0.42, 0.71), p(0.79, 0.30)], stroke);
+}
+
 // --- containers ------------------------------------------------------------
 
 /// Standard card / layer surface.
@@ -541,6 +554,222 @@ pub fn stepper(
     changed
 }
 
+/// Fluent checkbox: 20 px box, accent fill with a dark check mark when checked.
+/// The whole row is clickable.
+pub fn checkbox(ui: &mut Ui, id_salt: &str, checked: &mut bool, label: &str) -> Response {
+    let enabled = ui.is_enabled();
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), CHECKBOX_ROW_H),
+        if enabled { Sense::click() } else { Sense::hover() },
+    );
+
+    let hovered = enabled && response.hovered();
+    let pressed = enabled && response.is_pointer_button_down_on();
+    let anim_id = ui.make_persistent_id(id_salt).with("hover");
+    let t = ui.ctx().animate_bool_with_time(anim_id, hovered, ANIM);
+
+    let box_rect = Rect::from_center_size(
+        egui::pos2(
+            rect.left() + CHECKBOX_SIZE * 0.5,
+            rect.center().y,
+        ),
+        Vec2::splat(CHECKBOX_SIZE),
+    );
+    let painter = ui.painter().clone();
+
+    if *checked {
+        let fill = if !enabled {
+            mix(FIELD, ACCENT, 0.35)
+        } else if pressed {
+            ACCENT_PRESSED
+        } else {
+            mix(ACCENT, ACCENT_HOVER, t)
+        };
+        painter.rect_filled(box_rect, Rounding::same(R_SMALL), fill);
+        paint_check(
+            &painter,
+            box_rect.shrink(4.0),
+            if enabled { ON_ACCENT } else { TEXT_DISABLED },
+        );
+    } else {
+        if pressed {
+            painter.rect_filled(
+                box_rect,
+                Rounding::same(R_SMALL),
+                mix(transparent(), TEXT, 0.12),
+            );
+        } else if t > 0.0 {
+            painter.rect_filled(
+                box_rect,
+                Rounding::same(R_SMALL),
+                mix(transparent(), TEXT, 0.06 * t),
+            );
+        }
+        let stroke = if !enabled {
+            TEXT_DISABLED
+        } else if hovered {
+            TEXT_SECONDARY
+        } else {
+            TEXT_TERTIARY
+        };
+        painter.rect_stroke(
+            box_rect,
+            Rounding::same(R_SMALL),
+            Stroke::new(1.0_f32, stroke),
+        );
+    }
+
+    if response.has_focus() {
+        painter.rect_stroke(
+            box_rect.expand(2.0),
+            Rounding::same(R_SMALL + 1.0),
+            Stroke::new(1.5_f32, ACCENT),
+        );
+    }
+
+    painter.text(
+        egui::pos2(box_rect.right() + SP_S, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::new(BODY_SIZE, proportional()),
+        if enabled { TEXT } else { TEXT_DISABLED },
+    );
+
+    if enabled {
+        if response.clicked() {
+            *checked = !*checked;
+            response.request_focus();
+        }
+        if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Space)) {
+            *checked = !*checked;
+        }
+        response.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+/// Dropdown styled like a text field. Returns the newly picked option index.
+pub fn dropdown(
+    ui: &mut Ui,
+    id_salt: &str,
+    selected: usize,
+    labels: &[&str],
+    width: f32,
+) -> Option<usize> {
+    let enabled = ui.is_enabled();
+    let popup_id = ui.make_persistent_id(id_salt).with("popup");
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(width, FIELD_H),
+        if enabled { Sense::click() } else { Sense::hover() },
+    );
+
+    let open = ui.memory(|m| m.is_popup_open(popup_id));
+    let hovered = enabled && response.hovered();
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(response.id.with("hover"), hovered, ANIM);
+
+    let painter = ui.painter().clone();
+    painter.rect_filled(
+        rect,
+        Rounding::same(R_SMALL),
+        if hovered {
+            mix(FIELD, CONTROL_HOVER, t)
+        } else {
+            FIELD
+        },
+    );
+    let border = if open || response.has_focus() {
+        (ACCENT, 1.5_f32)
+    } else {
+        (STROKE_SOFT, 1.0_f32)
+    };
+    painter.rect_stroke(
+        rect,
+        Rounding::same(R_SMALL),
+        Stroke::new(border.1, border.0),
+    );
+    painter.text(
+        egui::pos2(rect.left() + SP_M, rect.center().y),
+        Align2::LEFT_CENTER,
+        labels.get(selected).copied().unwrap_or_default(),
+        FontId::new(BODY_SIZE, proportional()),
+        if enabled { TEXT } else { TEXT_DISABLED },
+    );
+    painter.text(
+        egui::pos2(rect.right() - SP_M, rect.center().y),
+        Align2::RIGHT_CENTER,
+        Icon::ChevronDown.glyph(),
+        icon_font(ICON_SIZE_SM),
+        if enabled { TEXT_SECONDARY } else { TEXT_DISABLED },
+    );
+
+    if enabled && response.clicked() {
+        response.request_focus();
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+
+    let mut picked = None;
+    if enabled {
+        egui::popup::popup_below_widget(
+            ui,
+            popup_id,
+            &response,
+            egui::popup::PopupCloseBehavior::CloseOnClick,
+            |ui| {
+                ui.set_min_width(width);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for (index, label) in labels.iter().enumerate() {
+                    let (row, row_response) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), CONTROL_H),
+                        Sense::click(),
+                    );
+                    let painter = ui.painter().clone();
+                    if row_response.hovered() {
+                        painter.rect_filled(row, Rounding::same(R_SMALL), CONTROL_HOVER);
+                    }
+                    if index == selected {
+                        painter.rect_filled(
+                            row,
+                            Rounding::same(R_SMALL),
+                            mix(transparent(), ACCENT, 0.10),
+                        );
+                        paint_check(
+                            &painter,
+                            Rect::from_center_size(
+                                egui::pos2(row.left() + SP_S + 6.0, row.center().y),
+                                Vec2::splat(12.0),
+                            ),
+                            ACCENT,
+                        );
+                    }
+                    painter.text(
+                        egui::pos2(row.left() + SP_S + 18.0, row.center().y),
+                        Align2::LEFT_CENTER,
+                        *label,
+                        FontId::new(BODY_SIZE, proportional()),
+                        TEXT,
+                    );
+                    if row_response.clicked() {
+                        picked = Some(index);
+                    }
+                }
+            },
+        );
+        if picked.is_some() {
+            ui.memory_mut(|m| m.close_popup());
+        }
+    }
+
+    if enabled {
+        response.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        response
+    };
+    picked
+}
+
 /// Animated expandable section with a chevron header.
 pub fn collapsible(
     ui: &mut Ui,
@@ -604,10 +833,7 @@ pub fn collapsible(
 
     state.show_body_unindented(ui, |ui| {
         ui.add_space(SP_S);
-        ui.indent(id, |ui| {
-            ui.expand_to_include_x(rect.right());
-            body(ui);
-        });
+        body(ui);
     });
 }
 
