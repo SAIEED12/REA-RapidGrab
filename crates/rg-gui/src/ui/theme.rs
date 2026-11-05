@@ -422,7 +422,10 @@ fn style() -> egui::Style {
     style.spacing.icon_spacing = SP_S;
     style.spacing.scroll.bar_width = 8.0;
     style.spacing.scroll.bar_inner_margin = 2.0;
-    style.spacing.scroll.floating = true;
+    // Reserved (non-overlay) scroll bars: an overlay bar covers the last few
+    // pixels of the content area, clipping card borders and right-aligned
+    // buttons when the window is at its minimum width.
+    style.spacing.scroll.floating = false;
 
     style.text_styles = [
         (

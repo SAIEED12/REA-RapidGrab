@@ -343,20 +343,22 @@ pub fn status_style(status: &JobStatus) -> (&'static str, Color32) {
 
 /// Slim animated progress bar. `id` must be stable across frames.
 pub fn progress(ui: &mut Ui, id: Id, fraction: f32, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), PROGRESS_H),
-        Sense::hover(),
-    );
+    let width = ui.available_width().max(PROGRESS_H);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, PROGRESS_H), Sense::hover());
     let target = fraction.clamp(0.0, 1.0);
     let shown = ui.ctx().animate_value_with_time(id, target, 0.3);
     let rounding = Rounding::same(PROGRESS_H * 0.5);
 
     ui.painter().rect_filled(rect, rounding, TRACK_FILL);
-    ui.painter()
-        .rect_stroke(rect, rounding, Stroke::new(1.0_f32, STROKE));
-    if shown > 0.001 {
-        let width = (rect.width() * shown).max(PROGRESS_H);
-        let fill = Rect::from_min_size(rect.min + Vec2::splat(1.0), Vec2::new(width - 2.0, rect.height() - 2.0));
+    let filled = rect.width() * shown;
+    if filled >= 1.0 {
+        // A rounded fill must never be narrower than the track height (its
+        // corner radius) nor wider than the track, so the caps stay circular
+        // at 1% as well as at 100%.
+        let fill = Rect::from_min_size(
+            rect.min,
+            Vec2::new(filled.min(rect.width()).max(PROGRESS_H), rect.height()),
+        );
         ui.painter().rect_filled(fill, rounding, color);
     }
 }
@@ -698,8 +700,14 @@ pub fn checkbox(ui: &mut Ui, id_salt: &str, checked: &mut bool, label: &str) -> 
             *checked = !*checked;
             response.request_focus();
         }
-        if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Space)) {
-            *checked = !*checked;
+        if response.has_focus() {
+            let toggle = ui.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Space)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+            });
+            if toggle {
+                *checked = !*checked;
+            }
         }
         response.on_hover_cursor(CursorIcon::PointingHand)
     } else {
