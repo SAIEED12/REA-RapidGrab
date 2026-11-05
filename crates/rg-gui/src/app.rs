@@ -48,6 +48,15 @@ pub enum CancelIntent {
     Stop,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum FailureKind {
+    #[default]
+    Other,
+    /// The remote file changed after a partial download began. Restarting
+    /// discards the stale parts manifest and downloads from scratch.
+    RemoteChanged,
+}
+
 #[derive(Debug, Clone)]
 pub struct DownloadUpdate {
     pub id: usize,
@@ -56,6 +65,8 @@ pub struct DownloadUpdate {
     pub progress: Option<Progress>,
     pub status: JobStatus,
     pub error: Option<String>,
+    /// Failure classification, set only when status is Failed.
+    pub failure: FailureKind,
     /// Effective output path, when it differs from the requested one.
     pub output: Option<PathBuf>,
     /// Combined resolver progress, when the job fell back to yt-dlp.
@@ -78,6 +89,8 @@ pub struct DownloadJob {
     pub progress: Option<Progress>,
     pub media: Option<MediaProgress>,
     pub error: Option<String>,
+    /// Failure classification, set only when status is Failed.
+    pub failure: FailureKind,
     /// Informational message shown under the status (for example a skipped
     /// checksum); cleared when the job starts again.
     pub notice: Option<String>,
@@ -107,6 +120,7 @@ struct JobView {
     progress: Option<Progress>,
     media: Option<MediaProgress>,
     error: Option<String>,
+    failure: FailureKind,
     notice: Option<String>,
     elapsed: Duration,
 }
@@ -164,6 +178,7 @@ enum Action {
     StartNow(usize),
     Resume(usize),
     Retry(usize),
+    Restart(usize),
     Remove(usize),
 }
 
@@ -189,9 +204,9 @@ pub struct RapidGrabApp {
     focus_url: bool,
     /// Cached result of the "output path already exists" probe.
     output_probe: Option<OutputProbe>,
-    /// Per-launch salt so the page starts at the top instead of restoring the
-    /// previous session's scroll offset.
-    page_nonce: u64,
+    /// Set on the first frame so the page starts at the top without
+    /// restoring the previous session's scroll offset.
+    page_reset_done: bool,
 
     logo: egui::TextureHandle,
 }
@@ -239,10 +254,7 @@ impl RapidGrabApp {
             show_add_panel: true,
             focus_url: false,
             output_probe: None,
-            page_nonce: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0),
+            page_reset_done: false,
             logo: crate::icon::logo_texture(&cc.egui_ctx),
         }
     }
@@ -334,6 +346,7 @@ impl RapidGrabApp {
                 progress: None,
                 media: None,
                 error: None,
+                failure: FailureKind::Other,
                 notice: None,
                 started_at: None,
                 elapsed: Duration::ZERO,
@@ -369,12 +382,17 @@ impl RapidGrabApp {
             job.cancel = cancel.clone();
             job.status = JobStatus::Starting;
             job.error = None;
+            job.failure = FailureKind::Other;
             job.notice = None;
             job.progress = None;
             job.media = None;
             job.intent = None;
             job.remove_after_stop = false;
             job.started_at = Some(Instant::now());
+            // Consume the one-shot restart flag now that the restart has
+            // begun, so the next retry resumes normally again.
+            let restart = job.restart;
+            job.restart = false;
             (
                 job.run,
                 job.url.clone(),
@@ -383,7 +401,7 @@ impl RapidGrabApp {
                 job.speed_limit,
                 job.sha256.clone(),
                 job.user_agent.clone(),
-                job.restart,
+                restart,
             )
         }) else {
             return;
@@ -404,6 +422,7 @@ impl RapidGrabApp {
                     progress,
                     status,
                     error,
+                    failure: FailureKind::Other,
                     output,
                     media,
                     notice: None,
@@ -434,6 +453,7 @@ impl RapidGrabApp {
                     progress: Some(p),
                     status: JobStatus::Downloading,
                     error: None,
+                    failure: FailureKind::Other,
                     output: Some(output),
                     media: None,
                     notice: None,
@@ -455,6 +475,7 @@ impl RapidGrabApp {
                             progress: None,
                             status: JobStatus::Resolving,
                             error: None,
+                            failure: FailureKind::Other,
                             output: None,
                             media: None,
                             notice: Some(
@@ -513,6 +534,7 @@ impl RapidGrabApp {
                             progress,
                             status,
                             error: None,
+                            failure: FailureKind::Other,
                             output,
                             media,
                             notice: None,
@@ -530,6 +552,23 @@ impl RapidGrabApp {
                             send(None, JobStatus::Failed, Some(error.to_string()), None, None);
                         }
                     }
+                }
+                Err(rg_core::Error::RemoteChanged) => {
+                    let _ = tx.send(DownloadUpdate {
+                        id,
+                        run,
+                        progress: None,
+                        status: JobStatus::Failed,
+                        error: Some(
+                            "The remote file changed after the partial download began. \
+                             Restart the download to discard the partial file and start over."
+                                .to_string(),
+                        ),
+                        failure: FailureKind::RemoteChanged,
+                        output: None,
+                        media: None,
+                        notice: None,
+                    });
                 }
                 Err(e) => {
                     send(None, JobStatus::Failed, Some(e.to_string()), None, None);
@@ -585,6 +624,18 @@ impl RapidGrabApp {
             .is_some_and(|job| job.status == JobStatus::Queued)
         {
             self.start_job(id);
+        }
+    }
+
+    fn restart_job(&mut self, id: usize) {
+        if let Some(job) = self.jobs.get_mut(&id) {
+            if matches!(job.status, JobStatus::Paused | JobStatus::Cancelled | JobStatus::Failed) {
+                job.status = JobStatus::Queued;
+                job.restart = true;
+                job.error = None;
+                job.failure = FailureKind::Other;
+                job.intent = None;
+            }
         }
     }
 
@@ -700,6 +751,7 @@ impl RapidGrabApp {
                 job.media = None;
                 job.status = JobStatus::Failed;
                 job.error = update.error;
+                job.failure = update.failure;
             }
             _ => {}
         }
@@ -713,6 +765,7 @@ impl RapidGrabApp {
                 Action::StartNow(id) => self.start_now(id),
                 Action::Resume(id) => self.resume_job(id),
                 Action::Retry(id) => self.resume_job(id),
+                Action::Restart(id) => self.restart_job(id),
                 Action::Remove(id) => self.remove_job(id),
             }
         }
@@ -756,6 +809,7 @@ impl RapidGrabApp {
                 progress: j.progress.clone(),
                 media: j.media.clone(),
                 error: j.error.clone(),
+                failure: j.failure,
                 notice: j.notice.clone(),
                 elapsed: j.total_elapsed(),
             })
@@ -828,10 +882,14 @@ impl eframe::App for RapidGrabApp {
                     }),
             )
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_source(("rapidgrab-page", self.page_nonce))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
+                let mut area = egui::ScrollArea::vertical()
+                    .id_source("rapidgrab-page")
+                    .auto_shrink([false, false]);
+                if !self.page_reset_done {
+                    area = area.vertical_scroll_offset(0.0);
+                    self.page_reset_done = true;
+                }
+                area.show(ui, |ui| {
                         widgets::content_column(ui, |ui| {
                             header(ui, self, active, queued, total_speed);
                             ui.add_space(theme::SP_M);
@@ -978,36 +1036,38 @@ fn header(
 fn save_as_row(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
     ui.add(egui::Label::new(theme::label("Save as")));
 
-    // Space between the field and the button; the field width is derived
-    // from the same gap so the row spans exactly the available width.
-    let gap = theme::SP_S;
-
     // The button's real painted width (label + 2×SP_L), floored at BROWSE_W
-    // so it never renders narrower than intended. field_w is computed from
-    // the *same* number the button paints, so the row's right edge is
-    // exactly the card's inner right edge — same as the URL field and the
-    // right-aligned Start button.
+    // so it never renders narrower than intended. Pass that exact width to
+    // the button and derive the field width from it so the row spans
+    // exactly the available width. `available_rect_before_wrap` (not
+    // `available_width`) accounts for the horizontal wrapper's spacing.
     let button_w = widgets::button_width_for(ui, "Browse…").max(theme::BROWSE_W);
-    let field_w = (ui.available_width() - button_w - gap).max(140.0);
+    let row_w = ui.available_rect_before_wrap().width();
+    let field_w = (row_w - button_w - theme::SP_S).max(140.0);
 
-    ui.horizontal(|ui| {
-        widgets::text_field(
-            ui,
-            widgets::Field::new("rg-output", "C:\\Downloads\\download.bin").width(field_w),
-            &mut app.new_output,
-        );
-        if widgets::button_fixed_width(
-            ui,
-            "Browse…",
-            widgets::ButtonKind::Secondary,
-            true,
-            button_w,
-        )
-        .clicked()
-        {
-            app.browse_output();
-        }
-    });
+    ui.allocate_ui_with_layout(
+        egui::vec2(row_w, theme::FIELD_H),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = theme::SP_S;
+            widgets::text_field(
+                ui,
+                widgets::Field::new("rg-output", "C:\\Downloads\\download.bin").width(field_w),
+                &mut app.new_output,
+            );
+            if widgets::button_fixed_width(
+                ui,
+                "Browse…",
+                widgets::ButtonKind::Secondary,
+                true,
+                button_w,
+            )
+            .clicked()
+            {
+                app.browse_output();
+            }
+        },
+    );
 }
 
 /// The Connections / Speed cap / Run at once settings, laid out as three
@@ -1506,7 +1566,12 @@ fn job_actions(ui: &mut egui::Ui, view: &JobView, actions: &mut Vec<Action>) {
             if widgets::icon_button(ui, theme::Icon::Folder, "Open folder", true).clicked() {
                 open_folder(view);
             }
-            if widgets::icon_button(ui, theme::Icon::Retry, "Retry", true).clicked() {
+            if view.failure == FailureKind::RemoteChanged {
+                let tooltip = "Restart — discard the partial download and start over";
+                if widgets::icon_button(ui, theme::Icon::Retry, tooltip, true).clicked() {
+                    actions.push(Action::Restart(view.id));
+                }
+            } else if widgets::icon_button(ui, theme::Icon::Retry, "Retry", true).clicked() {
                 actions.push(Action::Retry(view.id));
             }
         }
