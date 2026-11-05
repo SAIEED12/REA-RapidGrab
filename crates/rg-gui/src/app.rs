@@ -1068,7 +1068,9 @@ fn save_as_row(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
             ui.spacing_mut().item_spacing.x = theme::SP_S;
             widgets::text_field(
                 ui,
-                widgets::Field::new("rg-output", "C:\\Downloads\\download.bin").width(field_w),
+                widgets::Field::new("rg-output", "Choose where to save…")
+                    .dim_hint()
+                    .width(field_w),
                 &mut app.new_output,
             );
             if widgets::button_fixed_width(
@@ -1157,7 +1159,9 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
         ui.spacing_mut().item_spacing.y = theme::SP_XS;
 
         ui.add(egui::Label::new(theme::section("New download")));
-        ui.add_space(theme::SP_XS);
+        // The item spacing already contributes part of the gap; pad the rest
+        // so the title sits 6 px above the first field label.
+        ui.add_space((theme::TITLE_GAP - ui.spacing().item_spacing.y).max(0.0));
 
         ui.add(egui::Label::new(theme::label("URL")));
         if std::mem::take(&mut app.focus_url) {

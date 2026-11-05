@@ -277,6 +277,53 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str, enabled: bool) -> Res
     response.on_hover_text(tooltip)
 }
 
+/// 28x28 control-styled icon button used by steppers: visible rest fill,
+/// animated hover and pressed fills, disabled state at the range limits, and
+/// the same radius as the fields it sits next to.
+pub fn filled_icon_button(ui: &mut Ui, icon: Icon, tooltip: &str, enabled: bool) -> Response {
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(ICON_BTN), sense);
+    let hovered = enabled && response.hovered();
+    let pressed = enabled && response.is_pointer_button_down_on();
+    let t = ui.ctx().animate_bool_with_time(response.id, hovered, ANIM);
+    let rounding = Rounding::same(R_SMALL);
+
+    let fill = if !enabled {
+        CONTROL
+    } else if pressed {
+        CONTROL_PRESSED
+    } else {
+        mix(CONTROL, CONTROL_HOVER, t)
+    };
+    ui.painter().rect_filled(rect, rounding, fill);
+    ui.painter()
+        .rect_stroke(rect, rounding, Stroke::new(1.0_f32, STROKE_SOFT));
+
+    if response.has_focus() {
+        ui.painter()
+            .rect_stroke(rect.expand(1.0), rounding, Stroke::new(1.5_f32, ACCENT));
+    }
+    let color = if !enabled {
+        TEXT_DISABLED
+    } else {
+        mix(TEXT_SECONDARY, TEXT, t)
+    };
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        icon.glyph(),
+        icon_font(ICON_SIZE_MD),
+        color,
+    );
+
+    let response = if enabled {
+        response.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        response
+    };
+    response.on_hover_text(tooltip)
+}
+
 /// Small counted chip (e.g. the number of downloads).
 pub fn chip(ui: &mut Ui, text: &str, color: Color32) -> Response {
     let font = FontId::new(CAPTION_SIZE, proportional());
@@ -421,6 +468,7 @@ pub struct Field<'a> {
     icon: Option<Icon>,
     suffix: Option<&'a str>,
     invalid: bool,
+    dim_hint: bool,
     height: f32,
     width: Option<f32>,
 }
@@ -433,9 +481,17 @@ impl<'a> Field<'a> {
             icon: None,
             suffix: None,
             invalid: false,
+            dim_hint: false,
             height: FIELD_H,
             width: None,
         }
+    }
+
+    /// Paints the placeholder one step dimmer than a normal hint, for fields
+    /// whose value is usually filled in by the app rather than typed.
+    pub fn dim_hint(mut self) -> Self {
+        self.dim_hint = true;
+        self
     }
 
     pub fn icon(mut self, icon: Icon) -> Self {
@@ -473,6 +529,8 @@ pub struct FieldResponse {
 /// A dim hint that sits clearly below real text (unlike the egui hint,
 /// which uses the global weak text colour).
 const HINT_COLOR: Color32 = Color32::from_rgba_premultiplied(0x8B, 0x8B, 0x8B, 0x6F);
+/// One step dimmer, for placeholders the app normally fills in itself.
+const HINT_COLOR_DIM: Color32 = Color32::from_rgba_premultiplied(0x66, 0x66, 0x66, 0x66);
 
 /// Fluent text field: filled surface, accent focus border/underline, optional
 /// leading icon and trailing suffix. When the buffer is empty and the field
@@ -516,7 +574,7 @@ pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldRespo
                 Align2::LEFT_CENTER,
                 field.hint,
                 FontId::new(BODY_SIZE, proportional()),
-                HINT_COLOR,
+                if field.dim_hint { HINT_COLOR_DIM } else { HINT_COLOR },
             );
         }
 
@@ -545,7 +603,7 @@ pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldRespo
         } else if focused {
             (ACCENT, 1.5)
         } else {
-            (STROKE, 1.0_f32)
+            (STROKE_CONTROL, 1.0_f32)
         };
         painter.rect_stroke(rect, Rounding::same(R_SMALL), Stroke::new(width_px, color));
         if focused && !field.invalid {
@@ -586,7 +644,7 @@ pub fn stepper(
         ui.spacing_mut().item_spacing.x = SP_XS;
         ui.horizontal(|ui| {
             let minimum = *value <= *range.start();
-            if icon_button(ui, Icon::Minus, "Decrease", !minimum).clicked() {
+            if filled_icon_button(ui, Icon::Minus, "Decrease", !minimum).clicked() {
                 *value = (*value).saturating_sub(1).max(*range.start());
                 changed = true;
             }
@@ -595,7 +653,7 @@ pub fn stepper(
             ui.painter()
                 .rect_filled(rect, Rounding::same(R_SMALL), CONTROL);
             ui.painter()
-                .rect_stroke(rect, Rounding::same(R_SMALL), Stroke::new(1.0_f32, STROKE));
+                .rect_stroke(rect, Rounding::same(R_SMALL), Stroke::new(1.0_f32, STROKE_CONTROL));
             ui.painter().text(
                 rect.center(),
                 Align2::CENTER_CENTER,
@@ -605,7 +663,7 @@ pub fn stepper(
             );
 
             let maximum = *value >= *range.end();
-            if icon_button(ui, Icon::Plus, "Increase", !maximum).clicked() {
+            if filled_icon_button(ui, Icon::Plus, "Increase", !maximum).clicked() {
                 *value = (*value + 1).min(*range.end());
                 changed = true;
             }
@@ -749,7 +807,7 @@ pub fn dropdown(
     let border = if open || response.has_focus() {
         (ACCENT, 1.5_f32)
     } else {
-        (STROKE, 1.0_f32)
+        (STROKE_CONTROL, 1.0_f32)
     };
     painter.rect_stroke(
         rect,

@@ -28,6 +28,10 @@ pub const STROKE: Color32 = Color32::from_rgb(0x33, 0x33, 0x33);
 pub const STROKE_SOFT: Color32 = Color32::from_rgb(0x2A, 0x2A, 0x2A);
 /// Visible empty-track fill (~#FFFFFF1F over CARD).
 pub const TRACK_FILL: Color32 = Color32::from_rgb(0x4A, 0x4A, 0x4A);
+/// Idle border of text fields and dropdowns (`#FFFFFF14` over the control fill).
+/// Bright enough to read on the dark surface; the accent outline still takes
+/// over on focus.
+pub const STROKE_CONTROL: Color32 = Color32::from_rgba_premultiplied(0x14, 0x14, 0x14, 0x14);
 
 // --- text ------------------------------------------------------------------
 
@@ -93,6 +97,8 @@ pub const CHECKBOX_ROW_H: f32 = 32.0;
 pub const DROPDOWN_W: f32 = 160.0;
 /// Below this content width, form fields collapse to a single column.
 pub const FORM_COLUMN_MIN: f32 = 560.0;
+/// Gap between a card's section title and its first field label.
+pub const TITLE_GAP: f32 = 6.0;
 /// Square reserved for the large empty-state glyph.
 pub const EMPTY_ICON_BOX: f32 = 30.0;
 /// Leading icon gutter inside a text field.
