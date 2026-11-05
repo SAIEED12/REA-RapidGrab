@@ -94,6 +94,11 @@ pub struct DownloadJob {
     /// Informational message shown under the status (for example a skipped
     /// checksum); cleared when the job starts again.
     pub notice: Option<String>,
+    /// Last non-zero transfer rate. Progress samples arrive every 500 ms and
+    /// can legitimately be zero for one interval (segments blocked on a speed
+    /// limiter), which made the speed and ETA flicker; cards show this value
+    /// instead so active jobs keep a stable rate.
+    pub last_speed: f64,
     pub started_at: Option<Instant>,
     /// Accumulated run time of finished/previous runs (pauses).
     pub elapsed: Duration,
@@ -122,6 +127,8 @@ struct JobView {
     error: Option<String>,
     failure: FailureKind,
     notice: Option<String>,
+    /// Smoothed transfer rate for the detail line and the header total.
+    speed_bps: f64,
     elapsed: Duration,
 }
 
@@ -348,6 +355,7 @@ impl RapidGrabApp {
                 error: None,
                 failure: FailureKind::Other,
                 notice: None,
+                last_speed: 0.0,
                 started_at: None,
                 elapsed: Duration::ZERO,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -364,6 +372,11 @@ impl RapidGrabApp {
 
         self.new_url.clear();
         self.new_sha256.clear();
+        // The next download starts from a clean form: re-suggest the save path
+        // from the next URL instead of silently reusing this one, and never
+        // carry a one-shot "ignore existing parts" flag into another job.
+        self.new_output.clear();
+        self.new_restart = false;
     }
 
     /// Spawns the tokio task for a job. Caller guarantees the job is `Queued`.
@@ -388,6 +401,7 @@ impl RapidGrabApp {
             job.media = None;
             job.intent = None;
             job.remove_after_stop = false;
+            job.last_speed = 0.0;
             job.started_at = Some(Instant::now());
             // Consume the one-shot restart flag now that the restart has
             // begun, so the next retry resumes normally again.
@@ -714,6 +728,15 @@ impl RapidGrabApp {
                 if job.status != JobStatus::Pausing {
                     job.status = update.status;
                 }
+                let sample = update
+                    .progress
+                    .as_ref()
+                    .map(|progress| progress.speed_bps)
+                    .or_else(|| update.media.as_ref().map(|media| media.speed_bps))
+                    .unwrap_or(0.0);
+                if sample > 1.0 {
+                    job.last_speed = sample;
+                }
                 if let Some(p) = update.progress {
                     job.progress = Some(p);
                 }
@@ -811,6 +834,7 @@ impl RapidGrabApp {
                 error: j.error.clone(),
                 failure: j.failure,
                 notice: j.notice.clone(),
+                speed_bps: if j.status.is_active() { j.last_speed } else { 0.0 },
                 elapsed: j.total_elapsed(),
             })
             .collect();
@@ -860,15 +884,7 @@ impl eframe::App for RapidGrabApp {
         let views = self.job_views();
         let active = views.iter().filter(|v| v.status.is_active()).count();
         let queued = views.iter().filter(|v| v.status == JobStatus::Queued).count();
-        let total_speed: f64 = views
-            .iter()
-            .filter_map(|v| {
-                v.media
-                    .as_ref()
-                    .map(|m| m.speed_bps)
-                    .or_else(|| v.progress.as_ref().map(|p| p.speed_bps))
-            })
-            .sum();
+        let total_speed: f64 = views.iter().map(|v| v.speed_bps).sum();
 
         egui::CentralPanel::default()
             .frame(
@@ -1444,8 +1460,8 @@ fn progress_view(view: &JobView) -> ProgressView {
             ));
         }
         detail.push_str(&format!(" · {}", media_stage_label(media.stage)));
-        if media.speed_bps > 1.0 {
-            detail.push_str(&format!(" · {}/s", human_bytes(media.speed_bps as u64)));
+        if view.speed_bps > 1.0 {
+            detail.push_str(&format!(" · {}/s", human_bytes(view.speed_bps as u64)));
         }
         return ProgressView {
             fraction: Some(fraction),
@@ -1470,14 +1486,11 @@ fn progress_view(view: &JobView) -> ProgressView {
         } else {
             format!("{} received", human_bytes(progress.downloaded))
         };
-        if progress.speed_bps > 1.0 {
-            detail.push_str(&format!(
-                " · {}/s",
-                human_bytes(progress.speed_bps as u64)
-            ));
+        if view.speed_bps > 1.0 {
+            detail.push_str(&format!(" · {}/s", human_bytes(view.speed_bps as u64)));
         }
-        if progress.speed_bps > 1.0 && progress.total > progress.downloaded {
-            let secs = (progress.total - progress.downloaded) as f64 / progress.speed_bps;
+        if view.speed_bps > 1.0 && progress.total > progress.downloaded {
+            let secs = (progress.total - progress.downloaded) as f64 / view.speed_bps;
             detail.push_str(&format!(
                 " · ETA {}",
                 fmt_duration(Duration::from_secs_f64(secs.max(0.0)))
@@ -1522,6 +1535,20 @@ fn open_folder(view: &JobView) {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
     RapidGrabApp::open_path(&dir);
+}
+
+/// Number of icon actions a job in `status` shows, used to reserve exactly
+/// the space the action row needs (and no more) for the detail text.
+fn action_count(status: &JobStatus) -> usize {
+    match status {
+        JobStatus::Pausing => 0,
+        JobStatus::Queued
+        | JobStatus::Starting
+        | JobStatus::Downloading
+        | JobStatus::Resolving
+        | JobStatus::Merging => 2,
+        _ => 3,
+    }
 }
 
 /// Icon-only actions for the current job state, with tooltips.
@@ -1642,7 +1669,9 @@ fn job_card(ui: &mut egui::Ui, view: &JobView, actions: &mut Vec<Action>) {
         }
 
         ui.horizontal(|ui| {
-            let icons_width = 3.0 * theme::ICON_BTN + 3.0 * theme::SP_S;
+            let buttons = action_count(&view.status) as f32;
+            let icons_width =
+                buttons * theme::ICON_BTN + (buttons - 1.0).max(0.0) * theme::SP_XS;
             let text_width = (ui.available_width() - icons_width).max(80.0);
             ui.allocate_ui_with_layout(
                 egui::vec2(text_width, theme::ICON_BTN),
