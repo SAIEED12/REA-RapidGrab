@@ -203,13 +203,8 @@ pub async fn resolve(
 /// Pick the best downloadable streams from `yt-dlp` metadata.
 pub fn select_streams(metadata: &Metadata, max_height: Option<u32>) -> Result<Selection> {
     let cap = max_height.unwrap_or(0);
-    let within_cap = |format: &Format| {
-        cap == 0
-            || format
-                .height
-                .map(|height| height <= cap)
-                .unwrap_or(true)
-    };
+    let within_cap =
+        |format: &Format| cap == 0 || format.height.map(|height| height <= cap).unwrap_or(true);
 
     let rank_video = |format: &Format| -> (u32, u8, u64) {
         let height = format.height.unwrap_or(0);
@@ -221,12 +216,18 @@ pub fn select_streams(metadata: &Metadata, max_height: Option<u32>) -> Result<Se
         (height, avc, format.tbr.unwrap_or(0.0) as u64)
     };
     let rank_audio = |format: &Format, preferred_ext: &str| -> (u8, u8, u64) {
-        let note = format.format_note.as_deref().unwrap_or("").to_ascii_lowercase();
-        let language = format.language.as_deref().unwrap_or("").to_ascii_lowercase();
+        let note = format
+            .format_note
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let language = format
+            .language
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase();
         let original = u8::from(
-            note.contains("original")
-                || language.is_empty()
-                || language.starts_with("en"),
+            note.contains("original") || language.is_empty() || language.starts_with("en"),
         );
         let container = u8::from(format.ext.eq_ignore_ascii_case(preferred_ext));
         (original, container, format.abr.unwrap_or(0.0) as u64)
@@ -267,8 +268,8 @@ pub fn select_streams(metadata: &Metadata, max_height: Option<u32>) -> Result<Se
 
     if muxed_is_close {
         let muxed = best_muxed.expect("checked above");
-        let selected = SelectedStream::from_format(muxed)
-            .ok_or(ResolveError::NoStream { kind: "video" })?;
+        let selected =
+            SelectedStream::from_format(muxed).ok_or(ResolveError::NoStream { kind: "video" })?;
         return Ok(Selection {
             ext: "mp4".to_string(),
             total_bytes: selected.filesize,
@@ -280,8 +281,8 @@ pub fn select_streams(metadata: &Metadata, max_height: Option<u32>) -> Result<Se
     }
 
     let video = best_video.ok_or(ResolveError::NoStream { kind: "video" })?;
-    let video = SelectedStream::from_format(video)
-        .ok_or(ResolveError::NoStream { kind: "video" })?;
+    let video =
+        SelectedStream::from_format(video).ok_or(ResolveError::NoStream { kind: "video" })?;
 
     // Prefer audio whose container can be copied into the selected video
     // container without re-encoding (AAC in MP4, Opus in WebM).
@@ -498,4 +499,3 @@ mod tests {
         assert_eq!(selection.total_bytes, Some(1250));
     }
 }
-

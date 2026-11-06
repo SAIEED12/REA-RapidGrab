@@ -273,7 +273,11 @@ pub fn final_output_path(requested: &Path, title: &str, ext: &str) -> PathBuf {
 
     let parent = requested.parent().unwrap_or_else(|| Path::new(""));
     let base = rg_core::sanitize_filename(title).unwrap_or_else(|| "video".to_string());
-    let ext = if ext.trim().is_empty() { "mp4" } else { ext.trim() };
+    let ext = if ext.trim().is_empty() {
+        "mp4"
+    } else {
+        ext.trim()
+    };
     unique_path(parent.join(format!("{base}.{ext}")))
 }
 
@@ -308,7 +312,11 @@ fn sidecar_path(output: &Path, tag: &str, ext: &str) -> PathBuf {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("video");
-    let ext = if ext.trim().is_empty() { "bin" } else { ext.trim() };
+    let ext = if ext.trim().is_empty() {
+        "bin"
+    } else {
+        ext.trim()
+    };
     parent.join(format!(".{stem}.{tag}.{ext}"))
 }
 
@@ -451,10 +459,8 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rg-resolve-media-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rg-resolve-media-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
@@ -481,22 +487,20 @@ mod tests {
     fn keeps_an_explicit_filename() {
         let dir = temp_dir("explicit");
         let requested = dir.join("my-video.mkv");
-        assert_eq!(
-            final_output_path(&requested, "Ignored", "mp4"),
-            requested
-        );
+        assert_eq!(final_output_path(&requested, "Ignored", "mp4"), requested);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn sanitizes_the_title() {
         let dir = temp_dir("sanitize");
-        let final_path = final_output_path(
-            &dir.join("download.bin"),
-            "A/B: \"quoted\" <clip>?",
-            "mp4",
-        );
-        let name = final_path.file_name().unwrap().to_string_lossy().to_string();
+        let final_path =
+            final_output_path(&dir.join("download.bin"), "A/B: \"quoted\" <clip>?", "mp4");
+        let name = final_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         assert_eq!(name, "A B quoted clip.mp4");
         let _ = std::fs::remove_dir_all(&dir);
     }

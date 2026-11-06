@@ -110,7 +110,11 @@ fn extra_dirs() -> Vec<PathBuf> {
         dirs.push(python_root.join("Scripts"));
     }
 
-    push(&mut dirs, "LOCALAPPDATA", "Programs\\Python\\Python314\\Scripts");
+    push(
+        &mut dirs,
+        "LOCALAPPDATA",
+        "Programs\\Python\\Python314\\Scripts",
+    );
     push(&mut dirs, "LOCALAPPDATA", "Microsoft\\WinGet\\Links");
     push(&mut dirs, "LOCALAPPDATA", "Programs\\ffmpeg\\bin");
     push(&mut dirs, "USERPROFILE", "scoop\\shims");

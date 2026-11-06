@@ -229,9 +229,13 @@ async fn downloads_a_muxed_stream_without_ffmpeg() {
 
     let events = events.lock().expect("events lock");
     assert!(matches!(events.first(), Some(MediaEvent::Resolving)));
-    assert!(events.iter().any(
-        |event| matches!(event, MediaEvent::Resolved { needs_merge: false, .. })
-    ));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        MediaEvent::Resolved {
+            needs_merge: false,
+            ..
+        }
+    )));
     let progress: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
@@ -241,10 +245,10 @@ async fn downloads_a_muxed_stream_without_ffmpeg() {
         .collect();
     assert!(!progress.is_empty(), "expected at least one progress event");
     assert!(progress.iter().all(|p| p.stage == MediaStage::Video));
-    assert!(progress
-        .iter()
-        .all(|p| (0.0..=1.0).contains(&p.overall)));
-    assert!(matches!(events.last(), Some(MediaEvent::Done { bytes, .. }) if *bytes == data.len() as u64));
+    assert!(progress.iter().all(|p| (0.0..=1.0).contains(&p.overall)));
+    assert!(
+        matches!(events.last(), Some(MediaEvent::Done { bytes, .. }) if *bytes == data.len() as u64)
+    );
 
     let calls = runner.calls();
     assert_eq!(calls.len(), 1, "muxed download must not invoke ffmpeg");
@@ -302,10 +306,16 @@ async fn downloads_video_and_audio_then_merges() {
     assert!(!dir.join(".Merge Clip.rgaudio.m4a.rgparts").exists());
 
     let events = events.lock().expect("events lock");
-    assert!(events.iter().any(
-        |event| matches!(event, MediaEvent::Resolved { needs_merge: true, .. })
-    ));
-    assert!(events.iter().any(|event| matches!(event, MediaEvent::Merging)));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        MediaEvent::Resolved {
+            needs_merge: true,
+            ..
+        }
+    )));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, MediaEvent::Merging)));
 
     let progress: Vec<_> = events
         .iter()

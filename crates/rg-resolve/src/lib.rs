@@ -12,8 +12,8 @@ pub mod tools;
 
 pub use error::{ResolveError, Result};
 pub use media::{
-    download_media, download_media_with, final_output_path, MediaEvent, MediaProgress, MediaRequest,
-    MediaStage,
+    download_media, download_media_with, final_output_path, MediaEvent, MediaProgress,
+    MediaRequest, MediaStage,
 };
 pub use metadata::{
     resolve, select_streams, Format, Metadata, Resolved, SelectedStream, Selection,
@@ -23,4 +23,3 @@ pub use tools::{find_tool, CommandOutput, Runner, SystemRunner, Tools};
 /// Default resolution cap used by the front ends: 1080p H.264 is broadly
 /// playable and avoids multi-gigabyte 4K AV1 downloads.
 pub const DEFAULT_MAX_HEIGHT: u32 = 1080;
-
