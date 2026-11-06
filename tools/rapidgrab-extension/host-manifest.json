@@ -1,5 +1,5 @@
 {
-  "name": "RapidGrab native host",
+  "name": "com.rapidgrab",
   "description": "Forwards browser captures to the RapidGrab GUI via the named pipe.",
   "path": "E:\\Projects\\REA-RapidGrab\\target\\debug\\rapidgrab-host.exe",
   "type": "stdio",
