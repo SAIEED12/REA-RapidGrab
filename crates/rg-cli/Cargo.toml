@@ -9,6 +9,10 @@ description = "Command-line front end for the RapidGrab engine"
 name = "rapidgrab"
 path = "src/main.rs"
 
+[[bin]]
+name = "rapidgrab-host"
+path = "src/host.rs"
+
 [dependencies]
 rg-core = { path = "../rg-core" }
 rg-resolve = { path = "../rg-resolve" }

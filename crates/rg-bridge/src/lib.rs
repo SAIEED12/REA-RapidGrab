@@ -122,7 +122,14 @@ where
                 // ERROR_PIPE_CONNECTED (535) means client already connected.
                 let err = unsafe { winapi::um::errhandlingapi::GetLastError() };
                 if err != 535 {
-                    break;
+                    // Transient errors (e.g. a client that vanished before
+                    // connecting) must not kill the listener; only an invalid
+                    // handle means the pipe is gone for good.
+                    if err == 6 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
                 }
             }
             // Read one frame from this client.

@@ -241,9 +241,13 @@ impl RapidGrabApp {
         let rt = Arc::new(Runtime::new().expect("Failed to create tokio runtime"));
         let (update_tx, update_rx) = unbounded();
         let (capture_tx, capture_rx) = unbounded::<rg_bridge::CaptureRequest>();
+        let repaint_ctx = cc.egui_ctx.clone();
         let pipe_guard = if cfg!(windows) {
             rg_bridge::listen(move |req| {
                 let _ = capture_tx.send(req);
+                // The GUI only repaints while jobs are active; wake it so the
+                // capture is applied immediately instead of on the next click.
+                repaint_ctx.request_repaint();
             })
             .ok()
         } else {
