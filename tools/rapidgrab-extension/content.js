@@ -1,9 +1,10 @@
 // RapidGrab content script: media sniffing + player download button.
 // Runs on every page (all_frames, document_start). Finds <video>/<audio>
 // elements and <a download> / *.m3u8 links, and shows one small
-// "↓ RapidGrab" button per player on hover (IDM player-panel equivalent).
-// Clicking sends the media URL to the background, which captures it as
-// source "media". Never modifies the page's own controls.
+// "↓ RapidGrab" button per player (IDM player-panel equivalent). The button
+// is always visible while its player is in view. Clicking sends the media
+// URL to the background, which captures it as source "media". Never modifies
+// the page's own controls.
 //
 // Only real players get a button: thumbnail previews (YouTube homepage,
 // search results) are <video> elements too, but attaching to them produced
@@ -25,8 +26,6 @@
   const MIN_PLAYER_H = 200;
   const POS_KEY = "rapidgrab.btnPos";
   const DRAG_THRESHOLD = 4;
-  const HIDE_DELAY_MS = 300;
-  const KEEP_VISIBLE_MS = 1500;
   const DEFAULT_MARGIN = 8;
 
   function mediaUrlFor(el) {
@@ -111,10 +110,6 @@
     let dragging = false;
     let moved = false;
     let suppressClick = false;
-    let pointerOverBtn = false;
-    let pointerOverVideo = false;
-    let hideTimer = 0;
-    let keepTimer = 0;
     let raf = 0;
     let drag = null;
     let disposed = false;
@@ -154,28 +149,15 @@
       btn.style.pointerEvents = "none";
     }
 
+    // Always-visible badge: no hover gating. It only hides while its player
+    // is out of view (see the IntersectionObserver below).
     function show() {
       if (disposed || !onScreen) return;
-      window.clearTimeout(hideTimer);
-      window.clearTimeout(keepTimer);
       applyPosition();
       if (shown) return;
       shown = true;
       btn.style.opacity = "1";
       btn.style.pointerEvents = "auto";
-    }
-
-    function hide() {
-      window.clearTimeout(keepTimer);
-      if (disposed || dragging || pointerOverBtn || pointerOverVideo) return;
-      if (!shown) return;
-      forceHide();
-    }
-
-    function scheduleHide() {
-      if (disposed || dragging) return;
-      window.clearTimeout(hideTimer);
-      hideTimer = window.setTimeout(hide, HIDE_DELAY_MS);
     }
 
     // --- drag ------------------------------------------------------------
@@ -200,8 +182,6 @@
         btn.setPointerCapture(event.pointerId);
       } catch (_) {}
       btn.style.cursor = "grabbing";
-      window.clearTimeout(hideTimer);
-      window.clearTimeout(keepTimer);
     });
 
     btn.addEventListener("pointermove", (event) => {
@@ -239,9 +219,6 @@
       // A drop must never be mistaken for a click (no surprise download).
       suppressClick = moved;
       moved = false;
-      // Stay reachable for a moment so it can be grabbed again.
-      window.clearTimeout(keepTimer);
-      keepTimer = window.setTimeout(scheduleHide, KEEP_VISIBLE_MS);
     }
     btn.addEventListener("pointerup", endDrag);
     btn.addEventListener("pointercancel", endDrag);
@@ -264,30 +241,10 @@
         .catch(() => {});
     });
 
-    // --- visibility ------------------------------------------------------
-    btn.addEventListener("mouseenter", () => {
-      pointerOverBtn = true;
-      show();
-    });
-    btn.addEventListener("mouseleave", () => {
-      pointerOverBtn = false;
-      if (!pointerOverVideo) scheduleHide();
-    });
-
-    const onVideoEnter = () => {
-      pointerOverVideo = true;
-      show();
-    };
-    const onVideoLeave = () => {
-      pointerOverVideo = false;
-      if (!pointerOverBtn) scheduleHide();
-    };
-    video.addEventListener("mouseenter", onVideoEnter);
-    video.addEventListener("mouseleave", onVideoLeave);
-
-    // Re-check size on hover (a preview that grows into a player should
-    // still not get a button — isRealPlayer gates that — but a real player
-    // the user resized should hide/show correctly).
+    // --- size gate -------------------------------------------------------
+    // A preview that grows into a player should still not get a button —
+    // isRealPlayer gates that — but a real player the user resized should
+    // hide/show correctly.
     let scheduled = false;
     const place = () => {
       if (scheduled) return;
@@ -312,14 +269,9 @@
       intersectionObserver = new IntersectionObserver((entries) => {
         onScreen = entries.some((entry) => entry.isIntersecting);
         if (onScreen) {
+          // Come back automatically; no mouse movement required.
+          show();
           scheduleLayout();
-          // The cursor may already be over the player after scrolling back;
-          // no mouseenter will fire in that case, so re-check hover here.
-          if (video.matches(":hover") || btn.matches(":hover")) {
-            pointerOverVideo = video.matches(":hover");
-            pointerOverBtn = btn.matches(":hover");
-            show();
-          }
         } else {
           dragging = false;
           drag = null;
@@ -333,7 +285,7 @@
     window.addEventListener("scroll", onScroll, { capture: true, passive: true });
     window.addEventListener("resize", onScroll, { passive: true });
     document.addEventListener("fullscreenchange", scheduleLayout);
-    scheduleLayout();
+    show();
 
     // --- teardown (player removed by SPA navigation) ---------------------
     btn._rgVideo = video;
@@ -342,10 +294,6 @@
       window.removeEventListener("scroll", onScroll, true);
       window.removeEventListener("resize", onScroll);
       document.removeEventListener("fullscreenchange", scheduleLayout);
-      video.removeEventListener("mouseenter", onVideoEnter);
-      video.removeEventListener("mouseleave", onVideoLeave);
-      window.clearTimeout(hideTimer);
-      window.clearTimeout(keepTimer);
       if (raf) cancelAnimationFrame(raf);
       if (intersectionObserver) intersectionObserver.disconnect();
       resizeObserver.disconnect();
