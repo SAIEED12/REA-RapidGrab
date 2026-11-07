@@ -2,7 +2,7 @@
 //!
 //! Every color, radius, spacing step and font size used by the UI lives here.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, FontId, RichText};
 
@@ -286,7 +286,7 @@ fn install_fonts(ctx: &egui::Context) {
     let semibold = read_font(&["SegUIVar.ttf", "seguisb.ttf", "segoeuib.ttf"]);
 
     if let Some(data) = regular {
-        fonts.font_data.insert("rg-ui".to_string(), data);
+        fonts.font_data.insert("rg-ui".to_string(), Arc::new(data));
         if let Some(chain) = fonts.families.get_mut(&FontFamily::Proportional) {
             chain.insert(0, "rg-ui".to_string());
         }
@@ -306,7 +306,9 @@ fn install_fonts(ctx: &egui::Context) {
     let bangla_bold = read_font(&["NirmalaB.ttf", "NotoSansBengali-Bold.ttf"]);
     let mut text_chain = base_chain.clone();
     if let Some(data) = bangla {
-        fonts.font_data.insert("rg-bangla".to_string(), data);
+        fonts
+            .font_data
+            .insert("rg-bangla".to_string(), Arc::new(data));
         let at = if text_chain.first().is_some_and(|f| f == "rg-ui") {
             1
         } else {
@@ -318,11 +320,15 @@ fn install_fonts(ctx: &egui::Context) {
         }
     }
     if let Some(data) = bangla_bold {
-        fonts.font_data.insert("rg-bangla-bold".to_string(), data);
+        fonts
+            .font_data
+            .insert("rg-bangla-bold".to_string(), Arc::new(data));
     }
 
     let mut semibold_chain = if let Some(data) = semibold {
-        fonts.font_data.insert("rg-semibold".to_string(), data);
+        fonts
+            .font_data
+            .insert("rg-semibold".to_string(), Arc::new(data));
         let mut chain = vec!["rg-semibold".to_string()];
         if fonts.font_data.contains_key("rg-bangla-bold") {
             chain.push("rg-bangla-bold".to_string());
@@ -342,7 +348,9 @@ fn install_fonts(ctx: &egui::Context) {
     let icons = read_font(&["Segoe Fluent Icons.ttf", "segmdl2.ttf"]);
     let has_icons = icons.is_some();
     if let Some(data) = icons {
-        fonts.font_data.insert("rg-icons".to_string(), data);
+        fonts
+            .font_data
+            .insert("rg-icons".to_string(), Arc::new(data));
         fonts
             .families
             .insert(icon_family(), vec!["rg-icons".to_string()]);
@@ -354,9 +362,9 @@ fn install_fonts(ctx: &egui::Context) {
 
 fn shadow() -> egui::epaint::Shadow {
     egui::epaint::Shadow {
-        offset: egui::vec2(0.0, 6.0),
-        blur: 24.0,
-        spread: 0.0,
+        offset: [0, 6],
+        blur: 24,
+        spread: 0,
         color: Color32::from_rgba_premultiplied(0x00, 0x00, 0x00, 0x50),
     }
 }
@@ -369,8 +377,8 @@ fn visuals() -> egui::Visuals {
     v.panel_fill = BG;
     v.window_fill = CARD;
     v.window_stroke = egui::Stroke::new(1.0_f32, STROKE);
-    v.window_rounding = egui::Rounding::same(R_CARD);
-    v.menu_rounding = egui::Rounding::same(R_MEDIUM);
+    v.window_corner_radius = egui::CornerRadius::same(R_CARD as u8);
+    v.menu_corner_radius = egui::CornerRadius::same(R_MEDIUM as u8);
     v.window_shadow = shadow();
     v.popup_shadow = shadow();
     v.window_highlight_topmost = false;
@@ -394,13 +402,13 @@ fn visuals() -> egui::Visuals {
     v.interact_cursor = Some(egui::CursorIcon::PointingHand);
     v.image_loading_spinners = false;
 
-    let rounding = egui::Rounding::same(R_MEDIUM);
+    let rounding = egui::CornerRadius::same(R_MEDIUM as u8);
 
     let mut noninteractive = v.widgets.noninteractive;
     noninteractive.bg_fill = CARD;
     noninteractive.weak_bg_fill = CARD;
     noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, STROKE_SOFT);
-    noninteractive.rounding = egui::Rounding::same(R_SMALL);
+    noninteractive.corner_radius = egui::CornerRadius::same(R_SMALL as u8);
     noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT_SECONDARY);
     noninteractive.expansion = 0.0;
     v.widgets.noninteractive = noninteractive;
@@ -409,7 +417,7 @@ fn visuals() -> egui::Visuals {
     inactive.bg_fill = CONTROL;
     inactive.weak_bg_fill = CONTROL;
     inactive.bg_stroke = egui::Stroke::new(1.0_f32, STROKE_SOFT);
-    inactive.rounding = rounding;
+    inactive.corner_radius = rounding;
     inactive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
     inactive.expansion = 0.0;
     v.widgets.inactive = inactive;
@@ -418,7 +426,7 @@ fn visuals() -> egui::Visuals {
     hovered.bg_fill = CONTROL_HOVER;
     hovered.weak_bg_fill = CONTROL_HOVER;
     hovered.bg_stroke = egui::Stroke::new(1.0_f32, STROKE);
-    hovered.rounding = rounding;
+    hovered.corner_radius = rounding;
     hovered.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
     hovered.expansion = 0.0;
     v.widgets.hovered = hovered;
@@ -427,7 +435,7 @@ fn visuals() -> egui::Visuals {
     active.bg_fill = CONTROL_PRESSED;
     active.weak_bg_fill = CONTROL_PRESSED;
     active.bg_stroke = egui::Stroke::new(1.0_f32, STROKE);
-    active.rounding = rounding;
+    active.corner_radius = rounding;
     active.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
     active.expansion = 0.0;
     v.widgets.active = active;
@@ -436,7 +444,7 @@ fn visuals() -> egui::Visuals {
     open.bg_fill = CONTROL;
     open.weak_bg_fill = CONTROL;
     open.bg_stroke = egui::Stroke::new(1.0_f32, STROKE_SOFT);
-    open.rounding = rounding;
+    open.corner_radius = rounding;
     open.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
     open.expansion = 0.0;
     v.widgets.open = open;
@@ -453,8 +461,8 @@ fn style() -> egui::Style {
 
     style.spacing.item_spacing = egui::vec2(SP_S, SP_S);
     style.spacing.button_padding = egui::vec2(SP_M, SP_S);
-    style.spacing.window_margin = egui::Margin::same(SP_L);
-    style.spacing.menu_margin = egui::Margin::same(SP_S);
+    style.spacing.window_margin = egui::Margin::same(SP_L as i8);
+    style.spacing.menu_margin = egui::Margin::same(SP_S as i8);
     style.spacing.indent = SP_L;
     style.spacing.slider_width = 120.0;
     style.spacing.interact_size = egui::vec2(40.0, CONTROL_H);
@@ -509,5 +517,5 @@ fn style() -> egui::Style {
 /// Applies fonts, visuals and style to the context.
 pub fn apply_theme(ctx: &egui::Context) {
     install_fonts(ctx);
-    ctx.set_style(style());
+    ctx.set_global_style(style());
 }

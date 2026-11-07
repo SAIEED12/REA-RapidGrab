@@ -911,7 +911,8 @@ impl eframe::App for RapidGrabApp {
         eframe::set_value(storage, SETTINGS_KEY, &settings);
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         while let Ok(update) = self.update_rx.try_recv() {
             self.apply_update(update);
         }
@@ -972,15 +973,15 @@ impl eframe::App for RapidGrabApp {
                 egui::Frame::default()
                     .fill(theme::BG)
                     .inner_margin(egui::Margin {
-                        left: 20.0,
-                        right: 20.0,
-                        top: 14.0,
-                        bottom: 12.0,
+                        left: 20,
+                        right: 20,
+                        top: 14,
+                        bottom: 12,
                     }),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 let mut area = egui::ScrollArea::vertical()
-                    .id_source("rapidgrab-page")
+                    .id_salt("rapidgrab-page")
                     .auto_shrink([false, false]);
                 if !self.page_reset_done {
                     area = area.vertical_scroll_offset(0.0);
@@ -1087,7 +1088,7 @@ fn header(
                 app.logo.id(),
                 egui::vec2(32.0, 32.0),
             ))
-            .rounding(theme::R_MEDIUM),
+            .corner_radius(theme::R_MEDIUM as u8),
         );
         ui.add_space(theme::SP_S);
         ui.vertical(|ui| {
@@ -1236,7 +1237,7 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
 
         ui.add(egui::Label::new(theme::label("URL")));
         if std::mem::take(&mut app.focus_url) {
-            ui.memory_mut(|m| m.request_focus(egui::Id::new("rg-url")));
+            ui.memory_mut(|m| m.request_focus(ui.make_persistent_id("rg-url")));
         }
         let url = widgets::text_field(
             ui,
@@ -1723,7 +1724,7 @@ fn job_card(ui: &mut egui::Ui, view: &JobView, actions: &mut Vec<Action>) {
         if let Some(fraction) = progress.fraction {
             widgets::progress(
                 ui,
-                egui::Id::new(("rg-progress", view.id)),
+                ui.make_persistent_id(("rg-progress", view.id)),
                 fraction,
                 progress.color,
             );

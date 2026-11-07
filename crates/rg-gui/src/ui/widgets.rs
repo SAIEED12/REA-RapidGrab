@@ -1,8 +1,8 @@
 //! Reusable Fluent-inspired widgets built on top of [`super::theme`].
 
 use eframe::egui::{
-    self, Align, Align2, Color32, CursorIcon, FontId, Id, Rect, Response, RichText, Rounding,
-    Sense, Stroke, Ui, Vec2,
+    self, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Rect, Response, RichText, Sense,
+    Stroke, Ui, Vec2,
 };
 
 use super::theme::*;
@@ -27,7 +27,8 @@ fn transparent() -> Color32 {
 }
 
 fn text_width(ui: &Ui, text: &str, font: FontId) -> f32 {
-    ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font, TEXT))
+    ui.ctx()
+        .fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font, TEXT))
         .size()
         .x
 }
@@ -52,12 +53,12 @@ pub fn card() -> egui::Frame {
     egui::Frame::default()
         .fill(CARD)
         .stroke(Stroke::new(1.0_f32, STROKE_SOFT))
-        .rounding(Rounding::same(R_CARD))
-        .inner_margin(egui::Margin::same(SP_L))
+        .corner_radius(CornerRadius::same(R_CARD as u8))
+        .inner_margin(egui::Margin::same(SP_L as i8))
         .shadow(egui::epaint::Shadow {
-            offset: Vec2::new(0.0, 4.0),
-            blur: 18.0,
-            spread: 0.0,
+            offset: [0, 4],
+            blur: 18,
+            spread: 0,
             color: Color32::from_rgba_premultiplied(0, 0, 0, 0x38),
         })
 }
@@ -169,7 +170,7 @@ fn draw_button(ui: &mut Ui, label: &str, kind: ButtonKind, enabled: bool, size: 
     let pressed = enabled && response.is_pointer_button_down_on();
     let t = ui.ctx().animate_bool_with_time(response.id, hovered, ANIM);
 
-    let rounding = Rounding::same(R_MEDIUM);
+    let rounding = CornerRadius::same(R_MEDIUM as u8);
     let (fill, text_color, stroke) = match kind {
         ButtonKind::Primary => {
             let fill = if !enabled {
@@ -226,7 +227,7 @@ fn draw_button(ui: &mut Ui, label: &str, kind: ButtonKind, enabled: bool, size: 
         painter.rect_filled(rect, rounding, fill);
     }
     if stroke != Stroke::NONE {
-        painter.rect_stroke(rect, rounding, stroke);
+        painter.rect_stroke(rect, rounding, stroke, egui::StrokeKind::Middle);
     }
     if response.has_focus() {
         let ring = if kind == ButtonKind::Primary {
@@ -234,7 +235,12 @@ fn draw_button(ui: &mut Ui, label: &str, kind: ButtonKind, enabled: bool, size: 
         } else {
             ACCENT
         };
-        painter.rect_stroke(rect.expand(2.0), rounding, Stroke::new(1.5_f32, ring));
+        painter.rect_stroke(
+            rect.expand(2.0),
+            rounding,
+            Stroke::new(1.5_f32, ring),
+            egui::StrokeKind::Middle,
+        );
     }
     painter.text(
         rect.center(),
@@ -266,11 +272,11 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str, enabled: bool) -> Res
     let pressed = enabled && response.is_pointer_button_down_on();
     if pressed {
         ui.painter()
-            .rect_filled(rect, Rounding::same(R_SMALL), CONTROL_PRESSED);
+            .rect_filled(rect, CornerRadius::same(R_SMALL as u8), CONTROL_PRESSED);
     } else if t > 0.0 {
         ui.painter().rect_filled(
             rect,
-            Rounding::same(R_SMALL),
+            CornerRadius::same(R_SMALL as u8),
             mix(transparent(), CONTROL_HOVER, t),
         );
     }
@@ -282,8 +288,9 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str, enabled: bool) -> Res
     if response.has_focus() {
         ui.painter().rect_stroke(
             rect.expand(1.0),
-            Rounding::same(R_SMALL),
+            CornerRadius::same(R_SMALL as u8),
             Stroke::new(1.0_f32, ACCENT),
+            egui::StrokeKind::Middle,
         );
     }
     ui.painter().text(
@@ -315,7 +322,7 @@ pub fn filled_icon_button(ui: &mut Ui, icon: Icon, tooltip: &str, enabled: bool)
     let hovered = enabled && response.hovered();
     let pressed = enabled && response.is_pointer_button_down_on();
     let t = ui.ctx().animate_bool_with_time(response.id, hovered, ANIM);
-    let rounding = Rounding::same(R_SMALL);
+    let rounding = CornerRadius::same(R_SMALL as u8);
 
     let fill = if !enabled {
         CONTROL
@@ -325,12 +332,20 @@ pub fn filled_icon_button(ui: &mut Ui, icon: Icon, tooltip: &str, enabled: bool)
         mix(CONTROL, CONTROL_HOVER, t)
     };
     ui.painter().rect_filled(rect, rounding, fill);
-    ui.painter()
-        .rect_stroke(rect, rounding, Stroke::new(1.0_f32, STROKE_SOFT));
+    ui.painter().rect_stroke(
+        rect,
+        rounding,
+        Stroke::new(1.0_f32, STROKE_SOFT),
+        egui::StrokeKind::Middle,
+    );
 
     if response.has_focus() {
-        ui.painter()
-            .rect_stroke(rect.expand(1.0), rounding, Stroke::new(1.5_f32, ACCENT));
+        ui.painter().rect_stroke(
+            rect.expand(1.0),
+            rounding,
+            Stroke::new(1.5_f32, ACCENT),
+            egui::StrokeKind::Middle,
+        );
     }
     let color = if !enabled {
         TEXT_DISABLED
@@ -358,8 +373,11 @@ pub fn chip(ui: &mut Ui, text: &str, color: Color32) -> Response {
     let font = FontId::new(CAPTION_SIZE, proportional());
     let width = text_width(ui, text, font.clone()) + SP_S * 2.0;
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, CHIP_H), Sense::hover());
-    ui.painter()
-        .rect_filled(rect, Rounding::same(10.0), mix(transparent(), color, 0.14));
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same(10),
+        mix(transparent(), color, 0.14),
+    );
     ui.painter()
         .text(rect.center(), Align2::CENTER_CENTER, text, font, color);
     response
@@ -375,7 +393,7 @@ pub fn status_chip(ui: &mut Ui, status: &JobStatus) -> Response {
     let painter = ui.painter();
     painter.rect_filled(
         rect,
-        Rounding::same(STATUS_CHIP_H * 0.5),
+        CornerRadius::same((STATUS_CHIP_H * 0.5) as u8),
         mix(transparent(), color, 0.12),
     );
     if matches!(status, JobStatus::Completed) {
@@ -427,7 +445,7 @@ pub fn progress(ui: &mut Ui, id: Id, fraction: f32, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, PROGRESS_H), Sense::hover());
     let target = fraction.clamp(0.0, 1.0);
     let shown = ui.ctx().animate_value_with_time(id, target, 0.3);
-    let rounding = Rounding::same(PROGRESS_H * 0.5);
+    let rounding = CornerRadius::same((PROGRESS_H * 0.5) as u8);
 
     ui.painter().rect_filled(rect, rounding, TRACK_FILL);
     let filled = rect.width() * shown;
@@ -450,8 +468,8 @@ pub fn alert(ui: &mut Ui, text: &str, color: Color32) {
     egui::Frame::default()
         .fill(mix(transparent(), color, 0.08))
         .stroke(Stroke::new(1.0_f32, mix(transparent(), color, 0.28)))
-        .rounding(Rounding::same(R_SMALL))
-        .inner_margin(egui::Margin::symmetric(SP_S, SP_XS + 2.0))
+        .corner_radius(CornerRadius::same(R_SMALL as u8))
+        .inner_margin(egui::Margin::symmetric(SP_S as i8, (SP_XS + 2.0) as i8))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = SP_XS + 2.0;
@@ -578,7 +596,7 @@ pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldRespo
         let (rect, background) =
             ui.allocate_exact_size(Vec2::new(width, field.height), Sense::click());
         let painter = ui.painter().clone();
-        painter.rect_filled(rect, Rounding::same(R_SMALL), CONTROL);
+        painter.rect_filled(rect, CornerRadius::same(R_SMALL as u8), CONTROL);
 
         let icon_w = if field.icon.is_some() {
             FIELD_ICON_W
@@ -603,10 +621,10 @@ pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldRespo
         let response = ui.put(
             text_rect,
             egui::TextEdit::singleline(buf)
-                .id(Id::new(field.id))
-                .frame(false)
-                .margin(egui::Margin::symmetric(0.0, 0.0))
-                .vertical_align(Align::Center)
+                .id(ui.make_persistent_id(field.id))
+                .frame(egui::Frame::NONE)
+                .margin(egui::Margin::ZERO)
+                .align(egui::Align2::LEFT_CENTER)
                 .text_color(TEXT),
         );
 
@@ -651,7 +669,12 @@ pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldRespo
         } else {
             (STROKE_CONTROL, 1.0_f32)
         };
-        painter.rect_stroke(rect, Rounding::same(R_SMALL), Stroke::new(width_px, color));
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(R_SMALL as u8),
+            Stroke::new(width_px, color),
+            egui::StrokeKind::Middle,
+        );
         if focused && !field.invalid {
             let y = rect.bottom() - 1.5;
             painter.line_segment(
@@ -698,11 +721,12 @@ pub fn stepper(
             let (rect, _) =
                 ui.allocate_exact_size(Vec2::new(STEP_VALUE_W, FIELD_H), Sense::hover());
             ui.painter()
-                .rect_filled(rect, Rounding::same(R_SMALL), CONTROL);
+                .rect_filled(rect, CornerRadius::same(R_SMALL as u8), CONTROL);
             ui.painter().rect_stroke(
                 rect,
-                Rounding::same(R_SMALL),
+                CornerRadius::same(R_SMALL as u8),
                 Stroke::new(1.0_f32, STROKE_CONTROL),
+                egui::StrokeKind::Middle,
             );
             ui.painter().text(
                 rect.center(),
@@ -754,7 +778,7 @@ pub fn checkbox(ui: &mut Ui, id_salt: &str, checked: &mut bool, label: &str) -> 
         } else {
             mix(ACCENT, ACCENT_HOVER, t)
         };
-        painter.rect_filled(box_rect, Rounding::same(R_SMALL), fill);
+        painter.rect_filled(box_rect, CornerRadius::same(R_SMALL as u8), fill);
         paint_check(
             &painter,
             box_rect.shrink(4.0),
@@ -764,13 +788,13 @@ pub fn checkbox(ui: &mut Ui, id_salt: &str, checked: &mut bool, label: &str) -> 
         if pressed {
             painter.rect_filled(
                 box_rect,
-                Rounding::same(R_SMALL),
+                CornerRadius::same(R_SMALL as u8),
                 mix(transparent(), TEXT, 0.12),
             );
         } else if t > 0.0 {
             painter.rect_filled(
                 box_rect,
-                Rounding::same(R_SMALL),
+                CornerRadius::same(R_SMALL as u8),
                 mix(transparent(), TEXT, 0.06 * t),
             );
         }
@@ -783,16 +807,18 @@ pub fn checkbox(ui: &mut Ui, id_salt: &str, checked: &mut bool, label: &str) -> 
         };
         painter.rect_stroke(
             box_rect,
-            Rounding::same(R_SMALL),
+            CornerRadius::same(R_SMALL as u8),
             Stroke::new(1.0_f32, stroke),
+            egui::StrokeKind::Middle,
         );
     }
 
     if response.has_focus() {
         painter.rect_stroke(
             box_rect.expand(2.0),
-            Rounding::same(R_SMALL + 1.0),
+            CornerRadius::same((R_SMALL + 1.0) as u8),
             Stroke::new(1.5_f32, ACCENT),
+            egui::StrokeKind::Middle,
         );
     }
 
@@ -833,7 +859,7 @@ pub fn dropdown(
     width: f32,
 ) -> Option<usize> {
     let enabled = ui.is_enabled();
-    let popup_id = ui.make_persistent_id(id_salt).with("popup");
+    let _ = id_salt;
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(width, FIELD_H),
         if enabled {
@@ -842,8 +868,8 @@ pub fn dropdown(
             Sense::hover()
         },
     );
-
-    let open = ui.memory(|m| m.is_popup_open(popup_id));
+    let popup_id_lookup = egui::Popup::default_response_id(&response);
+    let open = egui::Popup::is_id_open(ui.ctx(), popup_id_lookup);
     let hovered = enabled && response.hovered();
     let t = ui
         .ctx()
@@ -852,7 +878,7 @@ pub fn dropdown(
     let painter = ui.painter().clone();
     painter.rect_filled(
         rect,
-        Rounding::same(R_SMALL),
+        CornerRadius::same(R_SMALL as u8),
         if hovered {
             mix(FIELD, CONTROL_HOVER, t)
         } else {
@@ -866,8 +892,9 @@ pub fn dropdown(
     };
     painter.rect_stroke(
         rect,
-        Rounding::same(R_SMALL),
+        CornerRadius::same(R_SMALL as u8),
         Stroke::new(border.1, border.0),
+        egui::StrokeKind::Middle,
     );
     painter.text(
         egui::pos2(rect.left() + SP_M, rect.center().y),
@@ -890,17 +917,13 @@ pub fn dropdown(
 
     if enabled && response.clicked() {
         response.request_focus();
-        ui.memory_mut(|m| m.toggle_popup(popup_id));
     }
 
     let mut picked = None;
     if enabled {
-        egui::popup::popup_below_widget(
-            ui,
-            popup_id,
-            &response,
-            egui::popup::PopupCloseBehavior::CloseOnClick,
-            |ui| {
+        egui::Popup::menu(&response)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+            .show(|ui| {
                 ui.set_min_width(width);
                 ui.spacing_mut().item_spacing.y = 2.0;
                 for (index, label) in labels.iter().enumerate() {
@@ -910,12 +933,12 @@ pub fn dropdown(
                     );
                     let painter = ui.painter().clone();
                     if row_response.hovered() {
-                        painter.rect_filled(row, Rounding::same(R_SMALL), CONTROL_HOVER);
+                        painter.rect_filled(row, CornerRadius::same(R_SMALL as u8), CONTROL_HOVER);
                     }
                     if index == selected {
                         painter.rect_filled(
                             row,
-                            Rounding::same(R_SMALL),
+                            CornerRadius::same(R_SMALL as u8),
                             mix(transparent(), ACCENT, 0.10),
                         );
                         paint_check(
@@ -938,11 +961,7 @@ pub fn dropdown(
                         picked = Some(index);
                     }
                 }
-            },
-        );
-        if picked.is_some() {
-            ui.memory_mut(|m| m.close_popup());
-        }
+            });
     }
 
     if enabled {
@@ -977,7 +996,7 @@ pub fn collapsible(
     if hover > 0.0 {
         ui.painter().rect_filled(
             rect,
-            Rounding::same(R_SMALL),
+            CornerRadius::same(R_SMALL as u8),
             mix(transparent(), CONTROL_HOVER, hover),
         );
     }
@@ -990,8 +1009,9 @@ pub fn collapsible(
     if response.has_focus() {
         ui.painter().rect_stroke(
             rect.shrink(1.0),
-            Rounding::same(R_SMALL),
+            CornerRadius::same(R_SMALL as u8),
             Stroke::new(1.0_f32, ACCENT),
+            egui::StrokeKind::Middle,
         );
     }
     ui.painter().text(
