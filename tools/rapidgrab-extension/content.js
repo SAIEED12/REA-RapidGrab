@@ -96,7 +96,7 @@
       "position:fixed", "left:0", "top:0", "z-index:2147483647",
       "background:#1b1b1b", "color:#60cdff", "border:1px solid #3a3a3a",
       "border-radius:6px", "padding:4px 8px", "font:12px system-ui, sans-serif",
-      "cursor:grab", "opacity:0", "transition:opacity .15s", "pointer-events:none",
+      "cursor:default", "opacity:0", "transition:opacity .15s", "pointer-events:none",
       "white-space:nowrap", "width:auto", "max-width:160px",
       "touch-action:none", "user-select:none", "-webkit-user-select:none",
       "-webkit-user-drag:none",
@@ -181,7 +181,6 @@
       try {
         btn.setPointerCapture(event.pointerId);
       } catch (_) {}
-      btn.style.cursor = "grabbing";
     });
 
     btn.addEventListener("pointermove", (event) => {
@@ -214,7 +213,6 @@
         } catch (_) {}
       }
       drag = null;
-      btn.style.cursor = "grab";
       if (moved && offset) saveOffset(offset);
       // A drop must never be mistaken for a click (no surprise download).
       suppressClick = moved;

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "RapidGrab",
-  "version": "1.2",
+  "version": "1.3",
   "description": "Send the current page's download link to RapidGrab for confirmation.",
   "permissions": ["cookies", "contextMenus", "nativeMessaging", "tabs", "webRequest", "downloads"],
   "host_permissions": ["<all_urls>"],
