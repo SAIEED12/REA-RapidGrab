@@ -5,6 +5,9 @@
 
 const HOST = "com.rapidgrab";
 
+// Firefox exposes the same APIs under `browser`; Chrome uses `chrome`.
+const api = globalThis.browser || globalThis.chrome;
+
 function guessFilename(url) {
   try {
     const u = new URL(url);
@@ -63,7 +66,7 @@ function sendCapture(url, tab) {
   const user_agent = navigator.userAgent;
 
   // Cookies for the target host (best-effort; empty on failure).
-  chrome.cookies
+  api.cookies
     .getAll({ url })
     .then((cookies) => {
       const cookie = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
@@ -73,38 +76,38 @@ function sendCapture(url, tab) {
 }
 
 function post(payload) {
-  const port = chrome.runtime.connectNative(HOST);
+  const port = api.runtime.connectNative(HOST);
   // Native messaging: send one length-prefixed JSON message.
   port.postMessage(payload);
   port.onDisconnect.addListener(() => {
-    if (chrome.runtime.lastError) {
-      console.warn("[RapidGrab] native host unavailable:", chrome.runtime.lastError.message);
+    if (api.runtime.lastError) {
+      console.warn("[RapidGrab] native host unavailable:", api.runtime.lastError.message);
     }
   });
   // Chrome closes the port after the message is sent; no response expected.
 }
 
-chrome.action.onClicked.addListener((tab) => {
+api.action.onClicked.addListener((tab) => {
   if (!tab || !tab.url) return;
   // Prefer the page URL itself; for link-heavy pages the user can use the
   // context menu on a specific link instead.
   sendCapture(tab.url, tab);
 });
 
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus.create({
+api.runtime.onInstalled.addListener(() => {
+  api.contextMenus.create({
     id: "rapidgrab-page",
     title: "Download page with RapidGrab",
     contexts: ["page"],
   });
-  chrome.contextMenus.create({
+  api.contextMenus.create({
     id: "rapidgrab-link",
     title: "Download link with RapidGrab",
     contexts: ["link"],
   });
 });
 
-chrome.contextMenus.onClicked.addListener((info, tab) => {
+api.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === "rapidgrab-link" && info.linkUrl) {
     sendCapture(info.linkUrl, tab);
   } else if (info.menuItemId === "rapidgrab-page" && tab && tab.url) {

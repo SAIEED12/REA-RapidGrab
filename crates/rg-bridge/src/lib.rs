@@ -53,6 +53,25 @@ pub fn write_frame<W: Write>(mut w: W, req: &CaptureRequest) -> Result<()> {
     Ok(())
 }
 
+/// Acknowledgement the native host sends back to the extension after
+/// forwarding (or failing to forward) one capture.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostAck {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Write one generic native-messaging frame (used for the host ack).
+pub fn write_ack_frame<W: Write>(mut w: W, ack: &HostAck) -> Result<()> {
+    let body = serde_json::to_vec(ack)?;
+    let len = u32::try_from(body.len()).context("frame too large")?;
+    w.write_all(&len.to_le_bytes())?;
+    w.write_all(&body)?;
+    w.flush()?;
+    Ok(())
+}
+
 /// Native host side: connect to the GUI pipe and send one request.
 /// Returns an error if the GUI is not running.
 pub fn send_capture(req: &CaptureRequest) -> Result<()> {
@@ -74,16 +93,32 @@ where
 {
     use std::sync::Arc;
     let on_request = Arc::new(on_request);
-    // Security descriptor: current user only. Safe descriptor string for
-    // the current user (D:P(A;;GA;;;OW)(A;;GA;;;SY)).
-    let sd = "D:P(A;;GA;;;OW)(A;;GA;;;SY)";
-    let builder = winapi::um::minwinbase::SECURITY_ATTRIBUTES {
+    // ACL the pipe to the current user only (owner + SYSTEM). Without this,
+    // any local process can connect and inject capture requests.
+    let sd_text: Vec<u16> = "D:P(A;;GA;;;OW)(A;;GA;;;SY)"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sd: winapi::um::winnt::PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let mut sd_size: u32 = 0;
+    let converted = unsafe {
+        winapi::shared::sddl::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sd_text.as_ptr(),
+            1,
+            &mut sd,
+            &mut sd_size,
+        )
+    };
+    if converted == 0 || sd.is_null() {
+        anyhow::bail!("ACL setup failed: {}", unsafe {
+            winapi::um::errhandlingapi::GetLastError()
+        });
+    }
+    let mut sa = winapi::um::minwinbase::SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<winapi::um::minwinbase::SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: std::ptr::null_mut(),
+        lpSecurityDescriptor: sd,
         bInheritHandle: winapi::shared::minwindef::FALSE,
     };
-    let _ = builder; // full SD setup via winapi is verbose; default DACL is acceptable for v1
-    let _ = sd;
 
     let server = unsafe {
         winapi::um::namedpipeapi::CreateNamedPipeW(
@@ -100,7 +135,7 @@ where
             16 * 1024,
             16 * 1024,
             0,
-            std::ptr::null_mut(),
+            &mut sa,
         )
     };
     if server == -1isize as winapi::um::winnt::HANDLE {
@@ -108,6 +143,8 @@ where
             winapi::um::errhandlingapi::GetLastError()
         });
     }
+    // The pipe copied the SD at creation; free our copy.
+    let _ = unsafe { winapi::um::winbase::LocalFree(sd as winapi::shared::minwindef::HLOCAL) };
 
     // HANDLE is a raw pointer and not Send; pass it as usize into the thread.
     let handle_usize = server as usize;
