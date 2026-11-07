@@ -8,6 +8,141 @@ const HOST = "com.rapidgrab";
 // Firefox exposes the same APIs under `browser`; Chrome uses `chrome`.
 const api = globalThis.browser || globalThis.chrome;
 
+// Extensions treated as files (own list; IDM's registry list covers the same
+// ground — archives, media, documents, installers).
+const FILE_EXTENSIONS = new Set([
+  "3gp", "7z", "aac", "ace", "aif", "apk", "arj", "asf", "avi", "bin", "bz2",
+  "exe", "gz", "gzip", "img", "iso", "lzh", "m4a", "m4v", "mkv", "mov", "mp3",
+  "mp4", "mpa", "mpeg", "mpg", "msi", "msu", "ogg", "ogv", "pdf", "ppt", "pptx",
+  "qt", "ra", "rar", "rm", "rmvb", "sit", "sitx", "tar", "tif", "tiff", "wav",
+  "webm", "wma", "wmv", "xls", "xlsx", "zip",
+]);
+
+const FILE_CONTENT_TYPES = new Set([
+  "application/pdf",
+  "application/zip",
+  "application/x-rar-compressed",
+  "application/x-7z-compressed",
+  "application/x-tar",
+  "application/gzip",
+  "application/octet-stream",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/msword",
+  "application/vnd.ms-powerpoint",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/x-msdownload",
+  "application/vnd.microsoft.portable-executable",
+]);
+
+// requestId -> { url, time } for deduping the same response.
+const seenRequests = new Map();
+
+// browser downloadId -> captured url, for cancelling after the GUI acks.
+const capturedDownloads = new Map();
+
+function headerValue(headers, name) {
+  const lower = name.toLowerCase();
+  for (const h of headers || []) {
+    if ((h.name || "").toLowerCase() === lower) return h.value || "";
+  }
+  return null;
+}
+
+function parseDispositionFilename(disposition) {
+  if (!disposition) return null;
+  // RFC 5987: filename*=UTF-8''%E2%82%AC.txt
+  const star = disposition.match(/filename\*\s*=\s*(?:UTF-8'')?([^;]+)/i);
+  if (star) {
+    try {
+      return decodeURIComponent(star[1].trim().replace(/^"|"$/g, ""));
+    } catch (_) {}
+  }
+  const plain = disposition.match(/filename\s*=\s*([^;]+)/i);
+  if (plain) return plain[1].trim().replace(/^"|"$/g, "");
+  return null;
+}
+
+function extensionOf(url, filename) {
+  const name = filename || "";
+  const dot = name.lastIndexOf(".");
+  if (dot > 0) return name.slice(dot + 1).toLowerCase();
+  try {
+    const parts = new URL(url).pathname.split("/").filter(Boolean);
+    const last = parts[parts.length - 1] || "";
+    const d = last.lastIndexOf(".");
+    if (d > 0) return last.slice(d + 1).toLowerCase();
+  } catch (_) {}
+  return "";
+}
+
+function isDownloadable(headers, url, resourceType) {
+  const disposition = headerValue(headers, "content-disposition") || "";
+  if (/attachment/i.test(disposition)) return true;
+  const type = (headerValue(headers, "content-type") || "").split(";")[0].trim().toLowerCase();
+  if (type.startsWith("video/") || type.startsWith("audio/")) return true;
+  if (FILE_CONTENT_TYPES.has(type)) return true;
+  const ext = extensionOf(url, parseDispositionFilename(disposition));
+  if (ext && FILE_EXTENSIONS.has(ext)) return true;
+  // Media subresource (video element streams) with a known file extension.
+  if (resourceType === "media" && ext) return true;
+  return false;
+}
+
+async function handleIntercept(details) {
+  try {
+    if (details.tabId < 0 || details.tabId === api.tabs.TAB_ID_NONE) return;
+    if (!/^https?:\/\//i.test(details.url)) return;
+    if (details.statusCode && details.statusCode >= 400) return;
+    const now = Date.now();
+    for (const [k, v] of seenRequests) {
+      if (now - v.time > 30000) seenRequests.delete(k);
+    }
+    if (seenRequests.has(details.requestId)) return;
+    const headers = details.responseHeaders || [];
+    if (!isDownloadable(headers, details.url, details.type)) return;
+    seenRequests.set(details.requestId, { url: details.url, time: now });
+
+    const disposition = headerValue(headers, "content-disposition");
+    const filename = parseDispositionFilename(disposition) || guessFilename(details.url);
+    const contentType = headerValue(headers, "content-type");
+    const lengthHeader = headerValue(headers, "content-length");
+    const contentLength =
+      lengthHeader && /^\d+$/.test(lengthHeader.trim())
+        ? Number(lengthHeader.trim())
+        : undefined;
+
+    const tab = await api.tabs.get(details.tabId).catch(() => null);
+    await sendCapture(details.url, tab, {
+      filename,
+      contentDisposition: disposition,
+      contentType: contentType || undefined,
+      contentLength,
+      source: "intercept",
+    });
+  } catch (e) {
+    console.warn("[RapidGrab] intercept failed:", e);
+  }
+}
+
+function onDownloadCreated(downloadItem) {
+  const url = downloadItem.finalUrl || downloadItem.url;
+  const when = Date.now();
+  for (const [k, v] of capturedDownloads) {
+    if (when - v.time > 60000) capturedDownloads.delete(k);
+  }
+  capturedDownloads.set(downloadItem.id, { url, time: when });
+}
+
+function cancelBrowserDownload(downloadId) {
+  if (!api.downloads) return;
+  api.downloads.pause(downloadId).catch(() => {});
+  // Give the pause a tick so the cancel wins (Chrome quirk).
+  setTimeout(() => {
+    api.downloads.cancel(downloadId).catch(() => {});
+  }, 50);
+}
+
 function guessFilename(url) {
   try {
     const u = new URL(url);
@@ -51,40 +186,64 @@ function filenameFromTitle(title) {
   return name;
 }
 
-function sendCapture(url, tab) {
+async function sendCapture(url, tab, info) {
   if (!/^https?:\/\//i.test(url)) {
     console.warn("[RapidGrab] not an http(s) URL:", url);
     return;
   }
-  let filename = guessFilename(url);
+  info = info || {};
+  let filename = info.filename || guessFilename(url);
   // YouTube watch/share pages carry no filename in the URL — name the
   // capture from the tab title instead of falling back to download.bin.
   if (!filename && isYouTubePage(url)) {
     filename = filenameFromTitle(tab && tab.title);
   }
-  const referer = tab && tab.url ? tab.url : undefined;
-  const user_agent = navigator.userAgent;
+  const payload = {
+    url,
+    filename: filename || undefined,
+    referer: (tab && tab.url) || undefined,
+    user_agent: navigator.userAgent,
+    content_disposition_filename: info.contentDisposition
+      ? parseDispositionFilename(info.contentDisposition) || undefined
+      : undefined,
+    content_type: info.contentType,
+    content_length: info.contentLength,
+    source: info.source || "click",
+  };
 
   // Cookies for the target host (best-effort; empty on failure).
-  api.cookies
-    .getAll({ url })
-    .then((cookies) => {
-      const cookie = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-      post({ url, filename, referer, cookies: cookie || undefined, user_agent });
-    })
-    .catch(() => post({ url, filename, referer, user_agent }));
+  try {
+    const cookies = await api.cookies.getAll({ url });
+    const cookie = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    if (cookie) payload.cookies = cookie;
+  } catch (_) {}
+  post(payload);
 }
 
 function post(payload) {
   const port = api.runtime.connectNative(HOST);
   // Native messaging: send one length-prefixed JSON message.
   port.postMessage(payload);
+  port.onMessage.addListener((msg) => {
+    // Host ack: cancel the browser's own duplicate download only when the
+    // GUI actually received the capture.
+    if (msg && msg.ok) {
+      for (const [id, entry] of capturedDownloads) {
+        if (entry.url === payload.url) {
+          cancelBrowserDownload(id);
+          capturedDownloads.delete(id);
+          break;
+        }
+      }
+    }
+  });
   port.onDisconnect.addListener(() => {
     if (api.runtime.lastError) {
       console.warn("[RapidGrab] native host unavailable:", api.runtime.lastError.message);
     }
   });
-  // Chrome closes the port after the message is sent; no response expected.
+  // Chrome closes the port after the message is sent; no response expected
+  // beyond the ack above.
 }
 
 api.action.onClicked.addListener((tab) => {
@@ -109,8 +268,19 @@ api.runtime.onInstalled.addListener(() => {
 
 api.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === "rapidgrab-link" && info.linkUrl) {
-    sendCapture(info.linkUrl, tab);
+    sendCapture(info.linkUrl, tab, { source: "link" });
   } else if (info.menuItemId === "rapidgrab-page" && tab && tab.url) {
-    sendCapture(tab.url, tab);
+    sendCapture(tab.url, tab, { source: "page" });
   }
 });
+
+// Interception (IDM-style): watch responses and capture downloadable files
+// automatically. The browser's own download is cancelled after the GUI acks.
+if (api.webRequest && api.webRequest.onHeadersReceived) {
+  api.webRequest.onHeadersReceived.addListener(handleIntercept, {
+    urls: ["http://*/*", "https://*/*"],
+  });
+}
+if (api.downloads && api.downloads.onCreated) {
+  api.downloads.onCreated.addListener(onDownloadCreated);
+}
