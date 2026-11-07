@@ -16,6 +16,60 @@ use anyhow::Result;
 use eframe::egui;
 use rg_bridge::CaptureRequest;
 
+fn font_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string()))
+        .join("Fonts")
+}
+
+fn read_font(names: &[&str]) -> Option<egui::FontData> {
+    let dir = font_dir();
+    for name in names {
+        if let Ok(bytes) = std::fs::read(dir.join(name)) {
+            return Some(egui::FontData::from_owned(bytes));
+        }
+    }
+    None
+}
+
+/// Segoe UI for Latin + Nirmala UI (Windows Indic) for Bengali, mirroring
+/// the main GUI's theme fallback. Without the Nirmala fallback, Bangla
+/// titles render as tofu boxes in this standalone window.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let regular = read_font(&["SegUIVar.ttf", "segoeui.ttf"]);
+    if let Some(data) = regular {
+        fonts
+            .font_data
+            .insert("rg-ui".to_string(), std::sync::Arc::new(data));
+        if let Some(chain) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            chain.insert(0, "rg-ui".to_string());
+        }
+    }
+    let bangla = read_font(&["Nirmala.ttf", "NotoSansBengali-Regular.ttf"]);
+    if let Some(data) = bangla {
+        fonts
+            .font_data
+            .insert("rg-bangla".to_string(), std::sync::Arc::new(data));
+        if let Some(chain) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            let at = if chain.first().is_some_and(|f| f == "rg-ui") {
+                1
+            } else {
+                0
+            };
+            chain.insert(at, "rg-bangla".to_string());
+        }
+    }
+    if let Some(data) = read_font(&["NirmalaB.ttf", "NotoSansBengali-Bold.ttf"]) {
+        fonts
+            .font_data
+            .insert("rg-bangla-bold".to_string(), std::sync::Arc::new(data));
+        if let Some(chain) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            chain.push("rg-bangla-bold".to_string());
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
 const BG: egui::Color32 = egui::Color32::from_rgb(0x20, 0x20, 0x20);
 const CARD: egui::Color32 = egui::Color32::from_rgb(0x2B, 0x2B, 0x2B);
 const TEXT: egui::Color32 = egui::Color32::from_rgb(0xFF, 0xFF, 0xFF);
@@ -297,6 +351,7 @@ fn main() -> Result<()> {
         Box::new(move |cc| {
             cc.egui_ctx
                 .send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+            install_fonts(&cc.egui_ctx);
             let mut visuals = egui::Visuals::dark();
             visuals.dark_mode = true;
             visuals.panel_fill = BG;
