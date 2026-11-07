@@ -7,9 +7,15 @@
 //
 // Only real players get a button: thumbnail previews (YouTube homepage,
 // search results) are <video> elements too, but attaching to them produced
-// a full-width black bar artifact. A player must be large, not be a link
-// thumbnail, and the button is positioned inside the video's wrapper
-// (absolute, not fixed) so it can never stretch across the page.
+// a full-width black bar artifact. A player must be large and not be a link
+// thumbnail.
+//
+// The button is draggable: it lives at the page level (position: fixed in
+// document.body, or inside the fullscreen element while a player is
+// fullscreen) so it can be moved off the player's own controls, and its
+// offset is remembered per site in localStorage. It stays anchored to its
+// player while scrolling, and is pointer-inert while hidden so it never
+// swallows clicks meant for the page.
 
 (() => {
   const api = globalThis.browser || globalThis.chrome;
@@ -17,6 +23,11 @@
   const BTN_TEXT = "↓ RapidGrab";
   const MIN_PLAYER_W = 480;
   const MIN_PLAYER_H = 200;
+  const POS_KEY = "rapidgrab.btnPos";
+  const DRAG_THRESHOLD = 4;
+  const HIDE_DELAY_MS = 300;
+  const KEEP_VISIBLE_MS = 1500;
+  const DEFAULT_MARGIN = 8;
 
   function mediaUrlFor(el) {
     if (!el) return null;
@@ -49,38 +60,199 @@
     return true;
   }
 
+  function loadOffset() {
+    try {
+      const raw = localStorage.getItem(POS_KEY);
+      if (!raw) return null;
+      const value = JSON.parse(raw);
+      if (typeof value.dx === "number" && typeof value.dy === "number") {
+        return { dx: value.dx, dy: value.dy };
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function saveOffset(offset) {
+    try {
+      localStorage.setItem(POS_KEY, JSON.stringify(offset));
+    } catch (_) {}
+  }
+
+  function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+  }
+
   function ensureButton(video) {
     if (!video || video.dataset.rgBtn) return;
     if (!isRealPlayer(video)) return;
     video.dataset.rgBtn = "1";
 
-    const parent = video.parentElement || document.body;
-    const parentStyle = getComputedStyle(parent);
-    if (parentStyle.position === "static") parent.style.position = "relative";
-
     const btn = document.createElement("button");
     btn.id = BTN_ID + "-" + Math.random().toString(36).slice(2, 8);
+    btn.className = "rg-fab";
     btn.textContent = BTN_TEXT;
-    btn.title = "Download with RapidGrab";
+    btn.title = "Drag to move · Click to download";
     btn.type = "button";
     btn.style.cssText = [
-      "position:absolute", "top:8px", "right:8px", "z-index:2147483647",
+      "position:fixed", "left:0", "top:0", "z-index:2147483647",
       "background:#1b1b1b", "color:#60cdff", "border:1px solid #3a3a3a",
       "border-radius:6px", "padding:4px 8px", "font:12px system-ui, sans-serif",
-      "cursor:pointer", "opacity:0", "transition:opacity .15s", "pointer-events:auto",
+      "cursor:grab", "opacity:0", "transition:opacity .15s", "pointer-events:none",
       "white-space:nowrap", "width:auto", "max-width:160px",
+      "touch-action:none", "user-select:none", "-webkit-user-select:none",
+      "-webkit-user-drag:none",
     ].join(";");
-    btn.addEventListener("mouseenter", () => {
-      btn.style.opacity = "1";
-    });
-    btn.addEventListener("mouseleave", () => {
+
+    // Position is an offset from the player's top-left; null = default
+    // top-right corner of the player.
+    let offset = loadOffset();
+    let onScreen = true;
+    let shown = false;
+    let dragging = false;
+    let moved = false;
+    let suppressClick = false;
+    let pointerOverBtn = false;
+    let pointerOverVideo = false;
+    let hideTimer = 0;
+    let keepTimer = 0;
+    let raf = 0;
+    let drag = null;
+    let disposed = false;
+
+    (document.body || document.documentElement).appendChild(btn);
+
+    function hostElement() {
+      return document.fullscreenElement || document.body || document.documentElement;
+    }
+
+    function applyPosition() {
+      raf = 0;
+      if (disposed) return;
+      const host = hostElement();
+      if (btn.parentElement !== host) host.appendChild(btn);
+      const rect = video.getBoundingClientRect();
+      const width = btn.offsetWidth;
+      const height = btn.offsetHeight;
+      const baseLeft = offset
+        ? rect.left + offset.dx
+        : rect.right - width - DEFAULT_MARGIN;
+      const baseTop = offset ? rect.top + offset.dy : rect.top + DEFAULT_MARGIN;
+      const left = clamp(baseLeft, 0, Math.max(0, window.innerWidth - width));
+      const top = clamp(baseTop, 0, Math.max(0, window.innerHeight - height));
+      btn.style.left = left + "px";
+      btn.style.top = top + "px";
+    }
+
+    function scheduleLayout() {
+      if (raf || disposed) return;
+      raf = requestAnimationFrame(applyPosition);
+    }
+
+    function forceHide() {
+      shown = false;
       btn.style.opacity = "0";
+      btn.style.pointerEvents = "none";
+    }
+
+    function show() {
+      if (disposed || !onScreen) return;
+      window.clearTimeout(hideTimer);
+      window.clearTimeout(keepTimer);
+      applyPosition();
+      if (shown) return;
+      shown = true;
+      btn.style.opacity = "1";
+      btn.style.pointerEvents = "auto";
+    }
+
+    function hide() {
+      window.clearTimeout(keepTimer);
+      if (disposed || dragging || pointerOverBtn || pointerOverVideo) return;
+      if (!shown) return;
+      forceHide();
+    }
+
+    function scheduleHide() {
+      if (disposed || dragging) return;
+      window.clearTimeout(hideTimer);
+      hideTimer = window.setTimeout(hide, HIDE_DELAY_MS);
+    }
+
+    // --- drag ------------------------------------------------------------
+    btn.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      // Keep the page (player click-to-pause, menus, etc.) out of the drag.
+      event.stopPropagation();
+      show();
+      const rect = video.getBoundingClientRect();
+      const box = btn.getBoundingClientRect();
+      dragging = true;
+      moved = false;
+      suppressClick = false;
+      drag = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        startDx: box.left - rect.left,
+        startDy: box.top - rect.top,
+      };
+      try {
+        btn.setPointerCapture(event.pointerId);
+      } catch (_) {}
+      btn.style.cursor = "grabbing";
+      window.clearTimeout(hideTimer);
+      window.clearTimeout(keepTimer);
     });
+
+    btn.addEventListener("pointermove", (event) => {
+      if (!dragging || !drag || event.pointerId !== drag.pointerId) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (
+        !moved &&
+        Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) >
+          DRAG_THRESHOLD
+      ) {
+        moved = true;
+      }
+      offset = {
+        dx: drag.startDx + (event.clientX - drag.startX),
+        dy: drag.startDy + (event.clientY - drag.startY),
+      };
+      scheduleLayout();
+    });
+
+    function endDrag(event) {
+      if (!dragging || !drag) return;
+      dragging = false;
+      if (event && event.pointerId === drag.pointerId) {
+        // No preventDefault here: a plain click must still reach the click
+        // handler and send the capture.
+        event.stopPropagation();
+        try {
+          btn.releasePointerCapture(event.pointerId);
+        } catch (_) {}
+      }
+      drag = null;
+      btn.style.cursor = "grab";
+      if (moved && offset) saveOffset(offset);
+      // A drop must never be mistaken for a click (no surprise download).
+      suppressClick = moved;
+      moved = false;
+      // Stay reachable for a moment so it can be grabbed again.
+      window.clearTimeout(keepTimer);
+      keepTimer = window.setTimeout(scheduleHide, KEEP_VISIBLE_MS);
+    }
+    btn.addEventListener("pointerup", endDrag);
+    btn.addEventListener("pointercancel", endDrag);
+
     btn.addEventListener("click", (event) => {
       event.stopPropagation();
       event.preventDefault();
-      // blob:/data: sources are MSE playback URLs, not downloads — fall
-      // back to the page URL so the resolver still gets a capture.
+      if (suppressClick) {
+        suppressClick = false;
+        return;
+      }
       const url = mediaUrlFor(video) || location.href;
       if (!url) return;
       api.runtime
@@ -91,7 +263,27 @@
         })
         .catch(() => {});
     });
-    parent.appendChild(btn);
+
+    // --- visibility ------------------------------------------------------
+    btn.addEventListener("mouseenter", () => {
+      pointerOverBtn = true;
+      show();
+    });
+    btn.addEventListener("mouseleave", () => {
+      pointerOverBtn = false;
+      if (!pointerOverVideo) scheduleHide();
+    });
+
+    const onVideoEnter = () => {
+      pointerOverVideo = true;
+      show();
+    };
+    const onVideoLeave = () => {
+      pointerOverVideo = false;
+      if (!pointerOverBtn) scheduleHide();
+    };
+    video.addEventListener("mouseenter", onVideoEnter);
+    video.addEventListener("mouseleave", onVideoLeave);
 
     // Re-check size on hover (a preview that grows into a player should
     // still not get a button — isRealPlayer gates that — but a real player
@@ -102,22 +294,76 @@
       scheduled = true;
       requestAnimationFrame(() => {
         scheduled = false;
+        if (disposed) return;
         try {
-          btn.style.display = isRealPlayer(video) ? "" : "none";
+          const real = isRealPlayer(video);
+          btn.style.display = real ? "" : "none";
+          if (real) scheduleLayout();
         } catch (_) {}
       });
     };
-    video.addEventListener("mouseenter", () => {
-      btn.style.opacity = "1";
-    });
-    video.addEventListener("mouseleave", () => {
-      btn.style.opacity = "0";
-    });
-    new ResizeObserver(place).observe(video);
+    const resizeObserver = new ResizeObserver(place);
+    resizeObserver.observe(video);
+
+    // Hide while the player is scrolled out of view so the fixed button
+    // never floats over unrelated content.
+    let intersectionObserver = null;
+    if ("IntersectionObserver" in window) {
+      intersectionObserver = new IntersectionObserver((entries) => {
+        onScreen = entries.some((entry) => entry.isIntersecting);
+        if (onScreen) {
+          scheduleLayout();
+          // The cursor may already be over the player after scrolling back;
+          // no mouseenter will fire in that case, so re-check hover here.
+          if (video.matches(":hover") || btn.matches(":hover")) {
+            pointerOverVideo = video.matches(":hover");
+            pointerOverBtn = btn.matches(":hover");
+            show();
+          }
+        } else {
+          dragging = false;
+          drag = null;
+          forceHide();
+        }
+      });
+      intersectionObserver.observe(video);
+    }
+
+    const onScroll = () => scheduleLayout();
+    window.addEventListener("scroll", onScroll, { capture: true, passive: true });
+    window.addEventListener("resize", onScroll, { passive: true });
+    document.addEventListener("fullscreenchange", scheduleLayout);
+    scheduleLayout();
+
+    // --- teardown (player removed by SPA navigation) ---------------------
+    btn._rgVideo = video;
+    btn._rgTeardown = () => {
+      disposed = true;
+      window.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("resize", onScroll);
+      document.removeEventListener("fullscreenchange", scheduleLayout);
+      video.removeEventListener("mouseenter", onVideoEnter);
+      video.removeEventListener("mouseleave", onVideoLeave);
+      window.clearTimeout(hideTimer);
+      window.clearTimeout(keepTimer);
+      if (raf) cancelAnimationFrame(raf);
+      if (intersectionObserver) intersectionObserver.disconnect();
+      resizeObserver.disconnect();
+      delete video.dataset.rgBtn;
+      btn.remove();
+    };
   }
 
   function scan() {
     document.querySelectorAll("video").forEach(ensureButton);
+    // Drop buttons whose player element is gone (SPA navigation).
+    document.querySelectorAll("button.rg-fab").forEach((btn) => {
+      const video = btn._rgVideo;
+      if (!video || !video.isConnected) {
+        if (typeof btn._rgTeardown === "function") btn._rgTeardown();
+        else btn.remove();
+      }
+    });
   }
 
   const observer = new MutationObserver(scan);
