@@ -270,16 +270,10 @@ impl RapidGrabApp {
         let pipe_guard = if cfg!(windows) {
             rg_bridge::listen(move |req| {
                 let _ = capture_tx.send(req);
-                // The GUI only repaints while jobs are active; wake it so the
-                // capture is applied immediately instead of on the next click.
+                // Wake the GUI so the deferred popup viewport opens at once;
+                // the main window itself is never raised (only the small
+                // Download window floats over the browser).
                 repaint_ctx.request_repaint();
-                // Bring the GUI (and its popup) to the front the moment the
-                // user clicks in the browser — otherwise the popup sits
-                // hidden behind Chrome.
-                let _ = repaint_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                repaint_ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                    egui::UserAttentionType::Informational,
-                ));
             })
             .ok()
         } else {
@@ -1090,75 +1084,99 @@ impl RapidGrabApp {
             )
         };
 
-        let output = {
-            let pending = self.pending_capture.as_mut().unwrap();
-            let mut output = pending.output.clone();
-            egui::Window::new("Download")
-                .id(egui::Id::unique("rg-download-popup"))
-                .order(egui::Order::Foreground)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.add(egui::Label::new(
-                        egui::RichText::new(&filename)
-                            .strong()
-                            .size(theme::SECTION_SIZE),
-                    ));
-                    ui.add(egui::Label::new(theme::caption(format!(
-                        "{source_label} · {size_label} · {type_label}"
-                    ))));
-                    ui.add(egui::Label::new(theme::caption(url.clone())));
-                    ui.add(egui::Label::new(theme::label("Save as")));
-                    ui.horizontal(|ui| {
-                        let field_w =
-                            (ui.available_width() - theme::BROWSE_W - theme::SP_S).max(120.0);
-                        widgets::text_field(
+        let mut output = self.pending_capture.as_ref().unwrap().output.clone();
+        let mut dont_ask = self.pending_capture.as_ref().unwrap().dont_ask_again;
+        let _ = ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("rg-download-popup"),
+            egui::ViewportBuilder::default()
+                .with_title("Download")
+                .with_inner_size([420.0, 360.0])
+                .with_resizable(false)
+                .with_active(true),
+            |viewport_ui, _class| {
+                if viewport_ui.ctx().input(|i| i.viewport().close_requested()) {
+                    close = true;
+                }
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::default()
+                            .fill(theme::CARD)
+                            .inner_margin(egui::Margin::same(16)),
+                    )
+                    .show(viewport_ui, |ui: &mut egui::Ui| {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(&filename)
+                                .strong()
+                                .size(theme::SECTION_SIZE),
+                        ));
+                        ui.add(egui::Label::new(theme::caption(format!(
+                            "{source_label} · {size_label} · {type_label}"
+                        ))));
+                        ui.add(egui::Label::new(theme::caption(url.clone())));
+                        ui.add(egui::Label::new(theme::label("Save as")));
+                        ui.horizontal(|ui| {
+                            let field_w =
+                                (ui.available_width() - theme::BROWSE_W - theme::SP_S).max(120.0);
+                            widgets::text_field(
+                                ui,
+                                widgets::Field::new("rg-popup-output", "Choose where to save…")
+                                    .width(field_w),
+                                &mut output,
+                            );
+                            if widgets::button(ui, "Browse…", widgets::ButtonKind::Secondary, true)
+                                .clicked()
+                            {
+                                browse = true;
+                            }
+                        });
+
+                        widgets::checkbox(
                             ui,
-                            widgets::Field::new("rg-popup-output", "Choose where to save…")
-                                .width(field_w),
-                            &mut output,
+                            "rg-popup-dontask",
+                            &mut dont_ask,
+                            "Don't ask again for this site",
                         );
-                        if widgets::button(ui, "Browse…", widgets::ButtonKind::Secondary, true)
-                            .clicked()
-                        {
-                            browse = true;
-                        }
-                    });
 
-                    let pending = self.pending_capture.as_mut().unwrap();
-                    widgets::checkbox(
-                        ui,
-                        "rg-popup-dontask",
-                        &mut pending.dont_ask_again,
-                        "Don't ask again for this site",
-                    );
-
-                    ui.horizontal(|ui| {
-                        if widgets::button(ui, "Cancel", widgets::ButtonKind::Secondary, true)
+                        ui.horizontal(|ui| {
+                            if widgets::button(ui, "Cancel", widgets::ButtonKind::Secondary, true)
+                                .clicked()
+                            {
+                                close = true;
+                            }
+                            if widgets::button(
+                                ui,
+                                "Download Later",
+                                widgets::ButtonKind::Secondary,
+                                true,
+                            )
                             .clicked()
-                        {
-                            close = true;
-                        }
-                        if widgets::button(
-                            ui,
-                            "Download Later",
-                            widgets::ButtonKind::Secondary,
-                            true,
-                        )
-                        .clicked()
-                        {
-                            later = true;
-                        }
-                        if widgets::button(ui, "Start download", widgets::ButtonKind::Primary, true)
+                            {
+                                later = true;
+                            }
+                            if widgets::button(
+                                ui,
+                                "Start download",
+                                widgets::ButtonKind::Primary,
+                                true,
+                            )
                             .clicked()
-                        {
-                            start = true;
-                        }
+                            {
+                                start = true;
+                            }
+                        });
                     });
-                });
-            output
-        };
+                if close || start || later {
+                    viewport_ui
+                        .ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            },
+        );
+
+        if let Some(pending) = &mut self.pending_capture {
+            pending.output = output;
+            pending.dont_ask_again = dont_ask;
+        }
 
         // Browse: folder dialog updates the popup output.
         if browse {
@@ -1171,9 +1189,6 @@ impl RapidGrabApp {
                     pending.output = dir.join(name).display().to_string();
                 }
             }
-        }
-        if let Some(pending) = &mut self.pending_capture {
-            pending.output = output;
         }
 
         if close && !start && !later {
