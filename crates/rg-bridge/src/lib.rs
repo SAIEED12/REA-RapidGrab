@@ -26,6 +26,21 @@ pub struct CaptureRequest {
     pub cookies: Option<String>,
     #[serde(default)]
     pub user_agent: Option<String>,
+    /// Value of the `Content-Disposition: filename=` (or `filename*=`) header.
+    #[serde(default)]
+    pub content_disposition_filename: Option<String>,
+    /// Value of the `Content-Type` response header.
+    #[serde(default)]
+    pub content_type: Option<String>,
+    /// Value of the `Content-Length` response header, when known.
+    #[serde(default)]
+    pub content_length: Option<u64>,
+    /// How the capture was triggered: `click`, `link`, `intercept`, `page`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// True when the extension was told to let the browser download continue.
+    #[serde(default)]
+    pub auto_start: bool,
 }
 
 /// Read one native-messaging frame: little-endian u32 length + JSON bytes.
@@ -250,6 +265,11 @@ mod tests {
             referer: Some("http://example.com/".into()),
             cookies: Some("a=1; b=2".into()),
             user_agent: Some("UA".into()),
+            content_disposition_filename: Some("file.bin".into()),
+            content_type: Some("application/octet-stream".into()),
+            content_length: Some(123),
+            source: Some("intercept".into()),
+            auto_start: false,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &req).unwrap();
@@ -259,6 +279,8 @@ mod tests {
         assert_eq!(back.referer, req.referer);
         assert_eq!(back.cookies, req.cookies);
         assert_eq!(back.user_agent, req.user_agent);
+        assert_eq!(back.content_length, req.content_length);
+        assert_eq!(back.source, req.source);
     }
 
     #[test]

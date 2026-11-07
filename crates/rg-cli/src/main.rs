@@ -3,7 +3,6 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use rg_bridge::CaptureRequest;
 use rg_core::{Download, Progress};
 use rg_resolve::{MediaEvent, MediaRequest, MediaStage, Tools};
 
@@ -251,18 +250,17 @@ async fn main() -> Result<()> {
         }
         Command::Host => {
             let request = rg_bridge::read_frame(std::io::stdin())?;
-            rg_bridge::send_capture(&request)?;
-            // Native messaging expects a response frame.
-            rg_bridge::write_frame(
-                std::io::stdout(),
-                &CaptureRequest {
-                    url: String::new(),
-                    filename: None,
-                    referer: None,
-                    cookies: None,
-                    user_agent: None,
+            let ack = match rg_bridge::send_capture(&request) {
+                Ok(()) => rg_bridge::HostAck {
+                    ok: true,
+                    error: None,
                 },
-            )?;
+                Err(e) => rg_bridge::HostAck {
+                    ok: false,
+                    error: Some(format!("{e:#}")),
+                },
+            };
+            rg_bridge::write_ack_frame(std::io::stdout(), &ack)?;
         }
     }
 

@@ -151,6 +151,10 @@ struct Settings {
     ffmpeg_path: String,
     #[serde(default)]
     yt_dlp_args: String,
+    /// Hosts (lowercase, no `www.`) whose captures skip the popup and
+    /// start immediately — the "don't ask again for this site" list.
+    #[serde(default)]
+    auto_start_hosts: Vec<String>,
 }
 
 fn default_auto_resolve() -> bool {
@@ -176,6 +180,7 @@ impl Default for Settings {
             yt_dlp_path: String::new(),
             ffmpeg_path: String::new(),
             yt_dlp_args: String::new(),
+            auto_start_hosts: Vec::new(),
         }
     }
 }
@@ -196,6 +201,8 @@ pub struct RapidGrabApp {
     update_rx: Receiver<DownloadUpdate>,
     update_tx: Sender<DownloadUpdate>,
     capture_rx: Receiver<rg_bridge::CaptureRequest>,
+    probe_rx: Receiver<(String, Option<u64>, Option<String>)>,
+    probe_tx: Sender<(String, Option<u64>, Option<String>)>,
     #[allow(dead_code)]
     pipe_guard: Option<rg_bridge::PipeGuard>,
     jobs: HashMap<usize, DownloadJob>,
@@ -222,6 +229,9 @@ pub struct RapidGrabApp {
     /// restoring the previous session's scroll offset.
     page_reset_done: bool,
 
+    /// Browser capture awaiting popup confirmation (browser integration).
+    pending_capture: Option<PendingCapture>,
+
     logo: egui::TextureHandle,
 }
 
@@ -230,6 +240,20 @@ struct OutputProbe {
     path: String,
     checked: Instant,
     exists: bool,
+}
+
+/// A browser capture waiting for the user to confirm in the popup.
+struct PendingCapture {
+    capture: rg_bridge::CaptureRequest,
+    /// Editable Save-as path shown in the popup.
+    output: String,
+    /// Best filename we have so far (header > URL > tab title).
+    filename: String,
+    size: Option<u64>,
+    content_type: Option<String>,
+    /// Set when the probe request is still in flight.
+    probing: bool,
+    dont_ask_again: bool,
 }
 
 impl RapidGrabApp {
@@ -241,6 +265,7 @@ impl RapidGrabApp {
         let rt = Arc::new(Runtime::new().expect("Failed to create tokio runtime"));
         let (update_tx, update_rx) = unbounded();
         let (capture_tx, capture_rx) = unbounded::<rg_bridge::CaptureRequest>();
+        let (probe_tx, probe_rx) = unbounded::<(String, Option<u64>, Option<String>)>();
         let repaint_ctx = cc.egui_ctx.clone();
         let pipe_guard = if cfg!(windows) {
             rg_bridge::listen(move |req| {
@@ -269,6 +294,8 @@ impl RapidGrabApp {
             update_rx,
             update_tx,
             capture_rx,
+            probe_rx,
+            probe_tx,
             pipe_guard,
             jobs: HashMap::new(),
             next_id: 1,
@@ -286,6 +313,7 @@ impl RapidGrabApp {
             focus_url: false,
             output_probe: None,
             page_reset_done: false,
+            pending_capture: None,
             logo: crate::icon::logo_texture(&cc.egui_ctx),
         }
     }
@@ -311,6 +339,84 @@ impl RapidGrabApp {
             PathBuf::from(&self.settings.last_dir)
         };
         self.new_output = dir.join(name).display().to_string();
+    }
+
+    /// Probes the capture URL for size/type so the popup can show it
+    /// (IDM's "Download File Info" behaviour). Best-effort, never blocks.
+    fn spawn_probe(&self, capture: rg_bridge::CaptureRequest) {
+        let tx = self.probe_tx.clone();
+        let rt = self.rt.clone();
+        rt.spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+            let mut req = client.head(&capture.url);
+            if let Some(ua) = &capture.user_agent {
+                req = req.header(reqwest::header::USER_AGENT, ua.as_str());
+            }
+            if let Some(cookie) = &capture.cookies {
+                req = req.header(reqwest::header::COOKIE, cookie.as_str());
+            }
+            if let Some(referer) = &capture.referer {
+                req = req.header(reqwest::header::REFERER, referer.as_str());
+            }
+            let (size, ctype) = match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let size = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_LENGTH)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.trim().parse::<u64>().ok());
+                    let ctype = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    (size, ctype)
+                }
+                _ => (None, None),
+            };
+            let _ = tx.send((capture.url.clone(), size, ctype));
+        });
+    }
+
+    /// Starts the pending capture as a queued job from the popup fields.
+    fn confirm_capture(&mut self, later: bool) {
+        let Some(pending) = self.pending_capture.take() else {
+            return;
+        };
+        let capture = pending.capture.clone();
+        if pending.dont_ask_again {
+            if let Some(host) = capture_host(&capture.url) {
+                if !self.settings.auto_start_hosts.contains(&host) {
+                    self.settings.auto_start_hosts.push(host);
+                }
+            }
+        }
+        let speed = self
+            .new_limit_kbps
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|&x| x > 0)
+            .map(|x| x * 1024);
+        let output = pending.output.clone();
+        self.enqueue(
+            capture.url.clone(),
+            output,
+            self.new_connections.max(1),
+            speed,
+            None,
+            capture.user_agent.clone(),
+            capture.referer.clone(),
+            capture.cookies.clone(),
+            false,
+        );
+        // `later` already queues (pump_queue starts when a slot is free, the
+        // same as Start in this build; IDM starts a part immediately while
+        // showing the dialog, we have no such distinction yet).
+        let _ = later;
     }
 
     /// Whether Start would replace an existing file at the current output path.
@@ -348,9 +454,6 @@ impl RapidGrabApp {
             return;
         }
 
-        let id = self.next_id;
-        self.next_id += 1;
-
         let speed_limit = self
             .new_limit_kbps
             .trim()
@@ -360,36 +463,12 @@ impl RapidGrabApp {
             .map(|x| x * 1024);
         let sha256 = non_empty(&self.new_sha256);
         let user_agent = non_empty(&self.new_user_agent);
-
-        self.jobs.insert(
-            id,
-            DownloadJob {
-                id,
-                run: 0,
-                url: self.new_url.trim().to_string(),
-                output: PathBuf::from(self.new_output.trim()),
-                connections: self.new_connections.max(1),
-                speed_limit,
-                sha256,
-                user_agent,
-                referer: non_empty(&self.new_referer),
-                cookie: non_empty(&self.new_cookie),
-                restart: self.new_restart,
-                status: JobStatus::Queued,
-                progress: None,
-                media: None,
-                error: None,
-                failure: FailureKind::Other,
-                notice: None,
-                last_speed: 0.0,
-                started_at: None,
-                elapsed: Duration::ZERO,
-                cancel: Arc::new(AtomicBool::new(false)),
-                intent: None,
-                remove_after_stop: false,
-                handle: None,
-            },
-        );
+        let referer = non_empty(&self.new_referer);
+        let cookie = non_empty(&self.new_cookie);
+        let url = self.new_url.trim().to_string();
+        let output = self.new_output.trim().to_string();
+        let connections = self.new_connections.max(1);
+        let restart = self.new_restart;
 
         // Remember the form as the next default.
         self.settings.connections = self.new_connections;
@@ -405,6 +484,69 @@ impl RapidGrabApp {
         // carry a one-shot "ignore existing parts" flag into another job.
         self.new_output.clear();
         self.new_restart = false;
+
+        self.enqueue(
+            url,
+            output,
+            connections,
+            speed_limit,
+            sha256,
+            user_agent,
+            referer,
+            cookie,
+            restart,
+        );
+    }
+
+    /// Inserts a queued job from explicit values (popup / auto-start captures).
+    /// Does not touch the New-download form.
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue(
+        &mut self,
+        url: String,
+        output: String,
+        connections: usize,
+        speed_limit: Option<u64>,
+        sha256: Option<String>,
+        user_agent: Option<String>,
+        referer: Option<String>,
+        cookie: Option<String>,
+        restart: bool,
+    ) {
+        if url.trim().is_empty() || output.trim().is_empty() {
+            return;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.jobs.insert(
+            id,
+            DownloadJob {
+                id,
+                run: 0,
+                url: url.trim().to_string(),
+                output: PathBuf::from(output.trim()),
+                connections: connections.max(1),
+                speed_limit,
+                sha256,
+                user_agent,
+                referer,
+                cookie,
+                restart,
+                status: JobStatus::Queued,
+                progress: None,
+                media: None,
+                error: None,
+                failure: FailureKind::Other,
+                notice: None,
+                last_speed: 0.0,
+                started_at: None,
+                elapsed: Duration::ZERO,
+                cancel: Arc::new(AtomicBool::new(false)),
+                intent: None,
+                remove_after_stop: false,
+                handle: None,
+            },
+        );
     }
 
     /// Spawns the tokio task for a job. Caller guarantees the job is `Queued`.
@@ -892,6 +1034,141 @@ impl RapidGrabApp {
         views.sort_by_key(|v| v.id);
         views
     }
+
+    /// Download popup for a browser capture (IDM "Download File Info" style).
+    fn render_capture_popup(&mut self, ctx: &egui::Context) {
+        if self.pending_capture.is_none() {
+            return;
+        }
+        let mut close = false;
+        let mut start = false;
+        let mut later = false;
+        let mut browse = false;
+
+        // Snapshot the fields the popup needs; mutating self inside the
+        // window closure would fight the borrow checker.
+        let (filename, url, size_label, type_label, source_label) = {
+            let pending = self.pending_capture.as_ref().unwrap();
+            let size_label = match pending.size {
+                Some(bytes) => human_bytes(bytes),
+                None if pending.probing => "Resolving…".to_string(),
+                None => "Unknown".to_string(),
+            };
+            let type_label = pending
+                .content_type
+                .as_deref()
+                .unwrap_or(if pending.probing { "…" } else { "—" })
+                .to_string();
+            let source_label = pending
+                .capture
+                .source
+                .as_deref()
+                .unwrap_or("browser")
+                .to_string();
+            (
+                pending.filename.clone(),
+                pending.capture.url.clone(),
+                size_label,
+                type_label,
+                source_label,
+            )
+        };
+
+        let output = {
+            let pending = self.pending_capture.as_mut().unwrap();
+            let mut output = pending.output.clone();
+            egui::Window::new("Download")
+                .id(egui::Id::unique("rg-download-popup"))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(&filename)
+                            .strong()
+                            .size(theme::SECTION_SIZE),
+                    ));
+                    ui.add(egui::Label::new(theme::caption(format!(
+                        "{source_label} · {size_label} · {type_label}"
+                    ))));
+                    ui.add(egui::Label::new(theme::caption(url.clone())));
+                    ui.add(egui::Label::new(theme::label("Save as")));
+                    ui.horizontal(|ui| {
+                        let field_w =
+                            (ui.available_width() - theme::BROWSE_W - theme::SP_S).max(120.0);
+                        widgets::text_field(
+                            ui,
+                            widgets::Field::new("rg-popup-output", "Choose where to save…")
+                                .width(field_w),
+                            &mut output,
+                        );
+                        if widgets::button(ui, "Browse…", widgets::ButtonKind::Secondary, true)
+                            .clicked()
+                        {
+                            browse = true;
+                        }
+                    });
+
+                    let pending = self.pending_capture.as_mut().unwrap();
+                    widgets::checkbox(
+                        ui,
+                        "rg-popup-dontask",
+                        &mut pending.dont_ask_again,
+                        "Don't ask again for this site",
+                    );
+
+                    ui.horizontal(|ui| {
+                        if widgets::button(ui, "Cancel", widgets::ButtonKind::Secondary, true)
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                        if widgets::button(
+                            ui,
+                            "Download Later",
+                            widgets::ButtonKind::Secondary,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            later = true;
+                        }
+                        if widgets::button(ui, "Start download", widgets::ButtonKind::Primary, true)
+                            .clicked()
+                        {
+                            start = true;
+                        }
+                    });
+                });
+            output
+        };
+
+        // Browse: folder dialog updates the popup output.
+        if browse {
+            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                if let Some(pending) = &mut self.pending_capture {
+                    let name = std::path::Path::new(&pending.filename)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "download.bin".to_string());
+                    pending.output = dir.join(name).display().to_string();
+                }
+            }
+        }
+        if let Some(pending) = &mut self.pending_capture {
+            pending.output = output;
+        }
+
+        if close && !start && !later {
+            self.pending_capture = None;
+        } else if start || later {
+            self.confirm_capture(later);
+        } else if self.pending_capture.is_some() {
+            // Keep probing results live.
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
 }
 
 impl eframe::App for RapidGrabApp {
@@ -907,6 +1184,7 @@ impl eframe::App for RapidGrabApp {
             yt_dlp_path: self.settings.yt_dlp_path.clone(),
             ffmpeg_path: self.settings.ffmpeg_path.clone(),
             yt_dlp_args: self.settings.yt_dlp_args.clone(),
+            auto_start_hosts: self.settings.auto_start_hosts.clone(),
         };
         eframe::set_value(storage, SETTINGS_KEY, &settings);
     }
@@ -916,32 +1194,87 @@ impl eframe::App for RapidGrabApp {
         while let Ok(update) = self.update_rx.try_recv() {
             self.apply_update(update);
         }
-        // Browser captures: pre-fill the form (confirm-first, never auto-start).
+        // Browser captures: intercept = Download popup, click/link = pre-fill.
         while let Ok(capture) = self.capture_rx.try_recv() {
-            self.new_url = capture.url;
-            if let Some(filename) = capture.filename {
-                if !filename.trim().is_empty() {
-                    // Suggest just the filename; the user picks the folder by
-                    // confirming (no auto-write outside Downloads).
-                    let dir = if self.settings.last_dir.is_empty() {
-                        dirs::download_dir().unwrap_or_else(|| PathBuf::from("."))
-                    } else {
-                        PathBuf::from(&self.settings.last_dir)
-                    };
-                    self.new_output = dir.join(filename).display().to_string();
+            // Best filename: Content-Disposition header wins, then the
+            // extension's guess, then the tab title for YouTube.
+            let filename = capture
+                .content_disposition_filename
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .or(capture.filename.as_deref().filter(|s| !s.trim().is_empty()));
+            let suggested = suggested_output_for(&self.settings.last_dir, filename, &capture.url);
+
+            let host = capture_host(&capture.url);
+            let trusted = capture.auto_start
+                || host
+                    .as_deref()
+                    .is_some_and(|h| self.settings.auto_start_hosts.iter().any(|t| t == h));
+
+            // Always pre-fill the form as a fallback (confirm-first backup).
+            self.new_url = capture.url.clone();
+            if let Some(ref name) = filename {
+                self.new_output = suggested.clone();
+                let _ = name;
+            }
+            if let Some(referer) = &capture.referer {
+                self.new_referer = referer.clone();
+            }
+            if let Some(cookies) = &capture.cookies {
+                self.new_cookie = cookies.clone();
+            }
+            if let Some(ua) = &capture.user_agent {
+                self.new_user_agent = ua.clone();
+            }
+
+            if trusted {
+                // Auto-start: queue immediately without the popup.
+                let speed = self
+                    .new_limit_kbps
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&x| x > 0)
+                    .map(|x| x * 1024);
+                self.enqueue(
+                    capture.url.clone(),
+                    suggested,
+                    self.new_connections.max(1),
+                    speed,
+                    None,
+                    capture.user_agent.clone(),
+                    capture.referer.clone(),
+                    capture.cookies.clone(),
+                    false,
+                );
+            } else {
+                let size = capture.content_length;
+                let content_type = capture.content_type.clone();
+                let probing = size.is_none() && content_type.is_none();
+                self.pending_capture = Some(PendingCapture {
+                    capture: capture.clone(),
+                    output: suggested,
+                    filename: filename.unwrap_or(&capture.url).to_string(),
+                    size,
+                    content_type,
+                    probing,
+                    dont_ask_again: false,
+                });
+                if probing {
+                    self.spawn_probe(capture);
                 }
-            }
-            if let Some(referer) = capture.referer {
-                self.new_referer = referer;
-            }
-            if let Some(cookies) = capture.cookies {
-                self.new_cookie = cookies;
-            }
-            if let Some(ua) = capture.user_agent {
-                self.new_user_agent = ua;
             }
             self.show_add_panel = true;
             self.focus_url = true;
+        }
+        while let Ok((url, size, ctype)) = self.probe_rx.try_recv() {
+            if let Some(pending) = &mut self.pending_capture {
+                if pending.capture.url == url {
+                    pending.size = size;
+                    pending.content_type = ctype;
+                    pending.probing = false;
+                }
+            }
         }
         for job in self.jobs.values_mut() {
             if job.status.is_active() && job.handle.as_ref().is_some_and(|h| h.is_finished()) {
@@ -1002,6 +1335,7 @@ impl eframe::App for RapidGrabApp {
                 });
             });
 
+        self.render_capture_popup(&ctx);
         self.handle_actions(actions);
         self.pump_queue();
 
@@ -1022,6 +1356,46 @@ fn non_empty(value: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// Lowercase host without a leading `www.` for the auto-start list.
+fn capture_host(url: &str) -> Option<String> {
+    url.trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split(['/', ':', '?', '#'])
+        .next()
+        .map(|h| {
+            h.to_ascii_lowercase()
+                .trim_start_matches("www.")
+                .to_string()
+        })
+        .filter(|h| !h.is_empty())
+}
+
+/// `<last dir>/<filename or name from url>`, mirroring `suggest_output`.
+fn suggested_output_for(last_dir: &str, filename: Option<&str>, url: &str) -> String {
+    let name = filename
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            url.split(['?', '#'])
+                .next()
+                .unwrap_or("")
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("download.bin")
+                .to_string()
+        });
+    let dir = if last_dir.is_empty() {
+        dirs::download_dir().unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        PathBuf::from(last_dir)
+    };
+    dir.join(name).display().to_string()
 }
 
 fn media_stage_label(stage: MediaStage) -> &'static str {
