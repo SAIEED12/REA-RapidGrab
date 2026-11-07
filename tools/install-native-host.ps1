@@ -25,6 +25,13 @@ if (-not (Test-Path $hostExe)) {
 
 New-Item -ItemType Directory -Force $InstallDir | Out-Null
 Copy-Item $hostExe (Join-Path $InstallDir 'rapidgrab-host.exe') -Force
+$popupExe = Join-Path $root "target\$Profile\rapidgrab-popup.exe"
+if (Test-Path $popupExe) {
+    Copy-Item $popupExe (Join-Path $InstallDir 'rapidgrab-popup.exe') -Force
+    Write-Host "Installed popup: $(Join-Path $InstallDir 'rapidgrab-popup.exe')"
+} else {
+    Write-Warning "rapidgrab-popup.exe not found at $popupExe (build it first: cargo build -p rg-cli --profile $Profile)"
+}
 $installedHost = Join-Path $InstallDir 'rapidgrab-host.exe'
 Write-Host "Installed host: $installedHost"
 

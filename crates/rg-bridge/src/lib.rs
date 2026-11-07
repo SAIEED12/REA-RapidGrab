@@ -41,6 +41,16 @@ pub struct CaptureRequest {
     /// True when the extension was told to let the browser download continue.
     #[serde(default)]
     pub auto_start: bool,
+    /// Save-as path chosen in the browser-side popup (confirmed captures).
+    #[serde(default)]
+    pub output: Option<String>,
+    /// True when a confirmed popup (rapidgrab-popup) produced this capture;
+    /// the GUI enqueues it directly without showing its own popup.
+    #[serde(default)]
+    pub confirmed: bool,
+    /// "Don't ask again for this site" checked in the popup.
+    #[serde(default)]
+    pub dont_ask_again: bool,
 }
 
 /// Read one native-messaging frame: little-endian u32 length + JSON bytes.
@@ -270,6 +280,9 @@ mod tests {
             content_length: Some(123),
             source: Some("intercept".into()),
             auto_start: false,
+            output: None,
+            confirmed: false,
+            dont_ask_again: false,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &req).unwrap();

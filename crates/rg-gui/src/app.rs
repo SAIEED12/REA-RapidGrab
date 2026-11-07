@@ -231,8 +231,48 @@ pub struct RapidGrabApp {
 
     /// Browser capture awaiting popup confirmation (browser integration).
     pending_capture: Option<PendingCapture>,
+    /// Shared snapshot for the deferred popup viewport ('static callback).
+    popup_shared: Arc<std::sync::Mutex<PopupShared>>,
 
     logo: egui::TextureHandle,
+}
+
+/// Popup action written by the deferred viewport, consumed in `logic()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopupAction {
+    Start,
+    Later,
+    Cancel,
+    Browse,
+}
+
+/// State shared between the app (in `logic()`) and the deferred popup
+/// viewport (whose callback must be `'static`, so it cannot borrow `self`).
+#[derive(Debug, Clone)]
+struct PopupShared {
+    filename: String,
+    url: String,
+    size_label: String,
+    type_label: String,
+    source_label: String,
+    output: String,
+    dont_ask_again: bool,
+    action: Option<PopupAction>,
+}
+
+impl PopupShared {
+    fn blank() -> Self {
+        Self {
+            filename: String::new(),
+            url: String::new(),
+            size_label: String::new(),
+            type_label: String::new(),
+            source_label: String::new(),
+            output: String::new(),
+            dont_ask_again: false,
+            action: None,
+        }
+    }
 }
 
 /// Cached filesystem probe for the Save-as path, refreshed at most every 500 ms.
@@ -315,7 +355,141 @@ impl RapidGrabApp {
             output_probe: None,
             page_reset_done: false,
             pending_capture: None,
+            popup_shared: Arc::new(std::sync::Mutex::new(PopupShared::blank())),
             logo: crate::icon::logo_texture(&cc.egui_ctx),
+        }
+    }
+
+    /// Drains the capture/probe channels and builds or updates the pending
+    /// capture. Safe to call from both `logic()` (hidden window) and `ui()`.
+    fn handle_captures(&mut self) {
+        // Browser captures: intercept = Download popup, click/link = pre-fill.
+        while let Ok(capture) = self.capture_rx.try_recv() {
+            // Best filename: Content-Disposition header wins, then the
+            // extension's guess, then the tab title for YouTube.
+            let filename = capture
+                .content_disposition_filename
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .or(capture.filename.as_deref().filter(|s| !s.trim().is_empty()));
+            let suggested = suggested_output_for(&self.settings.last_dir, filename, &capture.url);
+
+            let host = capture_host(&capture.url);
+            let trusted = capture.auto_start
+                || host
+                    .as_deref()
+                    .is_some_and(|h| self.settings.auto_start_hosts.iter().any(|t| t == h));
+
+            // Confirmed by the browser-side popup process (rapidgrab-popup):
+            // enqueue directly with the output the user picked there.
+            if capture.confirmed {
+                if let Some(output) = capture.output.clone() {
+                    if capture.dont_ask_again {
+                        if let Some(host) = capture_host(&capture.url) {
+                            if !self.settings.auto_start_hosts.contains(&host) {
+                                self.settings.auto_start_hosts.push(host);
+                            }
+                        }
+                    }
+                    // Always pre-fill the form as a fallback (confirm-first backup).
+                    self.new_url = capture.url.clone();
+                    self.new_output = output.clone();
+                    if let Some(referer) = &capture.referer {
+                        self.new_referer = referer.clone();
+                    }
+                    if let Some(cookies) = &capture.cookies {
+                        self.new_cookie = cookies.clone();
+                    }
+                    if let Some(ua) = &capture.user_agent {
+                        self.new_user_agent = ua.clone();
+                    }
+                    let speed = self
+                        .new_limit_kbps
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|&x| x > 0)
+                        .map(|x| x * 1024);
+                    self.enqueue(
+                        capture.url.clone(),
+                        output,
+                        self.new_connections.max(1),
+                        speed,
+                        None,
+                        capture.user_agent.clone(),
+                        capture.referer.clone(),
+                        capture.cookies.clone(),
+                        false,
+                    );
+                }
+                self.show_add_panel = true;
+                continue;
+            }
+
+            // Always pre-fill the form as a fallback (confirm-first backup).
+            self.new_url = capture.url.clone();
+            if let Some(ref name) = filename {
+                self.new_output = suggested.clone();
+                let _ = name;
+            }
+            if let Some(referer) = &capture.referer {
+                self.new_referer = referer.clone();
+            }
+            if let Some(cookies) = &capture.cookies {
+                self.new_cookie = cookies.clone();
+            }
+            if let Some(ua) = &capture.user_agent {
+                self.new_user_agent = ua.clone();
+            }
+
+            if trusted {
+                // Auto-start: queue immediately without the popup.
+                let speed = self
+                    .new_limit_kbps
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&x| x > 0)
+                    .map(|x| x * 1024);
+                self.enqueue(
+                    capture.url.clone(),
+                    suggested,
+                    self.new_connections.max(1),
+                    speed,
+                    None,
+                    capture.user_agent.clone(),
+                    capture.referer.clone(),
+                    capture.cookies.clone(),
+                    false,
+                );
+            } else {
+                let size = capture.content_length;
+                let content_type = capture.content_type.clone();
+                let probing = size.is_none() && content_type.is_none();
+                self.pending_capture = Some(PendingCapture {
+                    capture: capture.clone(),
+                    output: suggested,
+                    filename: filename.unwrap_or(&capture.url).to_string(),
+                    size,
+                    content_type,
+                    probing,
+                    dont_ask_again: false,
+                });
+                if probing {
+                    self.spawn_probe(capture);
+                }
+            }
+            self.show_add_panel = true;
+            self.focus_url = true;
+        }
+        while let Ok((url, size, ctype)) = self.probe_rx.try_recv() {
+            if let Some(pending) = &mut self.pending_capture {
+                if pending.capture.url == url {
+                    pending.size = size;
+                    pending.content_type = ctype;
+                    pending.probing = false;
+                }
+            }
         }
     }
 
@@ -1036,66 +1210,64 @@ impl RapidGrabApp {
         views
     }
 
-    /// Download popup for a browser capture (IDM "Download File Info" style).
-    fn render_capture_popup(&mut self, ctx: &egui::Context) {
-        if self.pending_capture.is_none() {
-            return;
-        }
-        let mut close = false;
-        let mut start = false;
-        let mut later = false;
-        let mut browse = false;
-
-        // Snapshot the fields the popup needs; mutating self inside the
-        // window closure would fight the borrow checker.
-        let (filename, url, size_label, type_label, source_label) = {
-            let pending = self.pending_capture.as_ref().unwrap();
-            // YouTube watch pages probe as text/html — that is the page,
-            // not the video. Label it as what it is and let the resolver
-            // pick the real stream on Start.
+    /// Opens the deferred Download viewport while a capture is pending.
+    /// Called from `logic()` so it works even when the main window is
+    /// minimized/hidden (immediate viewports require a visible parent pass).
+    fn show_capture_popup(&mut self, ctx: &egui::Context) {
+        // Sync snapshot into the shared state the 'static callback renders.
+        if let Some(pending) = &self.pending_capture {
             let is_media_page = pending.capture.source.as_deref() == Some("media");
             let (size_label, type_label) = if is_media_page {
                 ("Video page".to_string(), "resolved on Start".to_string())
             } else {
                 let size_label = match pending.size {
                     Some(bytes) => human_bytes(bytes),
-                    None if pending.probing => "Resolving…".to_string(),
+                    None if pending.probing => "Resolving\u{2026}".to_string(),
                     None => "Unknown".to_string(),
                 };
                 let type_label = pending
                     .content_type
                     .as_deref()
-                    .unwrap_or(if pending.probing { "…" } else { "—" })
+                    .unwrap_or(if pending.probing {
+                        "\u{2026}"
+                    } else {
+                        "\u{2014}"
+                    })
                     .to_string();
                 (size_label, type_label)
             };
-            let source_label = pending
-                .capture
-                .source
-                .as_deref()
-                .unwrap_or("browser")
-                .to_string();
-            (
-                pending.filename.clone(),
-                pending.capture.url.clone(),
-                size_label,
-                type_label,
-                source_label,
-            )
-        };
+            {
+                let mut shared = self.popup_shared.lock().unwrap();
+                shared.filename = pending.filename.clone();
+                shared.url = pending.capture.url.clone();
+                shared.size_label = size_label;
+                shared.type_label = type_label;
+                shared.source_label = pending
+                    .capture
+                    .source
+                    .as_deref()
+                    .unwrap_or("browser")
+                    .to_string();
+                shared.output = pending.output.clone();
+                shared.dont_ask_again = pending.dont_ask_again;
+            }
+        }
+        if self.pending_capture.is_none() {
+            return;
+        }
 
-        let mut output = self.pending_capture.as_ref().unwrap().output.clone();
-        let mut dont_ask = self.pending_capture.as_ref().unwrap().dont_ask_again;
-        let _ = ctx.show_viewport_immediate(
+        let shared = self.popup_shared.clone();
+        ctx.show_viewport_deferred(
             egui::ViewportId::from_hash_of("rg-download-popup"),
             egui::ViewportBuilder::default()
                 .with_title("Download")
                 .with_inner_size([420.0, 360.0])
                 .with_resizable(false)
                 .with_active(true),
-            |viewport_ui, _class| {
-                if viewport_ui.ctx().input(|i| i.viewport().close_requested()) {
-                    close = true;
+            move |ui, _class| {
+                let mut state = shared.lock().unwrap();
+                if ui.ctx().input(|i| i.viewport().close_requested()) {
+                    state.action = Some(PopupAction::Cancel);
                 }
                 egui::CentralPanel::default()
                     .frame(
@@ -1103,37 +1275,46 @@ impl RapidGrabApp {
                             .fill(theme::CARD)
                             .inner_margin(egui::Margin::same(16)),
                     )
-                    .show(viewport_ui, |ui: &mut egui::Ui| {
+                    .show(ui, |ui: &mut egui::Ui| {
                         ui.add(egui::Label::new(
-                            egui::RichText::new(&filename)
+                            egui::RichText::new(&state.filename)
                                 .strong()
                                 .size(theme::SECTION_SIZE),
                         ));
                         ui.add(egui::Label::new(theme::caption(format!(
-                            "{source_label} · {size_label} · {type_label}"
+                            "{} \u{b7} {} \u{b7} {}",
+                            state.source_label, state.size_label, state.type_label
                         ))));
-                        ui.add(egui::Label::new(theme::caption(url.clone())));
+                        ui.add(egui::Label::new(theme::caption(state.url.clone())));
                         ui.add(egui::Label::new(theme::label("Save as")));
                         ui.horizontal(|ui| {
                             let field_w =
                                 (ui.available_width() - theme::BROWSE_W - theme::SP_S).max(120.0);
                             widgets::text_field(
                                 ui,
-                                widgets::Field::new("rg-popup-output", "Choose where to save…")
-                                    .width(field_w),
-                                &mut output,
+                                widgets::Field::new(
+                                    "rg-popup-output",
+                                    "Choose where to save\u{2026}",
+                                )
+                                .width(field_w),
+                                &mut state.output,
                             );
-                            if widgets::button(ui, "Browse…", widgets::ButtonKind::Secondary, true)
-                                .clicked()
+                            if widgets::button(
+                                ui,
+                                "Browse\u{2026}",
+                                widgets::ButtonKind::Secondary,
+                                true,
+                            )
+                            .clicked()
                             {
-                                browse = true;
+                                state.action = Some(PopupAction::Browse);
                             }
                         });
 
                         widgets::checkbox(
                             ui,
                             "rg-popup-dontask",
-                            &mut dont_ask,
+                            &mut state.dont_ask_again,
                             "Don't ask again for this site",
                         );
 
@@ -1141,7 +1322,7 @@ impl RapidGrabApp {
                             if widgets::button(ui, "Cancel", widgets::ButtonKind::Secondary, true)
                                 .clicked()
                             {
-                                close = true;
+                                state.action = Some(PopupAction::Cancel);
                             }
                             if widgets::button(
                                 ui,
@@ -1151,7 +1332,7 @@ impl RapidGrabApp {
                             )
                             .clicked()
                             {
-                                later = true;
+                                state.action = Some(PopupAction::Later);
                             }
                             if widgets::button(
                                 ui,
@@ -1161,48 +1342,70 @@ impl RapidGrabApp {
                             )
                             .clicked()
                             {
-                                start = true;
+                                state.action = Some(PopupAction::Start);
                             }
                         });
                     });
-                if close || start || later {
-                    viewport_ui
-                        .ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                // Keep the popup repainting while it is up (probe updates).
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
             },
         );
 
+        // Consume the viewport's edits/action from the shared state.
+        let action = {
+            let state = self.popup_shared.lock().unwrap();
+            state.action
+        };
         if let Some(pending) = &mut self.pending_capture {
-            pending.output = output;
-            pending.dont_ask_again = dont_ask;
+            let state = self.popup_shared.lock().unwrap();
+            pending.output = state.output.clone();
+            pending.dont_ask_again = state.dont_ask_again;
         }
-
-        // Browse: folder dialog updates the popup output.
-        if browse {
-            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                if let Some(pending) = &mut self.pending_capture {
-                    let name = std::path::Path::new(&pending.filename)
-                        .file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "download.bin".to_string());
-                    pending.output = dir.join(name).display().to_string();
+        match action {
+            Some(PopupAction::Cancel) => {
+                self.pending_capture = None;
+                self.popup_shared.lock().unwrap().action = None;
+            }
+            Some(PopupAction::Start) => {
+                self.popup_shared.lock().unwrap().action = None;
+                self.confirm_capture(false)
+            }
+            Some(PopupAction::Later) => {
+                self.popup_shared.lock().unwrap().action = None;
+                self.confirm_capture(true)
+            }
+            Some(PopupAction::Browse) => {
+                self.popup_shared.lock().unwrap().action = None;
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    if let Some(pending) = &mut self.pending_capture {
+                        let name = std::path::Path::new(&pending.filename)
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "download.bin".to_string());
+                        pending.output = dir.join(name).display().to_string();
+                    }
                 }
             }
-        }
-
-        if close && !start && !later {
-            self.pending_capture = None;
-        } else if start || later {
-            self.confirm_capture(later);
-        } else if self.pending_capture.is_some() {
-            // Keep probing results live.
-            ctx.request_repaint_after(Duration::from_millis(500));
+            None => {}
         }
     }
 }
 
 impl eframe::App for RapidGrabApp {
+    /// Runs even when the main window is minimized/hidden (unlike `ui()`),
+    /// so captures still open the popup while the GUI stays out of the way.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        while let Ok(update) = self.update_rx.try_recv() {
+            self.apply_update(update);
+        }
+        self.handle_captures();
+        self.pump_queue();
+        self.show_capture_popup(ctx);
+        if self.pending_capture.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         let settings = Settings {
             max_concurrent: self.settings.max_concurrent,
@@ -1225,88 +1428,7 @@ impl eframe::App for RapidGrabApp {
         while let Ok(update) = self.update_rx.try_recv() {
             self.apply_update(update);
         }
-        // Browser captures: intercept = Download popup, click/link = pre-fill.
-        while let Ok(capture) = self.capture_rx.try_recv() {
-            // Best filename: Content-Disposition header wins, then the
-            // extension's guess, then the tab title for YouTube.
-            let filename = capture
-                .content_disposition_filename
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .or(capture.filename.as_deref().filter(|s| !s.trim().is_empty()));
-            let suggested = suggested_output_for(&self.settings.last_dir, filename, &capture.url);
-
-            let host = capture_host(&capture.url);
-            let trusted = capture.auto_start
-                || host
-                    .as_deref()
-                    .is_some_and(|h| self.settings.auto_start_hosts.iter().any(|t| t == h));
-
-            // Always pre-fill the form as a fallback (confirm-first backup).
-            self.new_url = capture.url.clone();
-            if let Some(ref name) = filename {
-                self.new_output = suggested.clone();
-                let _ = name;
-            }
-            if let Some(referer) = &capture.referer {
-                self.new_referer = referer.clone();
-            }
-            if let Some(cookies) = &capture.cookies {
-                self.new_cookie = cookies.clone();
-            }
-            if let Some(ua) = &capture.user_agent {
-                self.new_user_agent = ua.clone();
-            }
-
-            if trusted {
-                // Auto-start: queue immediately without the popup.
-                let speed = self
-                    .new_limit_kbps
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|&x| x > 0)
-                    .map(|x| x * 1024);
-                self.enqueue(
-                    capture.url.clone(),
-                    suggested,
-                    self.new_connections.max(1),
-                    speed,
-                    None,
-                    capture.user_agent.clone(),
-                    capture.referer.clone(),
-                    capture.cookies.clone(),
-                    false,
-                );
-            } else {
-                let size = capture.content_length;
-                let content_type = capture.content_type.clone();
-                let probing = size.is_none() && content_type.is_none();
-                self.pending_capture = Some(PendingCapture {
-                    capture: capture.clone(),
-                    output: suggested,
-                    filename: filename.unwrap_or(&capture.url).to_string(),
-                    size,
-                    content_type,
-                    probing,
-                    dont_ask_again: false,
-                });
-                if probing {
-                    self.spawn_probe(capture);
-                }
-            }
-            self.show_add_panel = true;
-            self.focus_url = true;
-        }
-        while let Ok((url, size, ctype)) = self.probe_rx.try_recv() {
-            if let Some(pending) = &mut self.pending_capture {
-                if pending.capture.url == url {
-                    pending.size = size;
-                    pending.content_type = ctype;
-                    pending.probing = false;
-                }
-            }
-        }
+        self.handle_captures();
         for job in self.jobs.values_mut() {
             if job.status.is_active() && job.handle.as_ref().is_some_and(|h| h.is_finished()) {
                 if let Some(started) = job.started_at.take() {
@@ -1366,7 +1488,6 @@ impl eframe::App for RapidGrabApp {
                 });
             });
 
-        self.render_capture_popup(&ctx);
         self.handle_actions(actions);
         self.pump_queue();
 
