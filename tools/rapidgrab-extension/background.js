@@ -38,6 +38,11 @@ const FILE_CONTENT_TYPES = new Set([
 // requestId -> { url, time } for deduping the same response.
 const seenRequests = new Map();
 
+// tabId -> last intercept capture time (ms). Media players fire a
+// `video/*` response per segment; without a per-tab cooldown every
+// segment would spawn a native host. One intercept per tab per 5 s.
+const lastInterceptByTab = new Map();
+
 // browser downloadId -> captured url, for cancelling after the GUI acks.
 const capturedDownloads = new Map();
 
@@ -101,9 +106,17 @@ async function handleIntercept(details) {
     if (seenRequests.has(details.requestId)) return;
     const headers = details.responseHeaders || [];
     if (!isDownloadable(headers, details.url, details.type)) return;
+    // Attachment downloads always pass; everything else (media segments,
+    // file content-types) is throttled to one per tab per 5 seconds.
+    const disposition = headerValue(headers, "content-disposition") || "";
+    const isAttachment = /attachment/i.test(disposition);
+    if (!isAttachment) {
+      const last = lastInterceptByTab.get(details.tabId) || 0;
+      if (now - last < 5000) return;
+      lastInterceptByTab.set(details.tabId, now);
+    }
     seenRequests.set(details.requestId, { url: details.url, time: now });
 
-    const disposition = headerValue(headers, "content-disposition");
     const filename = parseDispositionFilename(disposition) || guessFilename(details.url);
     const contentType = headerValue(headers, "content-type");
     const lengthHeader = headerValue(headers, "content-length");
@@ -264,11 +277,53 @@ api.runtime.onInstalled.addListener(() => {
     title: "Download link with RapidGrab",
     contexts: ["link"],
   });
+  api.contextMenus.create({
+    id: "rapidgrab-video",
+    title: "Download video with RapidGrab",
+    contexts: ["video"],
+  });
 });
+
+// Media sniffing: the content script reports the media URL it found.
+api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && msg.type === "rapidgrab-media" && /^https?:\/\//i.test(msg.url || "")) {
+    const tab = sender.tab
+      ? { url: sender.tab.url, title: msg.title }
+      : null;
+    sendCapture(msg.url, tab, {
+      filename: msg.title ? filenameFromTitle(msg.title) : null,
+      source: "media",
+    });
+    sendResponse({ ok: true });
+    return true;
+  }
+  return false;
+});
+
+// Toolbar button enabled state: only on http(s) pages.
+function refreshActionState(tabId) {
+  api.tabs
+    .query({ active: true, lastFocusedWindow: true })
+    .then((tabs) => {
+      const tab = tabs && tabs[0];
+      if (!tab || typeof api.action.setEnabled !== "function") return;
+      const onHttp = tab.url && /^https?:\/\//i.test(tab.url);
+      api.action.setEnabled(tab.id, !!onHttp).catch(() => {});
+    })
+    .catch(() => {});
+}
+if (api.tabs && api.tabs.onActivated) api.tabs.onActivated.addListener(refreshActionState);
+if (api.tabs && api.tabs.onUpdated) {
+  api.tabs.onUpdated.addListener((id, info, tab) => {
+    if (info.status === "complete") refreshActionState(id);
+  });
+}
 
 api.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === "rapidgrab-link" && info.linkUrl) {
     sendCapture(info.linkUrl, tab, { source: "link" });
+  } else if (info.menuItemId === "rapidgrab-video" && info.srcUrl) {
+    sendCapture(info.srcUrl, tab, { source: "media" });
   } else if (info.menuItemId === "rapidgrab-page" && tab && tab.url) {
     sendCapture(tab.url, tab, { source: "page" });
   }

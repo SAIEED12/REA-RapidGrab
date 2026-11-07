@@ -46,7 +46,9 @@ foreach ($key in @(
     'HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\com.rapidgrab',
     'HKCU:\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.rapidgrab',
     'HKCU:\Software\Opera Software\Opera Stable\NativeMessagingHosts\com.rapidgrab',
-    'HKCU:\Software\Vivaldi\NativeMessagingHosts\com.rapidgrab'
+    'HKCU:\Software\Vivaldi\NativeMessagingHosts\com.rapidgrab',
+    'HKCU:\Software\Chromium\NativeMessagingHosts\com.rapidgrab',
+    'HKCU:\Software\The Browser Company\Arc\NativeMessagingHosts\com.rapidgrab'
 )) {
     New-Item -Path $key -Force | Out-Null
     Set-ItemProperty -Path $key -Name '(default)' -Value $chromePath -Type String
