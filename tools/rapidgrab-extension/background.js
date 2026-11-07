@@ -15,12 +15,50 @@ function guessFilename(url) {
   return null;
 }
 
+/// True for YouTube watch/share pages where the URL itself carries no
+/// filename — the video filename can only come from the tab title.
+function isYouTubePage(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return (
+      host === "youtube.com" ||
+      host.endsWith(".youtube.com") ||
+      host === "youtu.be"
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
+/// Turn a YouTube tab title ("My Video - YouTube") into a safe
+/// "My Video.mp4" filename. Returns null when there is no usable title.
+function filenameFromTitle(title) {
+  if (!title) return null;
+  let name = String(title)
+    .replace(/\s*[-–—|]\s*YouTube(?:\s+Music)?\s*$/i, "")
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/[. ]+$/, "")
+    .trim()
+    .slice(0, 120);
+  if (!name) return null;
+  if (!/\.(mp4|webm|mkv|mov|avi|mp3|m4a|wav)$/i.test(name)) {
+    name += ".mp4";
+  }
+  return name;
+}
+
 function sendCapture(url, tab) {
   if (!/^https?:\/\//i.test(url)) {
     console.warn("[RapidGrab] not an http(s) URL:", url);
     return;
   }
-  const filename = guessFilename(url);
+  let filename = guessFilename(url);
+  // YouTube watch/share pages carry no filename in the URL — name the
+  // capture from the tab title instead of falling back to download.bin.
+  if (!filename && isYouTubePage(url)) {
+    filename = filenameFromTitle(tab && tab.title);
+  }
   const referer = tab && tab.url ? tab.url : undefined;
   const user_agent = navigator.userAgent;
 
