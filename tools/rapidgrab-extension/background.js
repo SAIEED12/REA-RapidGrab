@@ -286,16 +286,25 @@ api.runtime.onInstalled.addListener(() => {
 
 // Media sniffing: the content script reports the media URL it found.
 api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg && msg.type === "rapidgrab-media" && /^https?:\/\//i.test(msg.url || "")) {
-    const tab = sender.tab
-      ? { url: sender.tab.url, title: msg.title }
-      : null;
-    sendCapture(msg.url, tab, {
-      filename: msg.title ? filenameFromTitle(msg.title) : null,
-      source: "media",
-    });
-    sendResponse({ ok: true });
-    return true;
+  if (msg && msg.type === "rapidgrab-media") {
+    // Defense in depth: blob:/data: URLs are MSE playback URLs and can
+    // never be downloaded — substitute the page URL (the resolver handles
+    // it) instead of letting sendCapture drop the capture as non-http(s).
+    let url = msg.url || "";
+    if (!/^https?:\/\//i.test(url)) {
+      url = (sender.tab && sender.tab.url) || "";
+    }
+    if (/^https?:\/\//i.test(url)) {
+      const tab = sender.tab
+        ? { url: sender.tab.url, title: msg.title }
+        : null;
+      sendCapture(url, tab, {
+        filename: msg.title ? filenameFromTitle(msg.title) : null,
+        source: "media",
+      });
+      sendResponse({ ok: true });
+      return true;
+    }
   }
   return false;
 });

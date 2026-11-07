@@ -20,11 +20,18 @@
 
   function mediaUrlFor(el) {
     if (!el) return null;
+    // YouTube and most players use MSE: currentSrc is a blob: URL that
+    // cannot be downloaded. Fall back to the page URL (the resolver
+    // handles it) rather than sending an undownloadable blob:.
+    const candidates = [];
     if (el.tagName === "VIDEO" || el.tagName === "AUDIO") {
-      if (el.currentSrc) return el.currentSrc;
+      if (el.currentSrc) candidates.push(el.currentSrc);
       const src = el.querySelector("source[src]");
-      if (src && src.src) return src.src;
-      if (el.src) return el.src;
+      if (src && src.src) candidates.push(src.src);
+      if (el.src) candidates.push(el.src);
+    }
+    for (const candidate of candidates) {
+      if (/^https?:\/\//i.test(candidate)) return candidate;
     }
     return null;
   }
@@ -72,7 +79,9 @@
     btn.addEventListener("click", (event) => {
       event.stopPropagation();
       event.preventDefault();
-      const url = mediaUrlFor(video);
+      // blob:/data: sources are MSE playback URLs, not downloads — fall
+      // back to the page URL so the resolver still gets a capture.
+      const url = mediaUrlFor(video) || location.href;
       if (!url) return;
       api.runtime
         .sendMessage({
