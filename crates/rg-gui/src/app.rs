@@ -273,6 +273,13 @@ impl RapidGrabApp {
                 // The GUI only repaints while jobs are active; wake it so the
                 // capture is applied immediately instead of on the next click.
                 repaint_ctx.request_repaint();
+                // Bring the GUI (and its popup) to the front the moment the
+                // user clicks in the browser — otherwise the popup sits
+                // hidden behind Chrome.
+                let _ = repaint_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                repaint_ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Informational,
+                ));
             })
             .ok()
         } else {
@@ -1049,16 +1056,25 @@ impl RapidGrabApp {
         // window closure would fight the borrow checker.
         let (filename, url, size_label, type_label, source_label) = {
             let pending = self.pending_capture.as_ref().unwrap();
-            let size_label = match pending.size {
-                Some(bytes) => human_bytes(bytes),
-                None if pending.probing => "Resolving…".to_string(),
-                None => "Unknown".to_string(),
+            // YouTube watch pages probe as text/html — that is the page,
+            // not the video. Label it as what it is and let the resolver
+            // pick the real stream on Start.
+            let is_media_page = pending.capture.source.as_deref() == Some("media");
+            let (size_label, type_label) = if is_media_page {
+                ("Video page".to_string(), "resolved on Start".to_string())
+            } else {
+                let size_label = match pending.size {
+                    Some(bytes) => human_bytes(bytes),
+                    None if pending.probing => "Resolving…".to_string(),
+                    None => "Unknown".to_string(),
+                };
+                let type_label = pending
+                    .content_type
+                    .as_deref()
+                    .unwrap_or(if pending.probing { "…" } else { "—" })
+                    .to_string();
+                (size_label, type_label)
             };
-            let type_label = pending
-                .content_type
-                .as_deref()
-                .unwrap_or(if pending.probing { "…" } else { "—" })
-                .to_string();
             let source_label = pending
                 .capture
                 .source
