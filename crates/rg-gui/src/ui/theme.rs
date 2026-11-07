@@ -298,14 +298,45 @@ fn install_fonts(ctx: &egui::Context) {
         .cloned()
         .unwrap_or_default();
 
-    let semibold_chain = if let Some(data) = semibold {
+    // Bengali (and other Indic scripts): Segoe UI has no Bangla glyphs, so
+    // without a fallback they render as boxes. Nirmala UI is the Windows
+    // Indic font (regular + bold); it sits after Segoe UI in the text
+    // chain so Latin keeps Segoe and Bangla falls through to Nirmala.
+    let bangla = read_font(&["Nirmala.ttf", "NotoSansBengali-Regular.ttf"]);
+    let bangla_bold = read_font(&["NirmalaB.ttf", "NotoSansBengali-Bold.ttf"]);
+    let mut text_chain = base_chain.clone();
+    if let Some(data) = bangla {
+        fonts.font_data.insert("rg-bangla".to_string(), data);
+        let at = if text_chain.first().is_some_and(|f| f == "rg-ui") {
+            1
+        } else {
+            0
+        };
+        text_chain.insert(at, "rg-bangla".to_string());
+        if let Some(chain) = fonts.families.get_mut(&FontFamily::Proportional) {
+            *chain = text_chain.clone();
+        }
+    }
+    if let Some(data) = bangla_bold {
+        fonts.font_data.insert("rg-bangla-bold".to_string(), data);
+    }
+
+    let mut semibold_chain = if let Some(data) = semibold {
         fonts.font_data.insert("rg-semibold".to_string(), data);
         let mut chain = vec!["rg-semibold".to_string()];
-        chain.extend(base_chain.iter().cloned());
+        if fonts.font_data.contains_key("rg-bangla-bold") {
+            chain.push("rg-bangla-bold".to_string());
+        }
+        chain.extend(text_chain.iter().cloned());
         chain
     } else {
-        base_chain.clone()
+        text_chain.clone()
     };
+    // Deduplicate while keeping order (bold may duplicate text_chain entries).
+    {
+        let mut seen = std::collections::HashSet::new();
+        semibold_chain.retain(|f| seen.insert(f.clone()));
+    }
     fonts.families.insert(semibold_family(), semibold_chain);
 
     let icons = read_font(&["Segoe Fluent Icons.ttf", "segmdl2.ttf"]);
