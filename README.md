@@ -95,6 +95,36 @@ tools/             make-ico.ps1 (rebuild .ico), build-dist.ps1 (release bundle)
   silently returns wrong bytes produces a "successful" download.
 * **Fallback** — no range support or unknown length → single streaming download
   to `<output>.rgtmp`, then atomic rename.
+* **Proxy** — three modes. `Off` builds a client with `no_proxy()` (environment
+  variables are ignored too, so it really means direct). `Manual` points at an
+  explicit proxy URL (`http://…`, `socks5(h)://…`, and bare `host:port` are all
+  accepted). `System` resolves via the WinHTTP proxy engine:
+  `WinHttpGetIEProxyConfigForCurrentUser` first, then `WinHttpGetProxyForUrl`
+  with the IE-supplied PAC file or WPAD auto-detection for the exact target
+  host, falling back to the static IE proxy when PAC resolution fails. Proxy
+  bypass lists (`no_proxy`) are merged into reqwest's matcher. The client built
+  by `NetworkConfig::client_for` is the single client used everywhere (probe,
+  segment workers, single-stream fallback, resolver), so a job runs entirely
+  through one proxy choice. *Accepted limitation:* a cross-host redirect can
+  resolve to a different proxy under the OS engine, but the client keeps the
+  first choice for the rest of the job.
+* **Authentication** — HTTP Basic credentials can be attached preemptively
+  (Advanced form / `--user`/`--password`). A 401 or 407 the download did not
+  expect aborts with `Error::AuthRequired`, carrying the status code, host,
+  realm and whether it is a proxy challenge; the GUI opens a login dialog and
+  retries the same job with the entered credentials (proxy credentials are also
+  written back into the settings so future jobs inherit them). Credentials are
+  stored in plain text in `settings.json` (an accepted trade-off, same as
+  IDM-style tools).
+* **FTP** — `ftp://` downloads use one control connection plus one passive data
+  connection (`EPSV` with a `PASV` fallback; active `PORT` mode is not
+  supported). `SIZE` gives the total, `REST <offset>` resumes an existing
+  `.rgtmp` (a server that does not honour `REST` restarts from 0 rather than
+  corrupt the file), and the transfer is finished with the same atomic rename as
+  HTTP. A `530` login refusal surfaces as `Error::FtpAuth` and reuses the same
+  GUI login dialog. URL userinfo wins over configured credentials, and both
+  fall back to anonymous login. Not supported: FTPS, FTP-over-proxy, and
+  parallel segments (an FTP server-capability probe is a later phase).
 * **Content handling** — when the save path has no extension or ends in `.bin`,
   the output name is refined from `Content-Disposition` first and `Content-Type`
   second (so `download.bin` becomes `download.mp4`). HTML responses are refused
@@ -133,7 +163,15 @@ Double-click `dist\RapidGrab.exe` (or the Desktop shortcut created by
 
 * **Add Download** — URL, save-as (with `Browse…`), connections, speed cap,
   optional SHA-256 and User-Agent; the output path is suggested from the URL
-  into the last-used folder.
+  into the last-used folder. An *Advanced* section has optional
+  Username/Password for the target server.
+* **Proxy** — settings-wide, with modes Off / Manual / System. Manual asks for
+  a proxy URL (plus optional credentials); System uses the Windows proxy
+  configuration (including WPAD/PAC and bypass lists). New downloads capture
+  the settings, so a proxy change applies to the next job, not to running ones.
+* **Logins** — a 401/407 from the HTTP server/proxy or a refused FTP login
+  opens an authentication dialog for that job; signing in retries the job with
+  the entered credentials.
 * **Queue** — `Run at once` caps how many downloads are active; the rest wait as
   `Queued` and start in id order.
 * **Per job** — Pause / Resume, Cancel, Retry, Remove, Open File, Open Folder.
@@ -166,6 +204,19 @@ target\release\rapidgrab.exe get <url> -o <path> --restart      # discard parts
 target\release\rapidgrab.exe get <url> -o <path> --sha256 <hex> # verify content
 target\release\rapidgrab.exe get <url> -o <path> --allow-html   # save an HTML page
 target\release\rapidgrab.exe status D:\Downloads\big.iso        # segment map
+
+# Proxy and authentication
+target\release\rapidgrab.exe get <url> -o <path> --proxy http://proxy.corp:8080
+target\release\rapidgrab.exe get <url> -o <path> --proxy socks5://127.0.0.1:9050
+target\release\rapidgrab.exe get <url> -o <path> --proxy <url> --proxy-user me --proxy-pass p
+target\release\rapidgrab.exe get <url> -o <path> --system-proxy   # Windows proxy/WPAD/PAC
+target\release\rapidgrab.exe get <url> -o <path> --no-proxy       # direct, ignore env proxies
+target\release\rapidgrab.exe get <url> -o <path> --user alfred --password s3cret
+
+# FTP with credentials and resume
+target\release\rapidgrab.exe get ftp://ftp.example.com/pub/big.tar -o D:\Downloads\big.tar
+target\release\rapidgrab.exe get ftp://ftp.example.com/pub/big.tar -o D:\Downloads\big.tar --user alfred --password s3cret
+target\release\rapidgrab.exe get ftp://alfred:s3cret@ftp.example.com/pub/big.tar -o D:\Downloads\big.tar
 
 # Media pages: yt-dlp resolves, RapidGrab downloads, ffmpeg merges.
 target\release\rapidgrab.exe get "https://www.youtube.com/watch?v=SrJOE2pEp7A" -o D:\Downloads\download.bin
@@ -222,9 +273,31 @@ saturate all connections the way IDM does.
 `cargo test` covers the split policy (midpoint, current-position, IDM's 46,721
 threshold, minimum-chunk floor), segment accounting, Referer derivation,
 filename inference, HTML refusal, cancellation/resume against a local server,
-`yt-dlp -J` format selection (muxed/DASH/height cap/HLS exclusion/audio
-container matching), and full resolver orchestration with a fake tool runner and
-a local HTTP server (58 tests).
+proxy routing and bypass, Basic authentication (missing/wrong credentials fail,
+correct ones complete), FTP (anonymous, credentials, wrong-password refusal as
+`FtpAuth`, PASV fallback, `REST` resume), `yt-dlp -J` format selection
+(muxed/DASH/height cap/HLS exclusion/audio container matching), and full
+resolver orchestration with a fake tool runner and a local HTTP server (68
+tests).
+
+### Phase 3 protocol gates (in-process integration tests)
+
+| Gate | Result |
+|---|---|
+| Multipath download through a manual HTTP proxy (`tests/proxy.rs`) | PASS — proxy saw the request, byte-exact content |
+| `no_proxy` bypass list with a proxy configured | PASS — the proxy saw no request |
+| HTTP 401 without credentials (`tests/auth.rs`) | PASS — `Error::AuthRequired` with status 401 and realm |
+| HTTP 401 with wrong credentials | PASS — still `AuthRequired` |
+| HTTP 401 with correct credentials, 2 connections | PASS — byte-exact content |
+| FTP anonymous and credentialed download (`tests/ftp.rs`) | PASS — byte-exact over EPSV |
+| FTP wrong password / no credentials | PASS — `Error::FtpAuth` |
+| FTP server without `EPSV` | PASS — PASV fallback completes |
+| FTP resume into an existing `.rgtmp` | PASS — `REST` offset honoured, byte-exact file, temp renamed |
+
+Not yet testable in CI: the `System` proxy mode talks to the real WinHTTP
+engine, so it is verified manually — run `get <https url> --system-proxy` on a
+machine behind a corporate proxy (or Settings → Proxy = System in the GUI) and
+confirm the request appears in the proxy's log.
 
 ## 7. Roadmap
 

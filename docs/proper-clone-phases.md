@@ -11,7 +11,7 @@ Legal: reimplement from observed behavior only (strings, registry, manifests, ru
 Gate: install/uninstall on clean machine; click capture works for Chrome/Edge/Firefox.
 
 ## Phase 1 — Download popup + interception (1–2 weeks) [core, decide A confirmed]
-- MV3 `webRequest.onHeadersReceived` watches for `Content-Disposition: attachment`, known file types, media URLs → sends capture to host → `chrome.downloads.cancel()` the browser's own download, GUI takes over.
+- MV3 `webRequest.onHeadersReceived` plus `downloads.onCreated` capture real browser downloads → sends the capture to the host → after the host acks, `chrome.downloads.pause/cancel/erase` removes the browser's duplicate, and the GUI takes over. Streaming media is deliberately excluded: a video/audio response (by content type, `media` request type, or a streaming file extension such as `.mp4`) only counts when the browser navigated to it with `Content-Disposition: attachment`; in-page playback fetches never pop, even when a CDN labels them attachment (Facebook's scontent player requires this). Captures are deduped per URL for 30 s so chunked/range requests and the header+downloads double path produce one window. Video on a page is captured only when the user clicks the inline `↓ RapidGrab` player button; MSE players expose only a `blob:` `currentSrc`, so the service worker remembers the most recent streaming response per tab (15 min) and the button resolves to that real CDN URL — except for resolver hosts (YouTube/`googlevideo`), which keep sending the page URL to yt-dlp.
 - Download popup in GUI: filename, size/type (probe), Save-to + category, Start / Download Later / Cancel, "don't ask again for this site", Resume when partial exists.
 - File-type rules + ExceptionServers equivalent.
 - Stale signed-URL flow: tell user to re-trigger from browser.
@@ -27,13 +27,17 @@ Gate: download a ZIP/PDF/MP4 from a real site in Chrome — popup appears, brows
 
 Gate: each browser captures page + link + video with its own registration.
 
-## Phase 3 — Protocols & network (1 week)
-- FTP (PASV/PORT, user/pass from popup, REST resume).
-- Proxy: HTTP/HTTPS/SOCKS5 + PAC + per-protocol auth, wired into reqwest + GUI options.
-- Auth-retry popup on 401/407 instead of failing.
-- RTSP/MMS basic support.
+## Phase 3 — Protocols & network (1 week) ✅ DONE
+- FTP (PASV/PORT, user/pass from popup, REST resume). ✅ PASV (EPSV→PASV fallback, no active PORT), URL/Advanced/CLI credentials, REST resume into `.rgtmp`; parallel segments deferred (needs a server-capability probe).
+- Proxy: HTTP/HTTPS/SOCKS5 + PAC + per-protocol auth, wired into reqwest + GUI options. ✅ Off/Manual/System (`WinHttpGetProxyForUrl` + WPAD/PAC), no_proxy bypass, preemptive Basic auth; cross-host redirect keeps the job's first proxy choice (accepted limitation).
+- Auth-retry popup on 401/407 instead of failing. ✅ GUI authentication dialog retries the job with entered credentials; FTP `530` (`Error::FtpAuth`) opens the same dialog.
+- RTSP/MMS basic support. ❌ deferred to Phase 5 entirely (per decision).
 
-Gate: FTP download with credentials; proxied HTTPS download; 401 prompts for login.
+Gate: FTP download with credentials; proxied HTTPS download; 401 prompts for login. ✅
+`tests/proxy.rs` (proxy routing + bypass), `tests/auth.rs` (401→prompt→complete
+with credentials), `tests/ftp.rs` (anonymous/credentials/wrong-password/PASV
+fallback/REST resume); proxied-HTTPS and System-mode verified manually on a
+real proxy (docs in README §6).
 
 ## Phase 4 — Productivity (1–2 weeks)
 - Scheduler: timed start/stop, hibernate/sleep after queue, daily MB limits.

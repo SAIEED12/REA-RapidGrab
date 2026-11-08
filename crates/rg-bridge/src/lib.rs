@@ -13,6 +13,25 @@ use serde::{Deserialize, Serialize};
 /// Pipe name used by the native host and the GUI (Windows).
 pub const PIPE_NAME: &str = r"\\.\pipe\rapidgrab-capture";
 
+/// True when the URL path names a media file (a direct download) rather than
+/// a page that a resolver must handle.
+///
+/// Used by the capture popups: a `media`-sourced capture whose URL ends in a
+/// media extension came from a player's stream URL (MSE players such as
+/// Facebook expose no `currentSrc`), so it is probed and downloaded directly
+/// instead of being labelled "Video page".
+pub fn is_media_file_url(url: &str) -> bool {
+    const MEDIA_EXTENSIONS: [&str; 11] = [
+        ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".flv", ".mp3", ".m4a", ".wav", ".ogg",
+    ];
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    MEDIA_EXTENSIONS.iter().any(|ext| path.ends_with(ext))
+}
+
 /// One captured download from the browser.
 /// Every field except `url` is optional; missing values are filled in by the GUI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,5 +320,21 @@ mod tests {
         let mut buf = Vec::new();
         (0u32).to_le_bytes().iter().for_each(|b| buf.push(*b));
         assert!(read_frame(&buf[..]).is_err());
+    }
+
+    #[test]
+    fn media_file_url_detection() {
+        // Facebook's sniffed stream URL: the extension is before the query.
+        assert!(is_media_file_url(
+            "https://scontent-fra3-2.xx.fbcdn.net/v/t42.1790-2/AQM123ZA.mp4?_nc_cat=101&_nc_oc=x"
+        ));
+        assert!(is_media_file_url("https://ex.com/a/Clip.WEBM"));
+        assert!(is_media_file_url("https://ex.com/audio.mp3#t=10"));
+
+        // Pages (including ones that merely mention a media extension).
+        assert!(!is_media_file_url("https://www.facebook.com/"));
+        assert!(!is_media_file_url("https://ex.com/watch?v=abc.mp4"));
+        assert!(!is_media_file_url("https://ex.com/a.mp4/page"));
+        assert!(!is_media_file_url(""));
     }
 }

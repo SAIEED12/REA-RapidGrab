@@ -35,16 +35,96 @@ const FILE_CONTENT_TYPES = new Set([
   "application/vnd.microsoft.portable-executable",
 ]);
 
-// requestId -> { url, time } for deduping the same response.
-const seenRequests = new Map();
+// Streaming extensions: video/audio payloads. A response with one of these
+// (by URL or content type) is only a download when the browser navigated to
+// it with `Content-Disposition: attachment`; in-page playback fetches never
+// count, whatever headers the CDN sends. Facebook's scontent CDN, for
+// example, serves `video/mp4` (and sometimes attachment headers) to the
+// player via XHR.
+const STREAM_EXTENSIONS = new Set([
+  "3gp", "aac", "aif", "asf", "avi", "flv", "m4a", "m4v", "mkv", "mov", "mp3",
+  "mp4", "mpa", "mpeg", "mpg", "ogg", "ogv", "qt", "ra", "rm", "rmvb", "wav",
+  "webm", "wma", "wmv",
+]);
 
-// tabId -> last intercept capture time (ms). Media players fire a
-// `video/*` response per segment; without a per-tab cooldown every
-// segment would spawn a native host. One intercept per tab per 5 s.
-const lastInterceptByTab = new Map();
+// Request types that are page navigations. Playback uses
+// `xmlhttprequest`, `media`, `other`, … and can be ignored for streams.
+const NAVIGATION_TYPES = new Set(["main_frame", "sub_frame", "object"]);
+
+// URL -> capture time. Chunked/range requests and the header + downloads
+// paths must not pop more than one window per URL.
+const recentCaptures = new Map();
+const CAPTURE_WINDOW_MS = 30000;
+
+// tabId -> { url, time }: the most recent streaming media response seen on
+// that tab. MSE players (Facebook, …) play from blob: URLs, so the player
+// button cannot read `currentSrc`; this is what it resolves to instead.
+// Purely recorded — it never opens a popup by itself.
+const lastMediaByTab = new Map();
+const MEDIA_WINDOW_MS = 15 * 60 * 1000;
+
+// Hosts whose media must go through the yt-dlp resolver (signed URLs with
+// throttling tokens); the button keeps sending the page URL for these.
+const RESOLVER_HOSTS = ["googlevideo.com", "youtube.com", "youtu.be"];
+
+// URLs the GUI acknowledged, so a late browser download for them can be
+// cancelled even when it appears after the ack.
+const ackedUrls = new Map();
 
 // browser downloadId -> captured url, for cancelling after the GUI acks.
 const capturedDownloads = new Map();
+
+function pruneMap(map, now, maxAge) {
+  for (const [key, value] of map) {
+    const time = typeof value === "number" ? value : value.time;
+    if (now - time > maxAge) map.delete(key);
+  }
+}
+
+function wasCapturedRecently(url, now) {
+  pruneMap(recentCaptures, now, CAPTURE_WINDOW_MS);
+  return recentCaptures.has(url);
+}
+
+function noteCapture(url, now) {
+  recentCaptures.set(url, now);
+}
+
+function isResolverHost(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return RESOLVER_HOSTS.some((known) => host === known || host.endsWith("." + known));
+  } catch (_) {
+    return false;
+  }
+}
+
+/// Streams are recorded for the player button, not for automatic capture.
+function isStreamResponse(headers, url, resourceType) {
+  const type = (headerValue(headers, "content-type") || "").split(";")[0].trim().toLowerCase();
+  const ext = extensionOf(url, null);
+  return (
+    type.startsWith("video/") ||
+    type.startsWith("audio/") ||
+    resourceType === "media" ||
+    STREAM_EXTENSIONS.has(ext)
+  );
+}
+
+function rememberMedia(tabId, url, now) {
+  pruneMap(lastMediaByTab, now, MEDIA_WINDOW_MS);
+  lastMediaByTab.set(tabId, { url, time: now });
+}
+
+/// The freshest recorded media URL for a tab, unless it belongs to a host
+/// the resolver handles better (YouTube).
+function recentMediaFor(tabId, now) {
+  pruneMap(lastMediaByTab, now, MEDIA_WINDOW_MS);
+  const entry = lastMediaByTab.get(tabId);
+  if (!entry || now - entry.time > MEDIA_WINDOW_MS) return null;
+  if (isResolverHost(entry.url)) return null;
+  return entry.url;
+}
 
 function headerValue(headers, name) {
   const lower = name.toLowerCase();
@@ -83,15 +163,25 @@ function extensionOf(url, filename) {
 
 function isDownloadable(headers, url, resourceType) {
   const disposition = headerValue(headers, "content-disposition") || "";
-  if (/attachment/i.test(disposition)) return true;
+  const isAttachment = /attachment/i.test(disposition);
   const type = (headerValue(headers, "content-type") || "").split(";")[0].trim().toLowerCase();
-  if (type.startsWith("video/") || type.startsWith("audio/")) return true;
-  if (FILE_CONTENT_TYPES.has(type)) return true;
   const ext = extensionOf(url, parseDispositionFilename(disposition));
-  if (ext && FILE_EXTENSIONS.has(ext)) return true;
-  // Media subresource (video element streams) with a known file extension.
-  if (resourceType === "media" && ext) return true;
-  return false;
+
+  const isStream =
+    type.startsWith("video/") ||
+    type.startsWith("audio/") ||
+    resourceType === "media" ||
+    STREAM_EXTENSIONS.has(ext);
+  if (isStream) {
+    // Only a page navigation that the browser turned into a download
+    // (attachment) may pop. Playback fetches never do, even when the CDN
+    // labels them attachment or their URL ends in .mp4.
+    return isAttachment && NAVIGATION_TYPES.has(resourceType);
+  }
+
+  if (isAttachment) return true;
+  if (FILE_CONTENT_TYPES.has(type)) return true;
+  return !!(ext && FILE_EXTENSIONS.has(ext));
 }
 
 async function handleIntercept(details) {
@@ -99,24 +189,19 @@ async function handleIntercept(details) {
     if (details.tabId < 0 || details.tabId === api.tabs.TAB_ID_NONE) return;
     if (!/^https?:\/\//i.test(details.url)) return;
     if (details.statusCode && details.statusCode >= 400) return;
-    const now = Date.now();
-    for (const [k, v] of seenRequests) {
-      if (now - v.time > 30000) seenRequests.delete(k);
-    }
-    if (seenRequests.has(details.requestId)) return;
     const headers = details.responseHeaders || [];
-    if (!isDownloadable(headers, details.url, details.type)) return;
-    // Attachment downloads always pass; everything else (media segments,
-    // file content-types) is throttled to one per tab per 5 seconds.
-    const disposition = headerValue(headers, "content-disposition") || "";
-    const isAttachment = /attachment/i.test(disposition);
-    if (!isAttachment) {
-      const last = lastInterceptByTab.get(details.tabId) || 0;
-      if (now - last < 5000) return;
-      lastInterceptByTab.set(details.tabId, now);
+    // Record the media URL for the player button before deciding whether it
+    // pops; playback is never a capture, but it is the URL the button needs
+    // on MSE players (Facebook) where `currentSrc` is a blob:.
+    if (isStreamResponse(headers, details.url, details.type)) {
+      rememberMedia(details.tabId, details.url, Date.now());
     }
-    seenRequests.set(details.requestId, { url: details.url, time: now });
+    if (!isDownloadable(headers, details.url, details.type)) return;
+    const now = Date.now();
+    if (wasCapturedRecently(details.url, now)) return;
+    noteCapture(details.url, now);
 
+    const disposition = headerValue(headers, "content-disposition") || "";
     const filename = parseDispositionFilename(disposition) || guessFilename(details.url);
     const contentType = headerValue(headers, "content-type");
     const lengthHeader = headerValue(headers, "content-length");
@@ -138,13 +223,38 @@ async function handleIntercept(details) {
   }
 }
 
+/// The authoritative "the browser is downloading a file" signal: playback
+/// never creates a browser download, so this is what replaces guesswork over
+/// response headers. The header path above usually fires first (and gets the
+/// richer file name); this catches flows the headers miss.
 function onDownloadCreated(downloadItem) {
-  const url = downloadItem.finalUrl || downloadItem.url;
+  const url = downloadItem.finalUrl || downloadItem.url || "";
   const when = Date.now();
-  for (const [k, v] of capturedDownloads) {
-    if (when - v.time > 60000) capturedDownloads.delete(k);
-  }
+  pruneMap(capturedDownloads, when, 60000);
+  pruneMap(ackedUrls, when, 60000);
+
+  if (!/^https?:\/\//i.test(url)) return;
   capturedDownloads.set(downloadItem.id, { url, time: when });
+
+  if (ackedUrls.has(url)) {
+    // The GUI already took this URL over; this browser download is the
+    // duplicate that must be removed.
+    cancelBrowserDownload(downloadItem.id);
+    return;
+  }
+  if (wasCapturedRecently(url, when)) return;
+
+  noteCapture(url, when);
+  let filename = downloadItem.filename
+    ? String(downloadItem.filename).split(/[\\/]/).pop()
+    : guessFilename(url);
+  // Chrome reports interrupted downloads with a `.crdownload` suffix.
+  if (filename) filename = filename.replace(/\.crdownload$/i, "");
+  sendCapture(url, null, {
+    filename: filename || undefined,
+    contentType: downloadItem.mime || undefined,
+    source: "intercept",
+  }).catch(() => {});
 }
 
 function cancelBrowserDownload(downloadId) {
@@ -153,6 +263,12 @@ function cancelBrowserDownload(downloadId) {
   // Give the pause a tick so the cancel wins (Chrome quirk).
   setTimeout(() => {
     api.downloads.cancel(downloadId).catch(() => {});
+    // Drop the cancelled entry (and its partial file) from browser history.
+    setTimeout(() => {
+      if (typeof api.downloads.erase === "function") {
+        api.downloads.erase({ id: downloadId }).catch(() => {});
+      }
+    }, 100);
   }, 50);
 }
 
@@ -241,6 +357,9 @@ function post(payload) {
     // Host ack: cancel the browser's own duplicate download only when the
     // GUI actually received the capture.
     if (msg && msg.ok) {
+      const now = Date.now();
+      ackedUrls.set(payload.url, now);
+      pruneMap(ackedUrls, now, 60000);
       for (const [id, entry] of capturedDownloads) {
         if (entry.url === payload.url) {
           cancelBrowserDownload(id);
@@ -287,19 +406,31 @@ api.runtime.onInstalled.addListener(() => {
 // Media sniffing: the content script reports the media URL it found.
 api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === "rapidgrab-media") {
-    // Defense in depth: blob:/data: URLs are MSE playback URLs and can
-    // never be downloaded — substitute the page URL (the resolver handles
-    // it) instead of letting sendCapture drop the capture as non-http(s).
+    const now = Date.now();
+    const tabId = sender.tab ? sender.tab.id : undefined;
+    // MSE players (Facebook, …) have no downloadable `currentSrc`; the
+    // content script sends an empty URL and we use the most recent media
+    // response seen on this tab. Falls back to the page URL (the resolver
+    // handles it) when nothing recent was recorded or the host needs yt-dlp.
     let url = msg.url || "";
+    let sniffed = false;
     if (!/^https?:\/\//i.test(url)) {
-      url = (sender.tab && sender.tab.url) || "";
+      const recent = tabId !== undefined ? recentMediaFor(tabId, now) : null;
+      if (recent) {
+        url = recent;
+        sniffed = true;
+      } else {
+        url = (sender.tab && sender.tab.url) || "";
+      }
     }
     if (/^https?:\/\//i.test(url)) {
       const tab = sender.tab
         ? { url: sender.tab.url, title: msg.title }
         : null;
       sendCapture(url, tab, {
-        filename: msg.title ? filenameFromTitle(msg.title) : null,
+        // A sniffed CDN URL has a usable name of its own; the tab title is
+        // only a good name for the page-resolver fallback.
+        filename: !sniffed && msg.title ? filenameFromTitle(msg.title) : null,
         source: "media",
       });
       sendResponse({ ok: true });

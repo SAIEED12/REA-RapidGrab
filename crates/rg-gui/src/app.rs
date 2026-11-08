@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
-use rg_core::{Download, Progress};
+use rg_core::{Credentials, Download, NetworkConfig, Progress, ProxyConfig, ProxyMode};
 use rg_resolve::{MediaEvent, MediaProgress, MediaRequest, MediaStage, Tools};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
@@ -48,13 +48,20 @@ pub enum CancelIntent {
     Stop,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum FailureKind {
     #[default]
     Other,
     /// The remote file changed after a partial download began. Restarting
     /// discards the stale parts manifest and downloads from scratch.
     RemoteChanged,
+    /// HTTP 401/407: the GUI opens a credentials dialog and retries.
+    AuthRequired {
+        status: u16,
+        host: String,
+        realm: Option<String>,
+        proxy: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +94,9 @@ pub struct DownloadJob {
     pub referer: Option<String>,
     pub cookie: Option<String>,
     pub restart: bool,
+    /// Proxy settings captured when the job was enqueued; changing the global
+    /// setting later only affects new jobs.
+    pub network: NetworkConfig,
     pub status: JobStatus,
     pub progress: Option<Progress>,
     pub media: Option<MediaProgress>,
@@ -155,6 +165,10 @@ struct Settings {
     /// start immediately — the "don't ask again for this site" list.
     #[serde(default)]
     auto_start_hosts: Vec<String>,
+    /// Proxy selection shared by direct downloads, browser probes and media
+    /// streams. Captured per job when the job is created.
+    #[serde(default)]
+    proxy: ProxyConfig,
 }
 
 fn default_auto_resolve() -> bool {
@@ -181,6 +195,7 @@ impl Default for Settings {
             ffmpeg_path: String::new(),
             yt_dlp_args: String::new(),
             auto_start_hosts: Vec::new(),
+            proxy: ProxyConfig::default(),
         }
     }
 }
@@ -220,6 +235,9 @@ pub struct RapidGrabApp {
     new_user_agent: String,
     new_referer: String,
     new_cookie: String,
+    /// Optional HTTP Basic credentials for the next direct download.
+    new_auth_user: String,
+    new_auth_pass: String,
     show_add_panel: bool,
     /// Set when a button should move keyboard focus back to the URL field.
     focus_url: bool,
@@ -231,6 +249,8 @@ pub struct RapidGrabApp {
 
     /// Browser capture awaiting popup confirmation (browser integration).
     pending_capture: Option<PendingCapture>,
+    /// Credentials dialog shown after a 401/407 failure.
+    auth_prompt: Option<AuthPrompt>,
     /// Shared snapshot for the deferred popup viewport ('static callback).
     popup_shared: Arc<std::sync::Mutex<PopupShared>>,
 
@@ -282,9 +302,18 @@ struct OutputProbe {
     exists: bool,
 }
 
+/// Credentials dialog state opened when a job fails with 401/407.
+struct AuthPrompt {
+    job_id: usize,
+    host: String,
+    realm: Option<String>,
+    proxy: bool,
+    username: String,
+    password: String,
+}
+
 /// A browser capture waiting for the user to confirm in the popup.
-struct PendingCapture {
-    capture: rg_bridge::CaptureRequest,
+struct PendingCapture {    capture: rg_bridge::CaptureRequest,
     /// Editable Save-as path shown in the popup.
     output: String,
     /// Best filename we have so far (header > URL > tab title).
@@ -350,11 +379,14 @@ impl RapidGrabApp {
             new_sha256: String::new(),
             new_referer: String::new(),
             new_cookie: String::new(),
+            new_auth_user: String::new(),
+            new_auth_pass: String::new(),
             show_add_panel: true,
             focus_url: false,
             output_probe: None,
             page_reset_done: false,
             pending_capture: None,
+            auth_prompt: None,
             popup_shared: Arc::new(std::sync::Mutex::new(PopupShared::blank())),
             logo: crate::icon::logo_texture(&cc.egui_ctx),
         }
@@ -420,6 +452,7 @@ impl RapidGrabApp {
                         capture.referer.clone(),
                         capture.cookies.clone(),
                         false,
+                        None,
                     );
                 }
                 self.show_add_panel = true;
@@ -461,6 +494,7 @@ impl RapidGrabApp {
                     capture.referer.clone(),
                     capture.cookies.clone(),
                     false,
+                    None,
                 );
             } else {
                 let size = capture.content_length;
@@ -521,11 +555,19 @@ impl RapidGrabApp {
     fn spawn_probe(&self, capture: rg_bridge::CaptureRequest) {
         let tx = self.probe_tx.clone();
         let rt = self.rt.clone();
+        let network = NetworkConfig {
+            proxy: self.settings.proxy.clone(),
+            credentials: None,
+        };
         rt.spawn(async move {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new());
+            let client = match network.client_for(&capture.url, 1).await {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::warn!("size probe skipped: {error}");
+                    let _ = tx.send((capture.url.clone(), None, None));
+                    return;
+                }
+            };
             let mut req = client.head(&capture.url);
             if let Some(ua) = &capture.user_agent {
                 req = req.header(reqwest::header::USER_AGENT, ua.as_str());
@@ -536,8 +578,8 @@ impl RapidGrabApp {
             if let Some(referer) = &capture.referer {
                 req = req.header(reqwest::header::REFERER, referer.as_str());
             }
-            let (size, ctype) = match req.send().await {
-                Ok(resp) if resp.status().is_success() => {
+            let (size, ctype) = match tokio::time::timeout(Duration::from_secs(10), req.send()).await {
+                Ok(Ok(resp)) if resp.status().is_success() => {
                     let size = resp
                         .headers()
                         .get(reqwest::header::CONTENT_LENGTH)
@@ -587,6 +629,7 @@ impl RapidGrabApp {
             capture.referer.clone(),
             capture.cookies.clone(),
             false,
+            None,
         );
         // `later` already queues (pump_queue starts when a slot is free, the
         // same as Start in this build; IDM starts a part immediately while
@@ -640,6 +683,8 @@ impl RapidGrabApp {
         let user_agent = non_empty(&self.new_user_agent);
         let referer = non_empty(&self.new_referer);
         let cookie = non_empty(&self.new_cookie);
+        let credentials = non_empty(&self.new_auth_user)
+            .map(|username| Credentials::new(username, self.new_auth_pass.clone()));
         let url = self.new_url.trim().to_string();
         let output = self.new_output.trim().to_string();
         let connections = self.new_connections.max(1);
@@ -654,6 +699,8 @@ impl RapidGrabApp {
         self.new_sha256.clear();
         self.new_referer.clear();
         self.new_cookie.clear();
+        self.new_auth_user.clear();
+        self.new_auth_pass.clear();
         // The next download starts from a clean form: re-suggest the save path
         // from the next URL instead of silently reusing this one, and never
         // carry a one-shot "ignore existing parts" flag into another job.
@@ -670,6 +717,7 @@ impl RapidGrabApp {
             referer,
             cookie,
             restart,
+            credentials,
         );
     }
 
@@ -687,12 +735,17 @@ impl RapidGrabApp {
         referer: Option<String>,
         cookie: Option<String>,
         restart: bool,
+        credentials: Option<Credentials>,
     ) {
         if url.trim().is_empty() || output.trim().is_empty() {
             return;
         }
         let id = self.next_id;
         self.next_id += 1;
+        let network = NetworkConfig {
+            proxy: self.settings.proxy.clone(),
+            credentials: credentials.filter(|credentials| !credentials.is_empty()),
+        };
         self.jobs.insert(
             id,
             DownloadJob {
@@ -707,6 +760,7 @@ impl RapidGrabApp {
                 referer,
                 cookie,
                 restart,
+                network,
                 status: JobStatus::Queued,
                 progress: None,
                 media: None,
@@ -763,6 +817,7 @@ impl RapidGrabApp {
                 job.referer.clone(),
                 job.cookie.clone(),
                 restart,
+                job.network.clone(),
             )
         }) else {
             return;
@@ -779,6 +834,7 @@ impl RapidGrabApp {
             referer,
             cookie,
             restart,
+            network,
         ) = params;
         let task_cancel = cancel.clone();
 
@@ -804,7 +860,8 @@ impl RapidGrabApp {
             let mut dl = Download::new(url.clone(), output.clone())
                 .connections(connections)
                 .resume(!restart)
-                .cancel_flag(task_cancel.clone());
+                .cancel_flag(task_cancel.clone())
+                .network(network.clone());
 
             if let Some(limit) = speed_limit {
                 dl = dl.speed_limit(limit);
@@ -875,6 +932,7 @@ impl RapidGrabApp {
                     let mut request = MediaRequest::new(url, output)
                         .connections(connections)
                         .restart(restart)
+                        .network(network.clone())
                         .extra_args(yt_dlp_args);
                     if let Some(limit) = speed_limit {
                         request = request.speed_limit(limit);
@@ -928,6 +986,57 @@ impl RapidGrabApp {
                             send(None, JobStatus::Failed, Some(error.to_string()), None, None);
                         }
                     }
+                }
+                Err(rg_core::Error::AuthRequired {
+                    status,
+                    host,
+                    realm,
+                    proxy,
+                }) => {
+                    let what = if proxy { "Proxy" } else { "The server" };
+                    let _ = tx.send(DownloadUpdate {
+                        id,
+                        run,
+                        progress: None,
+                        status: JobStatus::Failed,
+                        error: Some(format!(
+                            "{what} {host} requires a username and password (HTTP {status})"
+                        )),
+                        failure: FailureKind::AuthRequired {
+                            status,
+                            host,
+                            realm,
+                            proxy,
+                        },
+                        output: None,
+                        media: None,
+                        notice: None,
+                    });
+                }
+                Err(error) if matches!(error, rg_core::Error::FtpAuth(_)) => {
+                    let rg_core::Error::FtpAuth(detail) = error else {
+                        unreachable!()
+                    };
+                    let host = reqwest::Url::parse(&url)
+                        .ok()
+                        .and_then(|parsed| parsed.host_str().map(str::to_string))
+                        .unwrap_or_default();
+                    let _ = tx.send(DownloadUpdate {
+                        id,
+                        run,
+                        progress: None,
+                        status: JobStatus::Failed,
+                        error: Some(format!("The FTP server requires a login: {detail}")),
+                        failure: FailureKind::AuthRequired {
+                            status: 0,
+                            host,
+                            realm: None,
+                            proxy: false,
+                        },
+                        output: None,
+                        media: None,
+                        notice: None,
+                    });
                 }
                 Err(rg_core::Error::RemoteChanged) => {
                     let _ = tx.send(DownloadUpdate {
@@ -1084,6 +1193,12 @@ impl RapidGrabApp {
             job.notice = Some(notice);
         }
 
+        // A 401/407 opens the credentials dialog after the job is marked failed.
+        let auth_failure = match &update.failure {
+            FailureKind::AuthRequired { .. } => Some(update.failure.clone()),
+            _ => None,
+        };
+
         match update.status {
             JobStatus::Starting
             | JobStatus::Downloading
@@ -1142,6 +1257,20 @@ impl RapidGrabApp {
             }
             _ => {}
         }
+
+        if let Some(FailureKind::AuthRequired {
+            host, realm, proxy, ..
+        }) = auth_failure
+        {
+            self.auth_prompt = Some(AuthPrompt {
+                job_id: update.id,
+                host,
+                realm,
+                proxy,
+                username: String::new(),
+                password: String::new(),
+            });
+        }
     }
 
     fn handle_actions(&mut self, actions: Vec<Action>) {
@@ -1196,7 +1325,7 @@ impl RapidGrabApp {
                 progress: j.progress.clone(),
                 media: j.media.clone(),
                 error: j.error.clone(),
-                failure: j.failure,
+                failure: j.failure.clone(),
                 notice: j.notice.clone(),
                 speed_bps: if j.status.is_active() {
                     j.last_speed
@@ -1213,10 +1342,95 @@ impl RapidGrabApp {
     /// Opens the deferred Download viewport while a capture is pending.
     /// Called from `logic()` so it works even when the main window is
     /// minimized/hidden (immediate viewports require a visible parent pass).
+    /// Credentials dialog for a 401/407 failure. Signing in stores the values
+    /// on the job (and proxy settings for a 407) and retries it.
+    fn show_auth_prompt(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.auth_prompt.as_ref() else {
+            return;
+        };
+        let mut username = prompt.username.clone();
+        let mut password = prompt.password.clone();
+        let mut submit = false;
+        let mut cancel = false;
+
+        egui::Window::new("Authentication required")
+            .id(egui::Id::unique("rg-auth-prompt"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(340.0);
+                ui.spacing_mut().item_spacing.y = theme::SP_XS;
+                let target = if prompt.proxy { "proxy" } else { "server" };
+                ui.add(egui::Label::new(format!(
+                    "{} is asking for a {target} username and password.",
+                    prompt.host
+                )));
+                if let Some(realm) = &prompt.realm {
+                    ui.add(egui::Label::new(theme::caption_tertiary(&format!(
+                        "Realm: {realm}"
+                    ))));
+                }
+                ui.add_space(theme::SP_XS);
+                ui.add(egui::Label::new(theme::label("Username")));
+                widgets::text_field(
+                    ui,
+                    widgets::Field::new("rg-auth-user", "username"),
+                    &mut username,
+                );
+                ui.add(egui::Label::new(theme::label("Password")));
+                widgets::text_field(
+                    ui,
+                    widgets::Field::new("rg-auth-pass", "password").password(true),
+                    &mut password,
+                );
+                ui.add_space(theme::SP_S);
+                ui.horizontal(|ui| {
+                    if widgets::button(ui, "Cancel", widgets::ButtonKind::Secondary, true).clicked()
+                    {
+                        cancel = true;
+                    }
+                    if widgets::button(ui, "Sign in", widgets::ButtonKind::Primary, true).clicked()
+                    {
+                        submit = true;
+                    }
+                });
+            });
+
+        if submit {
+            let (job_id, proxy) = (prompt.job_id, prompt.proxy);
+            if let Some(job) = self.jobs.get_mut(&job_id) {
+                if proxy {
+                    job.network.proxy.username = username.clone();
+                    job.network.proxy.password = password.clone();
+                    // Future jobs should use the working proxy credentials too.
+                    self.settings.proxy.username = username;
+                    self.settings.proxy.password = password;
+                } else {
+                    job.network.credentials = Some(Credentials::new(username, password));
+                }
+                job.status = JobStatus::Queued;
+                job.error = None;
+                job.failure = FailureKind::Other;
+                job.notice = None;
+                job.started_at = None;
+            }
+            self.auth_prompt = None;
+            self.start_job(job_id);
+        } else if cancel {
+            self.auth_prompt = None;
+        }
+    }
+
+    /// Polls the update channel and forwards worker events to the job cards.
     fn show_capture_popup(&mut self, ctx: &egui::Context) {
         // Sync snapshot into the shared state the 'static callback renders.
         if let Some(pending) = &self.pending_capture {
-            let is_media_page = pending.capture.source.as_deref() == Some("media");
+            // A "media" capture is a page only when the URL carries no media
+            // file name: MSE players (Facebook) resolve to the sniffed CDN
+            // URL, which downloads directly just like any other file.
+            let is_media_page = pending.capture.source.as_deref() == Some("media")
+                && !rg_bridge::is_media_file_url(&pending.capture.url);
             let (size_label, type_label) = if is_media_page {
                 ("Video page".to_string(), "resolved on Start".to_string())
             } else {
@@ -1419,6 +1633,7 @@ impl eframe::App for RapidGrabApp {
             ffmpeg_path: self.settings.ffmpeg_path.clone(),
             yt_dlp_args: self.settings.yt_dlp_args.clone(),
             auto_start_hosts: self.settings.auto_start_hosts.clone(),
+            proxy: self.settings.proxy.clone(),
         };
         eframe::set_value(storage, SETTINGS_KEY, &settings);
     }
@@ -1439,6 +1654,7 @@ impl eframe::App for RapidGrabApp {
             }
         }
         self.pump_queue();
+        self.show_auth_prompt(&ctx);
 
         // Esc drops keyboard focus from the URL field (and any other input).
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
@@ -1819,6 +2035,28 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
                 },
             );
             ui.add_space(theme::SP_XS);
+            let auth_user = &mut app.new_auth_user;
+            let auth_pass = &mut app.new_auth_pass;
+            form_columns(
+                ui,
+                |ui| {
+                    ui.add(egui::Label::new(theme::label("Username (optional)")));
+                    widgets::text_field(
+                        ui,
+                        widgets::Field::new("rg-auth-site-user", "HTTP Basic auth"),
+                        auth_user,
+                    );
+                },
+                |ui| {
+                    ui.add(egui::Label::new(theme::label("Password (optional)")));
+                    widgets::text_field(
+                        ui,
+                        widgets::Field::new("rg-auth-site-pass", "password").password(true),
+                        auth_pass,
+                    );
+                },
+            );
+            ui.add_space(theme::SP_XS);
             widgets::checkbox(
                 ui,
                 "rg-restart",
@@ -1874,6 +2112,13 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
 
         widgets::divider(ui);
 
+        widgets::collapsible(ui, "rg-proxy", "Proxy", false, |ui| {
+            ui.spacing_mut().item_spacing.y = theme::SP_XS;
+            proxy_fields(ui, &mut app.settings.proxy);
+        });
+
+        widgets::divider(ui);
+
         if app.settings.auto_resolve {
             widgets::info_line(
                 ui,
@@ -1913,6 +2158,87 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
             app.focus_url = true;
         }
     }
+}
+
+/// Proxy mode plus the fields relevant to that mode.
+fn proxy_fields(ui: &mut egui::Ui, proxy: &mut ProxyConfig) {
+    const MODES: [(&str, ProxyMode); 3] = [
+        ("Direct (no proxy)", ProxyMode::Off),
+        ("System (WinHTTP/PAC)", ProxyMode::System),
+        ("Manual", ProxyMode::Manual),
+    ];
+    let selected = MODES
+        .iter()
+        .position(|(_, mode)| *mode == proxy.mode)
+        .unwrap_or(0);
+    let labels: Vec<&str> = MODES.iter().map(|(label, _)| *label).collect();
+    ui.horizontal(|ui| {
+        ui.add(egui::Label::new(theme::label("Mode")));
+        if let Some(index) =
+            widgets::dropdown(ui, "rg-proxy-mode", selected, &labels, theme::DROPDOWN_W)
+        {
+            proxy.mode = MODES[index].1;
+        }
+    });
+
+    match proxy.mode {
+        ProxyMode::Off => {
+            ui.add(egui::Label::new(theme::caption_tertiary(
+                "Connections go straight to the server, even when HTTP_PROXY is set.",
+            )));
+        }
+        ProxyMode::System => {
+            ui.add(egui::Label::new(theme::label("PAC URL (optional)")));
+            widgets::text_field(
+                ui,
+                widgets::Field::new("rg-proxy-pac", "use the Windows auto-config URL"),
+                &mut proxy.pac_url,
+            );
+        }
+        ProxyMode::Manual => {
+            ui.add(egui::Label::new(theme::label("Proxy address")));
+            widgets::text_field(
+                ui,
+                widgets::Field::new("rg-proxy-url", "host:port, http://… or socks5://…"),
+                &mut proxy.url,
+            );
+            ui.add_space(theme::SP_XS);
+            let user = &mut proxy.username;
+            let pass = &mut proxy.password;
+            form_columns(
+                ui,
+                |ui| {
+                    ui.add(egui::Label::new(theme::label("Username (optional)")));
+                    widgets::text_field(
+                        ui,
+                        widgets::Field::new("rg-proxy-user", "proxy user"),
+                        user,
+                    );
+                },
+                |ui| {
+                    ui.add(egui::Label::new(theme::label("Password (optional)")));
+                    widgets::text_field(
+                        ui,
+                        widgets::Field::new("rg-proxy-pass", "proxy password").password(true),
+                        pass,
+                    );
+                },
+            );
+        }
+    }
+
+    if proxy.mode != ProxyMode::Off {
+        ui.add_space(theme::SP_XS);
+        ui.add(egui::Label::new(theme::label("Bypass list (optional)")));
+        widgets::text_field(
+            ui,
+            widgets::Field::new("rg-proxy-bypass", "localhost, 127.0.0.1, *.internal"),
+            &mut proxy.no_proxy,
+        );
+    }
+    ui.add(egui::Label::new(theme::caption_tertiary(
+        "Stored in plain text in the app settings; proxy auth uses HTTP Basic.",
+    )));
 }
 
 /// Two fields side by side when there is room; stacked below

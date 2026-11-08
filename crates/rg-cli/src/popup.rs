@@ -149,7 +149,11 @@ impl eframe::App for PopupApp {
             self.finish(&ctx, None);
         }
         let probe = self.probe.lock().unwrap().clone();
-        let is_media_page = self.capture.source.as_deref() == Some("media");
+        // A "media" capture is a page only when its URL carries no media file
+        // name. MSE players (Facebook) resolve to the sniffed CDN stream URL,
+        // which is a direct download just like any other file.
+        let is_media_page = self.capture.source.as_deref() == Some("media")
+            && !rg_bridge::is_media_file_url(&self.capture.url);
         let (size_label, type_label) = if is_media_page {
             ("Video page".to_string(), "resolved on Start".to_string())
         } else {
@@ -304,16 +308,42 @@ fn spawn_probe(capture: CaptureRequest, probe: Arc<Mutex<ProbeState>>) {
     });
 }
 
-fn main() -> Result<()> {
-    let capture = rg_bridge::read_frame(std::io::stdin())?;
-
-    let display_name = capture
+/// Title and default file name for a capture.
+///
+/// The browser-provided name wins; when it is missing (sniffed CDN streams)
+/// fall back to the last URL path segment, which is a real file name such as
+/// `AQM…ZA.mp4`. The whole URL is printed above the title anyway, so keeping
+/// it there as well adds nothing.
+fn display_name_for(capture: &CaptureRequest) -> String {
+    if let Some(name) = capture
         .content_disposition_filename
         .as_deref()
         .filter(|s| !s.trim().is_empty())
-        .or(capture.filename.as_deref().filter(|s| !s.trim().is_empty()))
-        .unwrap_or(&capture.url)
-        .to_string();
+    {
+        return name.to_string();
+    }
+    if let Some(name) = capture
+        .filename
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return name.to_string();
+    }
+    let path = capture.url.split(['?', '#']).next().unwrap_or("");
+    if let Some(segment) = path.rsplit('/').find(|part| !part.is_empty()) {
+        if let Some(dot) = segment.rfind('.') {
+            if dot > 0 && segment.len() > dot + 1 {
+                return segment.to_string();
+            }
+        }
+    }
+    capture.url.clone()
+}
+
+fn main() -> Result<()> {
+    let capture = rg_bridge::read_frame(std::io::stdin())?;
+
+    let display_name = display_name_for(&capture);
     let output = capture
         .output
         .clone()

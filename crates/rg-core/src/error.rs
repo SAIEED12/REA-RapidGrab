@@ -12,6 +12,20 @@ pub enum Error {
     BadStatus(u16),
     #[error("server does not support range requests")]
     NoRangeSupport,
+    #[error("authentication required (HTTP {status}) for {host}")]
+    AuthRequired {
+        status: u16,
+        host: String,
+        realm: Option<String>,
+        /// True for a proxy challenge (407), false for an origin challenge (401).
+        proxy: bool,
+    },
+    #[error("FTP error: {0}")]
+    Ftp(String),
+    #[error("FTP server rejected the login: {0}")]
+    FtpAuth(String),
+    #[error("proxy error: {0}")]
+    Proxy(String),
     #[error("remote file changed since the partial download was created")]
     RemoteChanged,
     #[error("cannot resume: {0}")]

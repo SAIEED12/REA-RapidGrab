@@ -522,6 +522,7 @@ pub struct Field<'a> {
     suffix: Option<&'a str>,
     invalid: bool,
     dim_hint: bool,
+    password: bool,
     height: f32,
     width: Option<f32>,
 }
@@ -535,6 +536,7 @@ impl<'a> Field<'a> {
             suffix: None,
             invalid: false,
             dim_hint: false,
+            password: false,
             height: FIELD_H,
             width: None,
         }
@@ -559,6 +561,13 @@ impl<'a> Field<'a> {
 
     pub fn invalid(mut self, invalid: bool) -> Self {
         self.invalid = invalid;
+        self
+    }
+
+    /// Mask the value (proxy passwords, credentials). The hint is still shown
+    /// while the field is empty.
+    pub fn password(mut self, password: bool) -> Self {
+        self.password = password;
         self
     }
 
@@ -625,7 +634,8 @@ pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldRespo
                 .frame(egui::Frame::NONE)
                 .margin(egui::Margin::ZERO)
                 .align(egui::Align2::LEFT_CENTER)
-                .text_color(TEXT),
+                .text_color(TEXT)
+                .password(field.password),
         );
 
         if buf.is_empty() && !response.has_focus() {

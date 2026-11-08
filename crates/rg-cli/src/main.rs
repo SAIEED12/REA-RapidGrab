@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use rg_core::{Download, Progress};
+use rg_core::{Download, NetworkConfig, Progress, ProxyConfig, ProxyMode};
 use rg_resolve::{MediaEvent, MediaRequest, MediaStage, Tools};
 
 #[derive(Parser)]
@@ -40,6 +40,30 @@ enum Command {
         /// Override the User-Agent header
         #[arg(long)]
         user_agent: Option<String>,
+        /// Manual proxy endpoint (`host:port`, `http://…`, `socks5://…`)
+        #[arg(long, value_name = "URL")]
+        proxy: Option<String>,
+        /// Proxy username (Basic auth)
+        #[arg(long, value_name = "USER")]
+        proxy_user: Option<String>,
+        /// Proxy password (Basic auth)
+        #[arg(long, value_name = "PASS")]
+        proxy_pass: Option<String>,
+        /// HTTP Basic username for the download itself
+        #[arg(long, value_name = "USER")]
+        user: Option<String>,
+        /// HTTP Basic password for the download itself
+        #[arg(long, value_name = "PASS")]
+        password: Option<String>,
+        /// Use the Windows system proxy (WinHTTP, including PAC/WPAD)
+        #[arg(long)]
+        system_proxy: bool,
+        /// Explicit PAC URL used with --system-proxy
+        #[arg(long, value_name = "URL")]
+        pac: Option<String>,
+        /// Hosts that bypass the proxy (comma or space separated)
+        #[arg(long, value_name = "LIST")]
+        no_proxy: Option<String>,
         /// Save HTML pages instead of refusing them as web pages
         #[arg(long)]
         allow_html: bool,
@@ -97,6 +121,14 @@ async fn main() -> Result<()> {
             restart,
             sha256,
             user_agent,
+            proxy,
+            proxy_user,
+            proxy_pass,
+            user,
+            password,
+            system_proxy,
+            pac,
+            no_proxy,
             allow_html,
             no_resolve,
             max_height,
@@ -104,6 +136,16 @@ async fn main() -> Result<()> {
             ffmpeg,
             yt_dlp_args,
         } => {
+            let network = network_config(
+                proxy,
+                proxy_user,
+                proxy_pass,
+                user,
+                password,
+                system_proxy,
+                pac,
+                no_proxy,
+            );
             let direct = direct_download(
                 &url,
                 &output,
@@ -113,6 +155,7 @@ async fn main() -> Result<()> {
                 sha256.as_deref(),
                 user_agent.as_deref(),
                 allow_html,
+                &network,
             )
             .await;
 
@@ -142,6 +185,7 @@ async fn main() -> Result<()> {
                     let mut request = MediaRequest::new(url.clone(), output)
                         .connections(connections)
                         .restart(restart)
+                        .network(network.clone())
                         .extra_args(yt_dlp_args);
                     if limit > 0 {
                         request = request.speed_limit(limit);
@@ -267,6 +311,37 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Turn the proxy flags into the engine's network configuration.
+fn network_config(
+    proxy: Option<String>,
+    proxy_user: Option<String>,
+    proxy_pass: Option<String>,
+    user: Option<String>,
+    password: Option<String>,
+    system_proxy: bool,
+    pac: Option<String>,
+    no_proxy: Option<String>,
+) -> NetworkConfig {
+    let mut config = ProxyConfig::default();
+    if let Some(url) = proxy.filter(|value| !value.trim().is_empty()) {
+        config.mode = ProxyMode::Manual;
+        config.url = url;
+    } else if system_proxy {
+        config.mode = ProxyMode::System;
+    }
+    config.username = proxy_user.unwrap_or_default();
+    config.password = proxy_pass.unwrap_or_default();
+    config.pac_url = pac.unwrap_or_default();
+    config.no_proxy = no_proxy.unwrap_or_default();
+    let credentials = user
+        .filter(|value| !value.trim().is_empty())
+        .map(|username| rg_core::Credentials::new(username, password.unwrap_or_default()));
+    NetworkConfig {
+        proxy: config,
+        credentials,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn direct_download(
     url: &str,
@@ -277,11 +352,13 @@ async fn direct_download(
     sha256: Option<&str>,
     user_agent: Option<&str>,
     allow_html: bool,
+    network: &NetworkConfig,
 ) -> std::result::Result<rg_core::Stats, rg_core::Error> {
     let mut dl = Download::new(url.to_string(), output)
         .connections(connections)
         .resume(!restart)
-        .allow_html(allow_html);
+        .allow_html(allow_html)
+        .network(network.clone());
     if limit > 0 {
         dl = dl.speed_limit(limit);
     }

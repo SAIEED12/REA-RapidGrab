@@ -228,8 +228,9 @@
         suppressClick = false;
         return;
       }
-      const url = mediaUrlFor(video) || location.href;
-      if (!url) return;
+      // Empty when the player is MSE (blob:): the service worker resolves
+      // it to the most recent media response it saw for this tab.
+      const url = mediaUrlFor(video) || "";
       api.runtime
         .sendMessage({
           type: "rapidgrab-media",

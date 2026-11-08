@@ -5,6 +5,7 @@ use reqwest::header::{
 use reqwest::StatusCode;
 
 use crate::error::{Error, Result};
+use crate::net::{auth_required, Credentials};
 
 /// Result of the capability probe: what the server will let us do.
 #[derive(Debug, Clone)]
@@ -37,23 +38,31 @@ fn content_length_header(resp: &reqwest::Response) -> u64 {
 /// This mirrors the capability discovery IDM performs with its first plain GET,
 /// but avoids downloading a body when the server supports HEAD.
 pub async fn probe(client: &reqwest::Client, url: &str, user_agent: &str) -> Result<Probe> {
-    probe_with(client, url, user_agent, None).await
+    probe_with(client, url, user_agent, None, None).await
 }
 
-/// Like [`probe`], with an optional `Cookie` header for browser captures.
+/// Like [`probe`], with optional `Cookie` and HTTP Basic credentials for
+/// browser captures and password-protected files.
 pub async fn probe_with(
     client: &reqwest::Client,
     url: &str,
     user_agent: &str,
     cookie: Option<&str>,
+    auth: Option<&Credentials>,
 ) -> Result<Probe> {
     let mut head = client.head(url).header(USER_AGENT, user_agent);
     if let Some(c) = cookie {
         head = head.header(COOKIE, c);
     }
+    if let Some(auth) = auth.filter(|auth| !auth.is_empty()) {
+        head = head.basic_auth(&auth.username, Some(&auth.password));
+    }
     let head = head.send().await;
 
     if let Ok(resp) = head {
+        if let Some(error) = auth_required(&resp, url) {
+            return Err(error);
+        }
         if resp.status().is_success() {
             let total = content_length_header(&resp);
             let accept = header_str(&resp, ACCEPT_RANGES)
@@ -68,7 +77,14 @@ pub async fn probe_with(
                     if let Some(c) = cookie {
                         range_probe = range_probe.header(COOKIE, c);
                     }
+                    if let Some(auth) = auth.filter(|auth| !auth.is_empty()) {
+                        range_probe =
+                            range_probe.basic_auth(&auth.username, Some(&auth.password));
+                    }
                     let range_probe = range_probe.send().await?;
+                    if let Some(error) = auth_required(&range_probe, url) {
+                        return Err(error);
+                    }
                     if range_probe.status() != StatusCode::PARTIAL_CONTENT {
                         return Ok(Probe {
                             final_url: resp.url().to_string(),
@@ -102,8 +118,14 @@ pub async fn probe_with(
     if let Some(c) = cookie {
         get = get.header(COOKIE, c);
     }
+    if let Some(auth) = auth.filter(|auth| !auth.is_empty()) {
+        get = get.basic_auth(&auth.username, Some(&auth.password));
+    }
     let resp = get.send().await?;
 
+    if let Some(error) = auth_required(&resp, url) {
+        return Err(error);
+    }
     let status = resp.status();
     if status != StatusCode::PARTIAL_CONTENT && !status.is_success() {
         return Err(Error::BadStatus(status.as_u16()));

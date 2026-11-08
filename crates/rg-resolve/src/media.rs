@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rg_core::{Download, Error as CoreError, Progress};
+use rg_core::{Download, Error as CoreError, NetworkConfig, Progress};
 
 use crate::error::{ResolveError, Result};
 use crate::metadata::{self, SelectedStream, Selection};
@@ -29,6 +29,8 @@ pub struct MediaRequest {
     pub cancel: Option<Arc<AtomicBool>>,
     /// Extra arguments passed to `yt-dlp` (for example cookies).
     pub extra_args: Vec<String>,
+    /// Proxy settings applied to every stream download.
+    pub network: NetworkConfig,
 }
 
 impl MediaRequest {
@@ -42,6 +44,7 @@ impl MediaRequest {
             restart: false,
             cancel: None,
             extra_args: Vec::new(),
+            network: NetworkConfig::default(),
         }
     }
 
@@ -72,6 +75,12 @@ impl MediaRequest {
 
     pub fn extra_args(mut self, args: impl IntoIterator<Item = String>) -> Self {
         self.extra_args = args.into_iter().collect();
+        self
+    }
+
+    /// Proxy settings for the stream downloads (not for yt-dlp itself).
+    pub fn network(mut self, network: NetworkConfig) -> Self {
+        self.network = network;
         self
     }
 }
@@ -336,6 +345,7 @@ async fn run_stream(
     let mut dl = Download::new(stream.url.clone(), output.to_path_buf())
         .connections(request.connections)
         .resume(!request.restart)
+        .network(request.network.clone())
         .resume_key(resume_key);
 
     if let Some(limit) = request.speed_limit {

@@ -26,6 +26,7 @@ use tracing::{info, warn};
 use crate::error::{Error, Result};
 use crate::limiter::Limiter;
 use crate::manifest::{parts_dir_for, Manifest, Segment, MANIFEST_VERSION};
+use crate::net::{Credentials, NetworkConfig};
 use crate::probe;
 
 pub const DEFAULT_CONNECTIONS: usize = 8;
@@ -80,6 +81,7 @@ pub struct Download {
     on_progress: Option<ProgressFn>,
     cancel: Option<Arc<AtomicBool>>,
     allow_html: bool,
+    network: NetworkConfig,
 }
 
 impl Download {
@@ -100,6 +102,7 @@ impl Download {
             on_progress: None,
             cancel: None,
             allow_html: false,
+            network: NetworkConfig::default(),
         }
     }
 
@@ -192,6 +195,12 @@ impl Download {
         self
     }
 
+    /// Proxy and other network-layer settings for this download.
+    pub fn network(mut self, network: NetworkConfig) -> Self {
+        self.network = network;
+        self
+    }
+
     pub async fn run(self) -> Result<Stats> {
         let started = Instant::now();
         let cancel = self.cancel.clone();
@@ -199,13 +208,31 @@ impl Download {
             return Err(Error::Cancelled);
         }
         let expected_sha256 = self.expected_sha256.clone();
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(20))
-            .pool_max_idle_per_host(self.connections)
-            .build()?;
 
-        let p =
-            probe::probe_with(&client, &self.url, &self.user_agent, self.cookie.as_deref()).await?;
+        // FTP has its own path; everything below is HTTP-only.
+        if let Ok(scheme_url) = reqwest::Url::parse(&self.url) {
+            match scheme_url.scheme() {
+                "ftp" => return self.run_ftp(started, cancel, expected_sha256).await,
+                "ftps" => return Err(Error::Ftp("ftps:// is not supported".into())),
+                _ => {}
+            }
+        }
+
+        let client = self.network.client_for(&self.url, self.connections).await?;
+        let credentials = self
+            .network
+            .credentials
+            .clone()
+            .filter(|credentials| !credentials.is_empty());
+
+        let p = probe::probe_with(
+            &client,
+            &self.url,
+            &self.user_agent,
+            self.cookie.as_deref(),
+            credentials.as_ref(),
+        )
+        .await?;
         info!(
             "probe: size={} ranges={} etag={:?} type={:?}",
             p.total, p.accept_ranges, p.etag, p.content_type
@@ -252,6 +279,7 @@ impl Download {
                 &self.user_agent,
                 referer.as_deref(),
                 self.cookie.as_deref(),
+                credentials.as_ref(),
                 p.total,
                 self.speed_limit,
                 cancel.clone(),
@@ -351,6 +379,7 @@ impl Download {
             range_unsupported: AtomicBool::new(false),
             on_progress: self.on_progress.clone(),
             cancel: cancel.clone(),
+            credentials: credentials.clone(),
         });
 
         {
@@ -427,6 +456,7 @@ impl Download {
                 &sh.user_agent,
                 sh.referer.as_deref(),
                 sh.cookie.as_deref(),
+                sh.credentials.as_ref(),
                 sh.total,
                 self.speed_limit,
                 cancel.clone(),
@@ -456,6 +486,33 @@ impl Download {
             ranged: true,
             output,
         })
+    }
+
+    /// FTP path: single data connection with REST resume.
+    async fn run_ftp(
+        self,
+        started: Instant,
+        cancel: Option<Arc<AtomicBool>>,
+        expected_sha256: Option<String>,
+    ) -> Result<Stats> {
+        let credentials = self.network.credentials.clone();
+        let output = self.output.clone();
+        let url = self.url.clone();
+        let stats = crate::ftp::download(
+            &url,
+            &output,
+            self.speed_limit,
+            credentials.as_ref(),
+            cancel.clone(),
+            self.on_progress.clone(),
+            started,
+            self.resume,
+        )
+        .await?;
+        if let Some(expected) = &expected_sha256 {
+            verify_sha256(&output, expected, cancel.as_ref()).await?;
+        }
+        Ok(stats)
     }
 }
 
@@ -487,6 +544,7 @@ struct Shared {
     range_unsupported: AtomicBool,
     on_progress: Option<ProgressFn>,
     cancel: Option<Arc<AtomicBool>>,
+    credentials: Option<Credentials>,
 }
 
 fn is_cancelled(flag: Option<&Arc<AtomicBool>>) -> bool {
@@ -700,8 +758,14 @@ async fn stream_range(
     if let Some(etag) = &sh.etag {
         req = req.header(IF_RANGE, etag.as_str());
     }
+    if let Some(auth) = &sh.credentials {
+        req = req.basic_auth(&auth.username, Some(&auth.password));
+    }
 
     let resp = req.send().await?;
+    if let Some(error) = crate::net::auth_required(&resp, &sh.url) {
+        return Err(error);
+    }
     if resp.status() == StatusCode::OK {
         sh.range_unsupported.store(true, Ordering::SeqCst);
         sh.finished.store(true, Ordering::SeqCst);
@@ -811,6 +875,7 @@ async fn single_stream(
     user_agent: &str,
     referer: Option<&str>,
     cookie: Option<&str>,
+    credentials: Option<&Credentials>,
     total_hint: u64,
     speed_limit: Option<u64>,
     cancel: Option<Arc<AtomicBool>>,
@@ -829,7 +894,14 @@ async fn single_stream(
         Some(cookie) => resp.header(COOKIE, cookie),
         None => resp,
     };
+    let resp = match credentials {
+        Some(auth) => resp.basic_auth(&auth.username, Some(&auth.password)),
+        None => resp,
+    };
     let resp = resp.send().await?;
+    if let Some(error) = crate::net::auth_required(&resp, url) {
+        return Err(error);
+    }
     if !resp.status().is_success() {
         return Err(Error::BadStatus(resp.status().as_u16()));
     }
