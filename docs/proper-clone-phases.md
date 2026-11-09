@@ -39,13 +39,14 @@ with credentials), `tests/ftp.rs` (anonymous/credentials/wrong-password/PASV
 fallback/REST resume); proxied-HTTPS and System-mode verified manually on a
 real proxy (docs in README §6).
 
-## Phase 4 — Productivity (1–2 weeks)
-- Scheduler: timed start/stop, hibernate/sleep after queue, daily MB limits.
-- Queue UI: Start/Stop Queue, per-item priority.
-- Categories: Compressed/Documents/Music/Programs/Video auto-bucket + per-category Save-to.
-- History + log persisted across sessions.
+## Phase 4 — Productivity (1–2 weeks) ✅ DONE
+- Scheduler: timed start/stop, hibernate/sleep after queue, daily MB limits. ✅ Window (HH:MM start/stop, crosses midnight) auto starts/stops the queue; after-queue Sleep/Hibernate/Shut down via `rundll32`/`shutdown.exe`; daily MB cap pauses the queue at the limit and resets at midnight (`%APPDATA%\RapidGrab\usage.json`). New `crates/rg-config` crate holds the shared config, queue, history and usage files.
+- Queue UI: Start/Stop Queue, per-item priority. ✅ Header toggle persists to `settings.json`; per-card priority cycles Low→Normal→High and `pump_queue()` runs High first; pending jobs persist to `queue.json` and restore as Queued on launch.
+- Categories: Compressed/Documents/Music/Programs/Video auto-bucket + per-category Save-to. ✅ `Category::from_filename`/`from_content_type` in `rg-config`; routing applies in the GUI suggestions and the standalone popup (both read `settings.json`), with per-category folder overrides in the Categories settings section.
+- History + log persisted across sessions. ✅ Append-only `history.jsonl` (rotated at 5000 lines) with a History page (Open/Folder/Retry/Copy URL/Clear); daily rolling log under `logs\` via `tracing-appender`.
 
-Gate: schedule an overnight queue; category auto-routing verified.
+Gate: schedule an overnight queue; category auto-routing verified. ✅ (manual: set Scheduler 22:00–06:00 + Sleep; add an MP4 and a ZIP and check `Downloads\Video` / `Downloads\Compressed`; restart the GUI — queue and history survive.)
+`crates/rg-config/tests` — category mapping, schedule windows incl. midnight crossing, priority ordering, atomic config round-trip.
 
 ## Phase 5 — Site Grabber + media (1 week)
 - Grabber crawler: site URL + rules → same-domain crawl, file-type filter → project list → batch download.

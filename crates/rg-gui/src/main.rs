@@ -9,11 +9,19 @@ use eframe::egui;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> eframe::Result<()> {
+    // Daily rolling file log under %APPDATA%\RapidGrab\logs\ (Phase 4), in
+    // addition to the console logger in debug builds.
+    let log_dir = rg_config::logs_dir();
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file_appender = tracing_appender::rolling::daily(log_dir, "rapidgrab.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("rg_core=info,rg_gui=info")),
         )
+        .with_writer(non_blocking)
+        .with_ansi(false)
         .init();
 
     let native_options = eframe::NativeOptions {

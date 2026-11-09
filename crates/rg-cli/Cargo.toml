@@ -21,6 +21,7 @@ path = "src/popup.rs"
 rg-core = { path = "../rg-core" }
 rg-resolve = { path = "../rg-resolve" }
 rg-bridge = { path = "../rg-bridge" }
+rg-config = { path = "../rg-config" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 clap = { version = "4", features = ["derive"] }
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
@@ -29,3 +30,4 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4" }

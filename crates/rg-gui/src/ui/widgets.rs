@@ -523,6 +523,8 @@ pub struct Field<'a> {
     invalid: bool,
     dim_hint: bool,
     password: bool,
+    frameless: bool,
+    title: bool,
     height: f32,
     width: Option<f32>,
 }
@@ -537,9 +539,26 @@ impl<'a> Field<'a> {
             invalid: false,
             dim_hint: false,
             password: false,
+            frameless: false,
+            title: false,
             height: FIELD_H,
             width: None,
         }
+    }
+
+    /// Borderless title-style field (the popup's editable file name): no
+    /// filled surface, accent underline on focus, 16px semibold text, and
+    /// auto-width from the current value unless width() is set.
+    pub fn frameless(mut self) -> Self {
+        self.frameless = true;
+        self.height = 28.0;
+        self
+    }
+
+    /// Render the text at title size (16px semibold) instead of body size.
+    pub fn title(mut self) -> Self {
+        self.title = true;
+        self
     }
 
     /// Paints the placeholder one step dimmer than a normal hint, for fields
@@ -599,13 +618,27 @@ const HINT_COLOR_DIM: Color32 = Color32::from_rgba_premultiplied(0x66, 0x66, 0x6
 /// is unfocused, the hint is painted in a dim colour so it can never be
 /// mistaken for a real value.
 pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldResponse {
-    let width = field.width.unwrap_or_else(|| ui.available_width());
+    let font = if field.title {
+        FontId::new(SECTION_SIZE, semibold_family())
+    } else {
+        FontId::new(BODY_SIZE, proportional())
+    };
+    let width = field.width.unwrap_or_else(|| {
+        if field.frameless {
+            // Auto-size to the current value so the name field hugs its text.
+            text_width(ui, buf, font.clone()).max(80.0) + SP_S
+        } else {
+            ui.available_width()
+        }
+    });
 
     ui.push_id(field.id, |ui| {
         let (rect, background) =
             ui.allocate_exact_size(Vec2::new(width, field.height), Sense::click());
         let painter = ui.painter().clone();
-        painter.rect_filled(rect, CornerRadius::same(R_SMALL as u8), CONTROL);
+        if !field.frameless {
+            painter.rect_filled(rect, CornerRadius::same(R_SMALL as u8), CONTROL);
+        }
 
         let icon_w = if field.icon.is_some() {
             FIELD_ICON_W
@@ -617,8 +650,9 @@ pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldRespo
             .map(|s| text_width(ui, s, FontId::new(CAPTION_SIZE, proportional())) + SP_S)
             .unwrap_or(0.0);
 
-        let left = rect.left() + SP_M + icon_w;
-        let right = rect.right() - SP_M - suffix_w;
+        // Frameless fields start flush at the left edge (no padding).
+        let left = rect.left() + if field.frameless { SP_S } else { SP_M + icon_w };
+        let right = rect.right() - if field.frameless { SP_S } else { SP_M + suffix_w };
         let text_rect = Rect::from_min_max(
             egui::pos2(left, rect.center().y - (field.height * 0.5).min(16.0)),
             egui::pos2(
@@ -643,7 +677,7 @@ pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldRespo
                 egui::pos2(left, rect.center().y),
                 Align2::LEFT_CENTER,
                 field.hint,
-                FontId::new(BODY_SIZE, proportional()),
+                font.clone(),
                 if field.dim_hint {
                     HINT_COLOR_DIM
                 } else {
@@ -672,28 +706,52 @@ pub fn text_field(ui: &mut Ui, field: Field<'_>, buf: &mut String) -> FieldRespo
         }
 
         let focused = response.has_focus();
-        let (color, width_px) = if field.invalid {
-            (ERROR, 1.5)
-        } else if focused {
-            (ACCENT, 1.5)
+        if field.frameless {
+            // Underline only: accent on focus, border on hover, nothing at
+            // rest — the text is the only thing floating on the card.
+            let underline = if field.invalid {
+                Some(ERROR)
+            } else if focused {
+                Some(ACCENT)
+            } else if response.hovered() {
+                Some(STROKE)
+            } else {
+                None
+            };
+            if let Some(color) = underline {
+                let y = rect.bottom() - 1.0;
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + 1.0, y),
+                        egui::pos2(rect.right() - 1.0, y),
+                    ],
+                    Stroke::new(2.0_f32, color),
+                );
+            }
         } else {
-            (STROKE_CONTROL, 1.0_f32)
-        };
-        painter.rect_stroke(
-            rect,
-            CornerRadius::same(R_SMALL as u8),
-            Stroke::new(width_px, color),
-            egui::StrokeKind::Middle,
-        );
-        if focused && !field.invalid {
-            let y = rect.bottom() - 1.5;
-            painter.line_segment(
-                [
-                    egui::pos2(rect.left() + R_SMALL, y),
-                    egui::pos2(rect.right() - R_SMALL, y),
-                ],
-                Stroke::new(2.0_f32, ACCENT),
+            let (color, width_px) = if field.invalid {
+                (ERROR, 1.5)
+            } else if focused {
+                (ACCENT, 1.5)
+            } else {
+                (STROKE_CONTROL, 1.0_f32)
+            };
+            painter.rect_stroke(
+                rect,
+                CornerRadius::same(R_SMALL as u8),
+                Stroke::new(width_px, color),
+                egui::StrokeKind::Middle,
             );
+            if focused && !field.invalid {
+                let y = rect.bottom() - 1.5;
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + R_SMALL, y),
+                        egui::pos2(rect.right() - R_SMALL, y),
+                    ],
+                    Stroke::new(2.0_f32, ACCENT),
+                );
+            }
         }
 
         if background.clicked() {
@@ -795,30 +853,33 @@ pub fn checkbox(ui: &mut Ui, id_salt: &str, checked: &mut bool, label: &str) -> 
             if enabled { ON_ACCENT } else { TEXT_DISABLED },
         );
     } else {
+        // Visible CONTROL fill + 1px border with strong contrast on the
+        // dark card (unchecked state must read at a glance).
+        painter.rect_filled(box_rect, CornerRadius::same(R_SMALL as u8), CONTROL);
         if pressed {
             painter.rect_filled(
                 box_rect,
                 CornerRadius::same(R_SMALL as u8),
-                mix(transparent(), TEXT, 0.12),
+                mix(CONTROL, TEXT, 0.12),
             );
         } else if t > 0.0 {
             painter.rect_filled(
                 box_rect,
                 CornerRadius::same(R_SMALL as u8),
-                mix(transparent(), TEXT, 0.06 * t),
+                mix(CONTROL, TEXT, 0.06 * t),
             );
         }
         let stroke = if !enabled {
             TEXT_DISABLED
         } else if hovered {
-            TEXT_SECONDARY
+            TEXT
         } else {
-            TEXT_TERTIARY
+            TEXT_SECONDARY
         };
         painter.rect_stroke(
             box_rect,
             CornerRadius::same(R_SMALL as u8),
-            Stroke::new(1.0_f32, stroke),
+            Stroke::new(1.5_f32, stroke),
             egui::StrokeKind::Middle,
         );
     }

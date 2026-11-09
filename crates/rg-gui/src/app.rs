@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
+use rg_config::{AfterAction, AppConfig, Category, Priority};
 use rg_core::{Credentials, Download, NetworkConfig, Progress, ProxyConfig, ProxyMode};
 use rg_resolve::{MediaEvent, MediaProgress, MediaRequest, MediaStage, Tools};
 use serde::{Deserialize, Serialize};
@@ -118,6 +119,11 @@ pub struct DownloadJob {
     pub intent: Option<CancelIntent>,
     pub remove_after_stop: bool,
     pub handle: Option<JoinHandle<()>>,
+    /// Queue priority (High runs first) and auto-bucket category.
+    pub priority: Priority,
+    pub category: Category,
+    /// History entry already written for the current terminal state.
+    pub history_recorded: bool,
 }
 
 impl DownloadJob {
@@ -142,6 +148,8 @@ struct JobView {
     /// Smoothed transfer rate for the detail line and the header total.
     speed_bps: f64,
     elapsed: Duration,
+    priority: Priority,
+    category: Category,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,9 +177,35 @@ struct Settings {
     /// streams. Captured per job when the job is created.
     #[serde(default)]
     proxy: ProxyConfig,
+    // --- Phase 4: productivity (mirrored to rg-config settings.json) ---
+    /// Route new downloads into per-category folders.
+    #[serde(default = "default_organize")]
+    organize_by_category: bool,
+    /// Per-category save folders; missing entries use the defaults.
+    #[serde(default)]
+    category_dirs: std::collections::HashMap<Category, String>,
+    /// Global queue pause (Start/Stop Queue + scheduler stops).
+    #[serde(default)]
+    queue_paused: bool,
+    /// Daily download allowance in megabytes; 0 = unlimited.
+    #[serde(default)]
+    daily_limit_mb: usize,
+    /// Scheduler: run the queue only inside the window.
+    #[serde(default)]
+    schedule_enabled: bool,
+    #[serde(default)]
+    schedule_start: String,
+    #[serde(default)]
+    schedule_stop: String,
+    #[serde(default)]
+    after_queue: AfterAction,
 }
 
 fn default_auto_resolve() -> bool {
+    true
+}
+
+fn default_organize() -> bool {
     true
 }
 
@@ -196,6 +230,14 @@ impl Default for Settings {
             yt_dlp_args: String::new(),
             auto_start_hosts: Vec::new(),
             proxy: ProxyConfig::default(),
+            organize_by_category: default_organize(),
+            category_dirs: std::collections::HashMap::new(),
+            queue_paused: false,
+            daily_limit_mb: 0,
+            schedule_enabled: false,
+            schedule_start: String::new(),
+            schedule_stop: String::new(),
+            after_queue: AfterAction::None,
         }
     }
 }
@@ -209,6 +251,13 @@ enum Action {
     Retry(usize),
     Restart(usize),
     Remove(usize),
+    CyclePriority(usize),
+    ToggleQueue,
+    ToggleHistory,
+    HistoryRetry(usize),
+    HistoryOpen(usize),
+    HistoryFolder(usize),
+    ClearHistory,
 }
 
 pub struct RapidGrabApp {
@@ -216,8 +265,8 @@ pub struct RapidGrabApp {
     update_rx: Receiver<DownloadUpdate>,
     update_tx: Sender<DownloadUpdate>,
     capture_rx: Receiver<rg_bridge::CaptureRequest>,
-    probe_rx: Receiver<(String, Option<u64>, Option<String>)>,
-    probe_tx: Sender<(String, Option<u64>, Option<String>)>,
+    probe_rx: Receiver<(String, Option<u64>, Option<String>, bool)>,
+    probe_tx: Sender<(String, Option<u64>, Option<String>, bool)>,
     #[allow(dead_code)]
     pipe_guard: Option<rg_bridge::PipeGuard>,
     jobs: HashMap<usize, DownloadJob>,
@@ -254,6 +303,14 @@ pub struct RapidGrabApp {
     /// Shared snapshot for the deferred popup viewport ('static callback).
     popup_shared: Arc<std::sync::Mutex<PopupShared>>,
 
+    /// Phase 4: history page + scheduler state.
+    show_history: bool,
+    history_cache: Vec<rg_config::HistoryEntry>,
+    /// Set while the queue has work; after-queue actions fire once it drains.
+    scheduler_armed: bool,
+    /// Ephemeral header notice (daily cap, scheduler stop, …).
+    last_notice: Option<String>,
+
     logo: egui::TextureHandle,
 }
 
@@ -275,7 +332,21 @@ struct PopupShared {
     size_label: String,
     type_label: String,
     source_label: String,
+    /// Pretty host for header chips (referer page host wins over CDN host).
+    host_label: String,
+    /// File-kind code for the painted header badge (0 file, 1 video, 2 audio, 3 image).
+    file_kind: u8,
+    /// Whether the reported size may be one 206 range chunk.
+    size_partial: bool,
+    /// Save-to directory.
+    folder: String,
+    /// Editable file-name stem (extension is separate and locked).
+    name_stem: String,
+    /// Locked extension including the dot.
+    name_ext: String,
     output: String,
+    /// When the source URL was last copied (brief "Copied" feedback).
+    copied_at: Option<Instant>,
     dont_ask_again: bool,
     action: Option<PopupAction>,
 }
@@ -288,11 +359,191 @@ impl PopupShared {
             size_label: String::new(),
             type_label: String::new(),
             source_label: String::new(),
+            host_label: String::new(),
+            file_kind: 0,
+            size_partial: false,
+            folder: String::new(),
+            name_stem: String::new(),
+            name_ext: String::new(),
             output: String::new(),
+            copied_at: None,
             dont_ask_again: false,
             action: None,
         }
     }
+}
+
+/// Pretty display host: strip scheme / www / port, lowercase.
+/// Prefer the page (referer) host over a sniffed CDN host.
+fn pretty_host(url: &str) -> String {
+    let s = url.trim();
+    let s = s.split(['?', '#']).next().unwrap_or(s);
+    let s = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .unwrap_or(s);
+    let host = s.split('/').next().unwrap_or("");
+    let host = host.split(':').next().unwrap_or("");
+    host.trim_start_matches("www.").to_ascii_lowercase()
+}
+
+/// File-kind code for the popup header badge:
+/// 0 file, 1 video, 2 audio, 3 image.
+fn file_kind_for(filename: &str, content_type: Option<&str>) -> u8 {
+    let ct = content_type.unwrap_or("").to_ascii_lowercase();
+    if ct.starts_with("video/") {
+        return 1;
+    }
+    if ct.starts_with("audio/") {
+        return 2;
+    }
+    if ct.starts_with("image/") {
+        return 3;
+    }
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "mp4" | "m4v" | "webm" | "mkv" | "mov" | "avi" | "flv" => 1,
+        "mp3" | "m4a" | "wav" | "ogg" | "flac" => 2,
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" => 3,
+        _ => 0,
+    }
+}
+
+/// Split a full name into its editable stem and locked extension.
+fn split_name(name: &str) -> (String, String) {
+    if let Some(dot) = name.rfind('.') {
+        if dot > 0 && name.len() < dot + 8 {
+            return (name[..dot].to_string(), name[dot..].to_string());
+        }
+    }
+    (name.to_string(), String::new())
+}
+
+/// True for CDN hash names such as `AQN6GyYVlQ5c…mp4`.
+fn is_hash_like(stem: &str) -> bool {
+    let len = stem.chars().count();
+    if len < 16 || stem.contains(' ') || stem.contains('-') || stem.contains('_') {
+        return false;
+    }
+    let lower = stem.chars().filter(|c| c.is_ascii_lowercase()).count();
+    let upper = stem.chars().filter(|c| c.is_ascii_uppercase()).count();
+    let digits = stem.chars().filter(|c| c.is_ascii_digit()).count();
+    lower >= 3 && upper >= 3 && digits >= 3
+}
+
+/// Second-level label of a host for the default name.
+fn site_label(host: &str) -> String {
+    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
+    let pick = if labels.len() >= 2 {
+        labels[labels.len() - 2]
+    } else {
+        host
+    };
+    pick.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Extension for a default name from Content-Type.
+fn ext_for_type(content_type: Option<&str>) -> &'static str {
+    match content_type.unwrap_or("").to_ascii_lowercase().as_str() {
+        t if t.starts_with("video/") => {
+            if t.contains("webm") { ".webm" } else if t.contains("quicktime") { ".mov" } else { ".mp4" }
+        }
+        t if t.starts_with("audio/") => {
+            if t.contains("mpeg") { ".mp3" } else { ".m4a" }
+        }
+        t if t.starts_with("image/") => {
+            if t.contains("png") { ".png" } else if t.contains("webp") { ".webp" } else { ".jpg" }
+        }
+        _ => ".bin",
+    }
+}
+
+/// Readable default for hash / over-long names:
+/// `facebook_video_2026-11-09.mp4`.
+fn suggested_media_name(
+    original: &str,
+    referer: Option<&str>,
+    url: &str,
+    content_type: Option<&str>,
+) -> String {
+    let (stem, ext) = split_name(original);
+    if !is_hash_like(&stem) && stem.chars().count() <= 40 {
+        return original.to_string();
+    }
+    let host = referer
+        .map(pretty_host)
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| pretty_host(url));
+    let site = site_label(&host);
+    let site = if site.is_empty() { "download".to_string() } else { site };
+    // Classify from the full name (extension included) — the stem alone
+    // has no extension and would always fall through to "file".
+    let word = match file_kind_for(original, content_type) {
+        1 => "video",
+        2 => "audio",
+        3 => "image",
+        _ => "file",
+    };
+    let date = chrono::Local::now().format("%Y-%m-%d");
+    let ext = if ext.is_empty() {
+        ext_for_type(content_type).to_string()
+    } else {
+        ext
+    };
+    format!("{site}_{word}_{date}{ext}")
+}
+
+/// Strip Windows-forbidden characters from the editable stem.
+fn sanitize_stem(stem: &str) -> String {
+    let cleaned: String = stem
+        .chars()
+        .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        "download".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Keep head + tail visible for long paths, ellipsizing the middle.
+fn ellipsize_middle(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    let head = max / 2;
+    let tail = max - head - 1;
+    let head: String = chars.iter().take(head).collect();
+    let tail: String = chars
+        .iter()
+        .rev()
+        .take(tail)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{head}\u{2026}{tail}")
+}
+
+/// Ellipsize a URL at the end (keeps the beginning visible).
+fn ellipsize_end(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    let head: String = chars.iter().take(max.saturating_sub(1)).collect();
+    format!("{head}\u{2026}")
 }
 
 /// Cached filesystem probe for the Save-as path, refreshed at most every 500 ms.
@@ -318,10 +569,18 @@ struct PendingCapture {    capture: rg_bridge::CaptureRequest,
     output: String,
     /// Best filename we have so far (header > URL > tab title).
     filename: String,
+    /// Save-to directory (from `output`'s parent).
+    folder: String,
+    /// Editable file-name stem (no extension).
+    name_stem: String,
+    /// Locked extension including the dot.
+    name_ext: String,
     size: Option<u64>,
     content_type: Option<String>,
     /// Set when the probe request is still in flight.
     probing: bool,
+    /// True when `size` may be one 206 range chunk, not the whole file.
+    size_partial: bool,
     dont_ask_again: bool,
 }
 
@@ -334,7 +593,7 @@ impl RapidGrabApp {
         let rt = Arc::new(Runtime::new().expect("Failed to create tokio runtime"));
         let (update_tx, update_rx) = unbounded();
         let (capture_tx, capture_rx) = unbounded::<rg_bridge::CaptureRequest>();
-        let (probe_tx, probe_rx) = unbounded::<(String, Option<u64>, Option<String>)>();
+        let (probe_tx, probe_rx) = unbounded::<(String, Option<u64>, Option<String>, bool)>();
         let repaint_ctx = cc.egui_ctx.clone();
         let pipe_guard = if cfg!(windows) {
             rg_bridge::listen(move |req| {
@@ -353,13 +612,58 @@ impl RapidGrabApp {
             .storage
             .and_then(|s| eframe::get_value(s, SETTINGS_KEY))
             .unwrap_or_default();
+        // Shared Phase-4 fields live in rg-config's settings.json (the
+        // standalone popup reads them from there). When that file exists it
+        // is the source of truth and overlays the eframe copy (migration).
+        let shared = AppConfig::load();
+        let shared_exists = rg_config::settings_path().is_file();
         let settings = Settings {
             max_concurrent: settings.max_concurrent.clamp(1, 8),
             connections: settings.connections.clamp(1, 16),
+            organize_by_category: if shared_exists {
+                shared.organize_by_category
+            } else {
+                settings.organize_by_category
+            },
+            category_dirs: if shared_exists {
+                shared.category_dirs.clone()
+            } else {
+                settings.category_dirs.clone()
+            },
+            queue_paused: if shared_exists {
+                shared.queue_paused
+            } else {
+                settings.queue_paused
+            },
+            daily_limit_mb: if shared_exists {
+                shared.daily_limit_mb as usize
+            } else {
+                settings.daily_limit_mb
+            },
+            schedule_enabled: if shared_exists {
+                shared.scheduler.enabled
+            } else {
+                settings.schedule_enabled
+            },
+            schedule_start: if shared_exists {
+                shared.scheduler.start.clone()
+            } else {
+                settings.schedule_start.clone()
+            },
+            schedule_stop: if shared_exists {
+                shared.scheduler.stop.clone()
+            } else {
+                settings.schedule_stop.clone()
+            },
+            after_queue: if shared_exists {
+                shared.scheduler.after_queue
+            } else {
+                settings.after_queue
+            },
             ..settings
         };
 
-        Self {
+        let mut app = Self {
             rt,
             update_rx,
             update_tx,
@@ -388,8 +692,98 @@ impl RapidGrabApp {
             pending_capture: None,
             auth_prompt: None,
             popup_shared: Arc::new(std::sync::Mutex::new(PopupShared::blank())),
+            show_history: false,
+            history_cache: Vec::new(),
+            scheduler_armed: false,
+            last_notice: None,
             logo: crate::icon::logo_texture(&cc.egui_ctx),
+        };
+        app.restore_queue();
+        app
+    }
+
+    /// The shared Phase-4 configuration, rebuilt from the live settings.
+    fn shared_config(&self) -> AppConfig {
+        AppConfig {
+            organize_by_category: self.settings.organize_by_category,
+            category_dirs: self.settings.category_dirs.clone(),
+            queue_paused: self.settings.queue_paused,
+            daily_limit_mb: self.settings.daily_limit_mb as u64,
+            scheduler: rg_config::ScheduleSettings {
+                enabled: self.settings.schedule_enabled,
+                start: self.settings.schedule_start.clone(),
+                stop: self.settings.schedule_stop.clone(),
+                after_queue: self.settings.after_queue,
+            },
         }
+    }
+
+    /// Persist the shared configuration for the popup process.
+    fn persist_shared(&self) {
+        if let Err(error) = self.shared_config().save() {
+            tracing::warn!("could not save shared config: {error}");
+        }
+    }
+
+    /// Folder a new download should be saved into (category routing).
+    fn routed_dir(&self, filename: &str, content_type: Option<&str>) -> PathBuf {
+        let base = if self.settings.last_dir.is_empty() {
+            dirs::download_dir().unwrap_or_else(|| PathBuf::from("."))
+        } else {
+            PathBuf::from(&self.settings.last_dir)
+        };
+        self.shared_config().dir_for(&base, filename, content_type)
+    }
+
+    /// Pending jobs (queued/paused) written to `queue.json`.
+    fn persist_queue(&self) {
+        let specs: Vec<rg_config::QueuedJobSpec> = self
+            .jobs
+            .values()
+            .filter(|j| matches!(j.status, JobStatus::Queued | JobStatus::Paused))
+            .map(|j| rg_config::QueuedJobSpec {
+                url: j.url.clone(),
+                output: j.output.display().to_string(),
+                connections: j.connections,
+                speed_limit: j.speed_limit,
+                sha256: j.sha256.clone(),
+                user_agent: j.user_agent.clone(),
+                referer: j.referer.clone(),
+                cookie: j.cookie.clone(),
+                restart: j.restart,
+                priority: j.priority,
+                category: j.category,
+            })
+            .collect();
+        if let Err(error) = rg_config::save_queue(&specs) {
+            tracing::warn!("could not save queue: {error}");
+        }
+    }
+
+    /// Restore pending jobs from `queue.json` as Queued (paused until the
+    /// pump runs). A queue that does not start downloading on its own is
+    /// safer than one that silently resumes after a crash.
+    fn restore_queue(&mut self) {
+        for spec in rg_config::load_queue() {
+            self.enqueue_with_priority(
+                spec.url,
+                spec.output,
+                spec.connections,
+                spec.speed_limit,
+                spec.sha256,
+                spec.user_agent,
+                spec.referer,
+                spec.cookie,
+                spec.restart,
+                None,
+                spec.priority,
+            );
+        }
+    }
+
+    /// Today as a local "YYYY-MM-DD" string (daily-cap bucket).
+    fn today_str() -> String {
+        chrono::Local::now().format("%Y-%m-%d").to_string()
     }
 
     /// Drains the capture/probe channels and builds or updates the pending
@@ -404,7 +798,40 @@ impl RapidGrabApp {
                 .as_deref()
                 .filter(|s| !s.trim().is_empty())
                 .or(capture.filename.as_deref().filter(|s| !s.trim().is_empty()));
-            let suggested = suggested_output_for(&self.settings.last_dir, filename, &capture.url);
+            // Suggest into the category folder (unless the popup already
+            // picked an output, which is always respected below).
+            let suggested_name = filename
+                .unwrap_or_else(|| {
+                    capture
+                        .url
+                        .split(['?', '#'])
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("download.bin")
+                })
+                .to_string();
+            // Hash / over-long CDN names become a readable default
+            // (`facebook_video_2026-11-09.mp4`) before suggesting the path.
+            let display_name = suggested_media_name(
+                &suggested_name,
+                capture.referer.as_deref(),
+                &capture.url,
+                capture.content_type.as_deref(),
+            );
+            let (pending_stem, pending_ext) = split_name(&display_name);
+            let suggested = self
+                .routed_dir(&display_name, capture.content_type.as_deref())
+                .join(&display_name)
+                .display()
+                .to_string();
+            let pending_folder = std::path::Path::new(&suggested)
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| suggested.clone());
 
             let host = capture_host(&capture.url);
             let trusted = capture.auto_start
@@ -497,30 +924,43 @@ impl RapidGrabApp {
                     None,
                 );
             } else {
+                // Always probe: the browser-reported Content-Length can be
+                // a single 206 range chunk (e.g. Facebook CDN), which would
+                // show a bogus small size. It stays as a fallback and is
+                // only replaced when the probe returns a real size.
                 let size = capture.content_length;
                 let content_type = capture.content_type.clone();
-                let probing = size.is_none() && content_type.is_none();
                 self.pending_capture = Some(PendingCapture {
                     capture: capture.clone(),
                     output: suggested,
-                    filename: filename.unwrap_or(&capture.url).to_string(),
+                    filename: display_name,
+                    folder: pending_folder,
+                    name_stem: pending_stem,
+                    name_ext: pending_ext,
                     size,
                     content_type,
-                    probing,
+                    probing: true,
+                    size_partial: false,
                     dont_ask_again: false,
                 });
-                if probing {
-                    self.spawn_probe(capture);
-                }
+                self.spawn_probe(capture);
             }
             self.show_add_panel = true;
             self.focus_url = true;
         }
-        while let Ok((url, size, ctype)) = self.probe_rx.try_recv() {
+        while let Ok((url, size, ctype, partial)) = self.probe_rx.try_recv() {
             if let Some(pending) = &mut self.pending_capture {
                 if pending.capture.url == url {
-                    pending.size = size;
-                    pending.content_type = ctype;
+                    // Keep the browser-reported values as fallback when the
+                    // probe comes back without a size/type. The probe's
+                    // `partial` verdict already accounts for the fallback.
+                    if size.is_some() {
+                        pending.size = size;
+                    }
+                    pending.size_partial = partial;
+                    if pending.content_type.is_none() {
+                        pending.content_type = ctype;
+                    }
                     pending.probing = false;
                 }
             }
@@ -542,11 +982,7 @@ impl RapidGrabApp {
             .next()
             .filter(|s| !s.is_empty())
             .unwrap_or("download.bin");
-        let dir = if self.settings.last_dir.is_empty() {
-            dirs::download_dir().unwrap_or_else(|| PathBuf::from("."))
-        } else {
-            PathBuf::from(&self.settings.last_dir)
-        };
+        let dir = self.routed_dir(name, None);
         self.new_output = dir.join(name).display().to_string();
     }
 
@@ -564,7 +1000,7 @@ impl RapidGrabApp {
                 Ok(client) => client,
                 Err(error) => {
                     tracing::warn!("size probe skipped: {error}");
-                    let _ = tx.send((capture.url.clone(), None, None));
+                    let _ = tx.send((capture.url.clone(), None, None, false));
                     return;
                 }
             };
@@ -578,23 +1014,90 @@ impl RapidGrabApp {
             if let Some(referer) = &capture.referer {
                 req = req.header(reqwest::header::REFERER, referer.as_str());
             }
-            let (size, ctype) = match tokio::time::timeout(Duration::from_secs(10), req.send()).await {
-                Ok(Ok(resp)) if resp.status().is_success() => {
-                    let size = resp
-                        .headers()
-                        .get(reqwest::header::CONTENT_LENGTH)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.trim().parse::<u64>().ok());
-                    let ctype = resp
-                        .headers()
-                        .get(reqwest::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
-                    (size, ctype)
-                }
-                _ => (None, None),
+            // Total from `Content-Range: bytes 0-0/123456` (after '/') —
+            // correct on 206 responses where Content-Length is one chunk.
+            let range_total = |headers: &reqwest::header::HeaderMap| -> Option<u64> {
+                let s = headers
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())?;
+                s.rfind('/')
+                    .and_then(|slash| s[slash + 1..].trim().parse::<u64>().ok())
             };
-            let _ = tx.send((capture.url.clone(), size, ctype));
+            let header_u64 = |headers: &reqwest::header::HeaderMap| -> Option<u64> {
+                headers
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+            };
+
+            let mut got_total = false;
+            let (mut size, mut ctype) =
+                match tokio::time::timeout(Duration::from_secs(10), req.send()).await {
+                    Ok(Ok(resp)) if resp.status().is_success() => {
+                        let headers = resp.headers().clone();
+                        let size = {
+                            let total = range_total(&headers);
+                            if total.is_some() {
+                                got_total = true;
+                            }
+                            total.or_else(|| header_u64(&headers))
+                        };
+                        let ctype = headers
+                            .get(reqwest::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string());
+                        (size, ctype)
+                    }
+                    _ => (None, None),
+                };
+
+            // One-byte ranged GET: HEAD alone can still report a chunk size
+            // on range-capable CDNs. Headers only — the body is never read,
+            // so this doesn't download the file. The 206 Content-Range
+            // total is authoritative when present.
+            {
+                let mut get = client
+                    .get(&capture.url)
+                    .header(reqwest::header::RANGE, "bytes=0-0");
+                if let Some(ua) = &capture.user_agent {
+                    get = get.header(reqwest::header::USER_AGENT, ua.as_str());
+                }
+                if let Some(cookie) = &capture.cookies {
+                    get = get.header(reqwest::header::COOKIE, cookie.as_str());
+                }
+                if let Some(referer) = &capture.referer {
+                    get = get.header(reqwest::header::REFERER, referer.as_str());
+                }
+                if let Ok(Ok(resp)) =
+                    tokio::time::timeout(Duration::from_secs(10), get.send()).await
+                {
+                    if resp.status().is_success()
+                        || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+                    {
+                        let headers = resp.headers().clone();
+                        if let Some(total) = range_total(&headers) {
+                            size = Some(total);
+                            got_total = true;
+                        } else if size.is_none() {
+                            size = header_u64(&headers);
+                        }
+                        if ctype.is_none() {
+                            ctype = headers
+                                .get(reqwest::header::CONTENT_TYPE)
+                                .and_then(|v| v.to_str().ok())
+                                .map(|s| s.to_string());
+                        }
+                    }
+                }
+            }
+            // Partial when no total was ever reported and the file is a
+            // video or suspiciously small — the number may be one chunk.
+            let final_size = size.or(capture.content_length);
+            let final_ctype = ctype.as_deref().or(capture.content_type.as_deref());
+            let kind = file_kind_for(&capture.url, final_ctype);
+            let partial = !got_total
+                && final_size.is_some_and(|n| kind == 1 || n < 256 * 1024);
+            let _ = tx.send((capture.url.clone(), size, ctype, partial));
         });
     }
 
@@ -618,7 +1121,23 @@ impl RapidGrabApp {
             .ok()
             .filter(|&x| x > 0)
             .map(|x| x * 1024);
-        let output = pending.output.clone();
+        // The popup edits folder + name stem (extension locked); recompose
+        // the full save path here so enqueue sees the final value. A
+        // direct output set outside the popup (Browse) is respected when
+        // the name fields match it.
+        let recomposed = std::path::Path::new(&pending.folder)
+            .join(format!(
+                "{}{}",
+                sanitize_stem(&pending.name_stem),
+                pending.name_ext
+            ))
+            .display()
+            .to_string();
+        let output = if recomposed.is_empty() {
+            pending.output.clone()
+        } else {
+            recomposed
+        };
         self.enqueue(
             capture.url.clone(),
             output,
@@ -737,6 +1256,36 @@ impl RapidGrabApp {
         restart: bool,
         credentials: Option<Credentials>,
     ) {
+        self.enqueue_with_priority(
+            url,
+            output,
+            connections,
+            speed_limit,
+            sha256,
+            user_agent,
+            referer,
+            cookie,
+            restart,
+            credentials,
+            Priority::Normal,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_with_priority(
+        &mut self,
+        url: String,
+        output: String,
+        connections: usize,
+        speed_limit: Option<u64>,
+        sha256: Option<String>,
+        user_agent: Option<String>,
+        referer: Option<String>,
+        cookie: Option<String>,
+        restart: bool,
+        credentials: Option<Credentials>,
+        priority: Priority,
+    ) {
         if url.trim().is_empty() || output.trim().is_empty() {
             return;
         }
@@ -774,8 +1323,18 @@ impl RapidGrabApp {
                 intent: None,
                 remove_after_stop: false,
                 handle: None,
+                priority,
+                category: Category::from_filename(
+                    PathBuf::from(output.trim())
+                        .file_name()
+                        .map(|n| n.to_string_lossy())
+                        .as_deref()
+                        .unwrap_or(""),
+                ),
+                history_recorded: false,
             },
         );
+        self.persist_queue();
     }
 
     /// Spawns the tokio task for a job. Caller guarantees the job is `Queued`.
@@ -801,6 +1360,7 @@ impl RapidGrabApp {
             job.intent = None;
             job.remove_after_stop = false;
             job.last_speed = 0.0;
+            job.history_recorded = false;
             job.started_at = Some(Instant::now());
             // Consume the one-shot restart flag now that the restart has
             // begun, so the next retry resumes normally again.
@@ -1160,21 +1720,40 @@ impl RapidGrabApp {
 
     /// Starts queued jobs while the concurrency budget allows.
     fn pump_queue(&mut self) {
+        if self.settings.queue_paused {
+            return;
+        }
+        // Daily cap: once the allowance is used up, hold the queue until
+        // tomorrow (the usage bucket resets on the local date).
+        if self.settings.daily_limit_mb > 0 {
+            let used = rg_config::DailyUsage::load(&Self::today_str()).bytes;
+            if used >= (self.settings.daily_limit_mb as u64) * 1024 * 1024 {
+                if self.last_notice.is_none() {
+                    self.last_notice = Some(format!(
+                        "Daily limit reached ({} used of {} MB) — queue resumes tomorrow",
+                        human_bytes(used),
+                        self.settings.daily_limit_mb
+                    ));
+                }
+                return;
+            }
+        }
         let max = self.settings.max_concurrent.max(1);
         let active = self.jobs.values().filter(|j| j.status.is_active()).count();
         if active >= max {
             return;
         }
 
-        let mut queued: Vec<usize> = self
+        let mut queued: Vec<(Priority, usize)> = self
             .jobs
             .iter()
             .filter(|(_, j)| j.status == JobStatus::Queued)
-            .map(|(&id, _)| id)
+            .map(|(&id, j)| (j.priority, id))
             .collect();
-        queued.sort_unstable();
+        // High priority first, then oldest (lowest id) first.
+        queued.sort_by(|a, b| b.0.rank().cmp(&a.0.rank()).then(a.1.cmp(&b.1)));
 
-        for id in queued.into_iter().take(max - active) {
+        for (_, id) in queued.into_iter().take(max - active) {
             self.start_job(id);
         }
     }
@@ -1186,6 +1765,14 @@ impl RapidGrabApp {
         if job.run != update.run {
             return; // stale update from a previous run
         }
+        // Byte count for history/daily-cap bookkeeping, captured before the
+        // terminal branches clear the progress.
+        let bytes_done = job
+            .progress
+            .as_ref()
+            .map(|p| p.downloaded)
+            .or_else(|| job.media.as_ref().map(|m| m.downloaded))
+            .unwrap_or(0);
         if let Some(output) = update.output.clone() {
             job.output = output;
         }
@@ -1225,9 +1812,13 @@ impl RapidGrabApp {
                 if let Some(started) = job.started_at.take() {
                     job.elapsed += started.elapsed();
                 }
+                let intent = job.intent.take();
+                // A pause is not a terminal state: no history entry.
+                if intent != Some(CancelIntent::Pause) {
+                    Self::record_history(job, "cancelled", bytes_done);
+                }
                 job.progress = None;
                 job.media = None;
-                let intent = job.intent.take();
                 job.status = match intent {
                     Some(CancelIntent::Pause) => JobStatus::Paused,
                     _ => JobStatus::Cancelled,
@@ -1240,6 +1831,20 @@ impl RapidGrabApp {
                 if let Some(started) = job.started_at.take() {
                     job.elapsed += started.elapsed();
                 }
+                let bytes = if bytes_done > 0 {
+                    bytes_done
+                } else {
+                    std::fs::metadata(&job.output).map(|m| m.len()).unwrap_or(0)
+                };
+                Self::record_history(job, "completed", bytes);
+                // Daily cap bookkeeping.
+                if bytes > 0 {
+                    if let Err(error) = rg_config::DailyUsage::default()
+                        .add(&Self::today_str(), bytes)
+                    {
+                        tracing::warn!("could not record daily usage: {error}");
+                    }
+                }
                 job.progress = None;
                 job.media = None;
                 job.status = JobStatus::Completed;
@@ -1249,6 +1854,7 @@ impl RapidGrabApp {
                 if let Some(started) = job.started_at.take() {
                     job.elapsed += started.elapsed();
                 }
+                Self::record_history(job, "failed", bytes_done);
                 job.progress = None;
                 job.media = None;
                 job.status = JobStatus::Failed;
@@ -1273,7 +1879,33 @@ impl RapidGrabApp {
         }
     }
 
+    /// Append one history entry for a terminal update (once per run).
+    fn record_history(job: &mut DownloadJob, status: &str, bytes: u64) {
+        if job.history_recorded {
+            return;
+        }
+        job.history_recorded = true;
+        let entry = rg_config::HistoryEntry {
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            url: job.url.clone(),
+            output: job.output.display().to_string(),
+            bytes,
+            elapsed_ms: job.total_elapsed().as_millis() as u64,
+            status: status.to_string(),
+            error: job.error.clone(),
+            category: job.category,
+            sha256: job.sha256.clone(),
+        };
+        if let Err(error) = rg_config::append_history(&entry) {
+            tracing::warn!("could not append history: {error}");
+        }
+    }
+
     fn handle_actions(&mut self, actions: Vec<Action>) {
+        let mut queue_changed = false;
         for action in actions {
             match action {
                 Action::Pause(id) => self.pause_job(id),
@@ -1282,10 +1914,121 @@ impl RapidGrabApp {
                 Action::Resume(id) => self.resume_job(id),
                 Action::Retry(id) => self.resume_job(id),
                 Action::Restart(id) => self.restart_job(id),
-                Action::Remove(id) => self.remove_job(id),
+                Action::Remove(id) => {
+                    self.remove_job(id);
+                    queue_changed = true;
+                }
+                Action::CyclePriority(id) => {
+                    if let Some(job) = self.jobs.get_mut(&id) {
+                        job.priority = match job.priority {
+                            Priority::Low => Priority::Normal,
+                            Priority::Normal => Priority::High,
+                            Priority::High => Priority::Low,
+                        };
+                    }
+                    queue_changed = true;
+                }
+                Action::ToggleQueue => {
+                    self.settings.queue_paused = !self.settings.queue_paused;
+                    self.persist_shared();
+                }
+                Action::ToggleHistory => {
+                    self.show_history = !self.show_history;
+                    if self.show_history {
+                        self.history_cache = rg_config::load_history();
+                    }
+                }
+                Action::HistoryRetry(index) => {
+                    if let Some(entry) = self.history_cache.get(index).cloned() {
+                        self.enqueue(entry.url.clone(), entry.output.clone(), self.settings.connections.max(1), None, entry.sha256.clone(), None, None, None, false, None);
+                        self.show_history = false;
+                    }
+                }
+                Action::HistoryOpen(index) => {
+                    if let Some(entry) = self.history_cache.get(index) {
+                        Self::open_path(std::path::Path::new(&entry.output));
+                    }
+                }
+                Action::HistoryFolder(index) => {
+                    if let Some(entry) = self.history_cache.get(index) {
+                        if let Some(parent) = std::path::Path::new(&entry.output).parent() {
+                            Self::open_path(parent);
+                        }
+                    }
+                }
+                Action::ClearHistory => {
+                    let _ = rg_config::clear_history();
+                    self.history_cache.clear();
+                }
+            }
+        }
+        if queue_changed {
+            self.persist_queue();
+        }
+    }
+
+    /// One scheduler tick: apply the start/stop window, fire the after-queue
+    /// action once the queue drains, and clear stale notices.
+    fn scheduler_tick(&mut self) {
+        if self.settings.schedule_enabled {
+            let now = chrono::Local::now();
+            let now_min = (now.format("%H").to_string().parse::<u16>().unwrap_or(0)) * 60
+                + now.format("%M").to_string().parse::<u16>().unwrap_or(0);
+            let inside = rg_config::in_schedule_window(
+                now_min,
+                rg_config::parse_hhmm(&self.settings.schedule_start),
+                rg_config::parse_hhmm(&self.settings.schedule_stop),
+            );
+            if inside && self.settings.queue_paused {
+                self.settings.queue_paused = false;
+                self.persist_shared();
+                self.last_notice = None;
+            } else if !inside && !self.settings.queue_paused {
+                self.settings.queue_paused = true;
+                self.persist_shared();
+                self.last_notice = Some("Scheduler: queue stopped outside the configured window".into());
+            }
+        }
+
+        let active = self.jobs.values().filter(|j| j.status.is_active()).count();
+        let queued = self.jobs.values().filter(|j| j.status == JobStatus::Queued).count();
+        if active + queued > 0 {
+            self.scheduler_armed = true;
+        } else if self.scheduler_armed {
+            self.scheduler_armed = false;
+            match self.settings.after_queue {
+                AfterAction::None => {}
+                AfterAction::Sleep => Self::power_action("sleep"),
+                AfterAction::Hibernate => Self::power_action("hibernate"),
+                AfterAction::Shutdown => Self::power_action("shutdown"),
             }
         }
     }
+
+    #[cfg(windows)]
+    fn power_action(action: &str) {
+        let result = match action {
+            "sleep" => std::process::Command::new("rundll32.exe")
+                .args(["powrprof.dll,SetSuspendState", "0,1,0"])
+                .status()
+                .map(|_| ()),
+            "hibernate" => std::process::Command::new("shutdown.exe")
+                .args(["/h"])
+                .status()
+                .map(|_| ()),
+            "shutdown" => std::process::Command::new("shutdown.exe")
+                .args(["/s", "/t", "60"])
+                .status()
+                .map(|_| ()),
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
+            tracing::warn!("after-queue power action ({action}) failed: {error}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn power_action(_action: &str) {}
 
     fn browse_output(&mut self) {
         let dir = if self.settings.last_dir.is_empty() {
@@ -1333,6 +2076,8 @@ impl RapidGrabApp {
                     0.0
                 },
                 elapsed: j.total_elapsed(),
+                priority: j.priority,
+                category: j.category,
             })
             .collect();
         views.sort_by_key(|v| v.id);
@@ -1434,10 +2179,16 @@ impl RapidGrabApp {
             let (size_label, type_label) = if is_media_page {
                 ("Video page".to_string(), "resolved on Start".to_string())
             } else {
-                let size_label = match pending.size {
-                    Some(bytes) => human_bytes(bytes),
-                    None if pending.probing => "Resolving\u{2026}".to_string(),
-                    None => "Unknown".to_string(),
+                // While probing, the stored size may be the browser's
+                // partial (206 range) value — don't show it until the
+                // probe settles.
+                let size_label = if pending.probing {
+                    "Resolving\u{2026}".to_string()
+                } else {
+                    match pending.size {
+                        Some(bytes) => human_bytes(bytes),
+                        None => "Unknown size".to_string(),
+                    }
                 };
                 let type_label = pending
                     .content_type
@@ -1462,6 +2213,21 @@ impl RapidGrabApp {
                     .as_deref()
                     .unwrap_or("browser")
                     .to_string();
+                shared.host_label = pending
+                    .capture
+                    .referer
+                    .as_deref()
+                    .map(pretty_host)
+                    .filter(|h| !h.is_empty())
+                    .unwrap_or_else(|| pretty_host(&pending.capture.url));
+                shared.file_kind = file_kind_for(
+                    &pending.filename,
+                    pending.content_type.as_deref(),
+                );
+                shared.size_partial = pending.size_partial;
+                shared.folder = pending.folder.clone();
+                shared.name_stem = pending.name_stem.clone();
+                shared.name_ext = pending.name_ext.clone();
                 shared.output = pending.output.clone();
                 shared.dont_ask_again = pending.dont_ask_again;
             }
@@ -1474,8 +2240,8 @@ impl RapidGrabApp {
         ctx.show_viewport_deferred(
             egui::ViewportId::from_hash_of("rg-download-popup"),
             egui::ViewportBuilder::default()
-                .with_title("Download")
-                .with_inner_size([420.0, 360.0])
+                .with_title("New download \u{2014} RapidGrab")
+                .with_inner_size([520.0, 304.0])
                 .with_resizable(false)
                 .with_active(true),
             move |ui, _class| {
@@ -1483,41 +2249,266 @@ impl RapidGrabApp {
                 if ui.ctx().input(|i| i.viewport().close_requested()) {
                     state.action = Some(PopupAction::Cancel);
                 }
+                // Short type chip: "MP4" not "video/mp4".
+                let type_chip = state
+                    .type_label
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&state.type_label)
+                    .to_ascii_uppercase();
+                let container_folder = state.folder.clone();
+                let ext_text = state.name_ext.clone();
+                let full_name = format!("{}{}", sanitize_stem(&state.name_stem), state.name_ext);
+                let full_url = state.url.clone();
+                let kind = state.file_kind;
+                let partial = state.size_partial;
+                let size_label = state.size_label.clone();
+                let host_label = state.host_label.clone();
+                let copied_active = state
+                    .copied_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(1500));
+                if state.copied_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(1500)) {
+                    state.copied_at = None;
+                }
+
+                // Footer pinned to the window bottom, no divider — spacing
+                // only. Hints left, actions right (Cancel = ghost).
+                egui::Panel::bottom("rg-popup-footer")
+                    .frame(
+                        egui::Frame::default()
+                            .fill(theme::CARD)
+                            .inner_margin(egui::Margin::symmetric(16, 8)),
+                    )
+                    .show(ui, |ui: &mut egui::Ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Label::new(theme::caption_tertiary(
+                                "Enter to start \u{b7} Esc to cancel",
+                            )));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.spacing_mut().item_spacing.x = theme::SP_S;
+                                // Fixed widths so the hint + buttons fit the
+                                // 488px inner width without clipping.
+                                if widgets::button_fixed_width(
+                                    ui,
+                                    "Start download",
+                                    widgets::ButtonKind::Primary,
+                                    true,
+                                    124.0,
+                                )
+                                .clicked()
+                                {
+                                    state.action = Some(PopupAction::Start);
+                                }
+                                if widgets::button_fixed_width(
+                                    ui,
+                                    "Download Later",
+                                    widgets::ButtonKind::Secondary,
+                                    true,
+                                    112.0,
+                                )
+                                .clicked()
+                                {
+                                    state.action = Some(PopupAction::Later);
+                                }
+                                if widgets::button_fixed_width(
+                                    ui,
+                                    "Cancel",
+                                    widgets::ButtonKind::Ghost,
+                                    true,
+                                    64.0,
+                                )
+                                .clicked()
+                                {
+                                    state.action = Some(PopupAction::Cancel);
+                                }
+                            });
+                        });
+                    });
+
                 egui::CentralPanel::default()
                     .frame(
                         egui::Frame::default()
                             .fill(theme::CARD)
-                            .inner_margin(egui::Margin::same(16)),
+                            .stroke(egui::Stroke::new(1.0, theme::STROKE_SOFT))
+                            .corner_radius(egui::CornerRadius::same(12))
+                            // Single 16px left edge, 8px top/bottom.
+                            .inner_margin(egui::Margin::symmetric(16, 8)),
                     )
                     .show(ui, |ui: &mut egui::Ui| {
-                        ui.add(egui::Label::new(
-                            egui::RichText::new(&state.filename)
-                                .strong()
-                                .size(theme::SECTION_SIZE),
-                        ));
-                        ui.add(egui::Label::new(theme::caption(format!(
-                            "{} \u{b7} {} \u{b7} {}",
-                            state.source_label, state.size_label, state.type_label
-                        ))));
-                        ui.add(egui::Label::new(theme::caption(state.url.clone())));
-                        ui.add(egui::Label::new(theme::label("Save as")));
+                        ui.spacing_mut().item_spacing.y = theme::SP_S;
+
+                        // --- Header: painted badge + editable name + chips ---
                         ui.horizontal(|ui| {
-                            let field_w =
-                                (ui.available_width() - theme::BROWSE_W - theme::SP_S).max(120.0);
-                            widgets::text_field(
-                                ui,
-                                widgets::Field::new(
-                                    "rg-popup-output",
-                                    "Choose where to save\u{2026}",
-                                )
-                                .width(field_w),
-                                &mut state.output,
+                            ui.spacing_mut().item_spacing.x = theme::SP_M;
+                            // 36x36 painted file-type badge (no font glyph).
+                            let (rect, _resp) = ui.allocate_exact_size(
+                                egui::vec2(36.0, 36.0),
+                                egui::Sense::hover(),
                             );
-                            if widgets::button(
+                            let painter = ui.painter();
+                            let r = egui::CornerRadius::same(10);
+                            painter.rect_filled(rect, r, theme::CONTROL);
+                            painter.rect_stroke(
+                                rect,
+                                r,
+                                egui::Stroke::new(1.0, theme::STROKE_SOFT),
+                                egui::StrokeKind::Middle,
+                            );
+                            let cx = rect.center().x;
+                            let cy = rect.center().y;
+                            match kind {
+                                1 => {
+                                    painter.add(egui::Shape::convex_polygon(
+                                        vec![
+                                            egui::pos2(cx - 6.0, cy - 8.0),
+                                            egui::pos2(cx + 8.0, cy),
+                                            egui::pos2(cx - 6.0, cy + 8.0),
+                                        ],
+                                        theme::ACCENT,
+                                        egui::Stroke::NONE,
+                                    ));
+                                }
+                                2 => {
+                                    for (i, &h) in [6.0_f32, 12.0, 8.0].iter().enumerate() {
+                                        let x = cx - 9.0 + i as f32 * 7.0;
+                                        painter.rect_filled(
+                                            egui::Rect::from_center_size(
+                                                egui::pos2(x, cy),
+                                                egui::vec2(3.0, h),
+                                            ),
+                                            egui::CornerRadius::same(1),
+                                            theme::ACCENT,
+                                        );
+                                    }
+                                }
+                                3 => {
+                                    painter.circle_filled(
+                                        egui::pos2(cx - 4.0, cy - 5.0),
+                                        3.0,
+                                        theme::ACCENT,
+                                    );
+                                    painter.add(egui::Shape::line_segment(
+                                        [egui::pos2(cx - 9.0, cy + 8.0), egui::pos2(cx - 2.0, cy - 1.0)],
+                                        egui::Stroke::new(2.5, theme::ACCENT),
+                                    ));
+                                    painter.add(egui::Shape::line_segment(
+                                        [egui::pos2(cx + 0.0, cy + 3.0), egui::pos2(cx + 9.0, cy + 8.0)],
+                                        egui::Stroke::new(2.5, theme::ACCENT),
+                                    ));
+                                }
+                                _ => {
+                                    let doc = egui::Rect::from_center_size(
+                                        egui::pos2(cx + 1.0, cy),
+                                        egui::vec2(14.0, 18.0),
+                                    );
+                                    painter.rect_filled(doc, egui::CornerRadius::same(2), theme::ACCENT);
+                                    painter.add(egui::Shape::convex_polygon(
+                                        vec![
+                                            egui::pos2(doc.right() - 5.0, doc.top()),
+                                            egui::pos2(doc.right(), doc.top() + 5.0),
+                                            egui::pos2(doc.right() - 5.0, doc.top() + 5.0),
+                                        ],
+                                        theme::TEXT,
+                                        egui::Stroke::NONE,
+                                    ));
+                                }
+                            }
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                // Inline-editable name stem; the dimmed
+                                // extension sits DIRECTLY after it on the
+                                // same line (zero gap, baseline-aligned).
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    let field_resp = widgets::text_field(
+                                        ui,
+                                        widgets::Field::new("rg-popup-name", "file name")
+                                            .frameless()
+                                            .title(),
+                                        &mut state.name_stem,
+                                    );
+                                    if !field_resp.response.has_focus() {
+                                        field_resp.response.on_hover_text(full_name.clone());
+                                    }
+                                    if !ext_text.is_empty() {
+                                        ui.add_sized(
+                                            egui::vec2(48.0, 28.0),
+                                            egui::Label::new(
+                                                egui::RichText::new(&ext_text)
+                                                    .color(theme::TEXT_TERTIARY)
+                                                    .size(theme::CAPTION_SIZE),
+                                            ),
+                                        );
+                                    }
+                                    if field_resp.submitted {
+                                        state.action = Some(PopupAction::Start);
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    widgets::chip(ui, &size_label, theme::ACCENT);
+                                    if type_chip != "\u{2014}" && type_chip != "\u{2026}" {
+                                        widgets::chip(ui, &type_chip, theme::ACCENT);
+                                    }
+                                    if !host_label.is_empty() {
+                                        widgets::chip(ui, &host_label, theme::ACCENT);
+                                    }
+                                    if partial {
+                                        widgets::chip(
+                                            ui,
+                                            "Size may be incomplete",
+                                            theme::WARNING,
+                                        )
+                                        .on_hover_text(
+                                            "The server didn't report a full size; the final size may differ.",
+                                        );
+                                    }
+                                });
+                            });
+                        });
+
+                        // --- Save to: label above field (+ Change button) ----
+                        ui.add(egui::Label::new(theme::caption("Save to")));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = theme::SP_S;
+                            // Field + Change exactly fill the row — nothing
+                            // can overflow or clip at any DPI.
+                            let row_w = ui.available_rect_before_wrap().width();
+                            let btn_w = 76.0;
+                            let field_w = (row_w - btn_w - theme::SP_S).max(80.0);
+                            // Subtle-background path box (middle-ellipsized,
+                            // left-aligned).
+                            let display_folder = ellipsize_middle(&container_folder, 52);
+                            let full_folder = container_folder.clone();
+                            let (rect, _resp) = ui.allocate_exact_size(
+                                egui::vec2(field_w, 36.0),
+                                egui::Sense::hover(),
+                            );
+                            let painter = ui.painter();
+                            painter.rect_filled(rect, egui::CornerRadius::same(6), theme::CONTROL);
+                            painter.rect_stroke(
+                                rect,
+                                egui::CornerRadius::same(6),
+                                egui::Stroke::new(1.0, theme::STROKE_SOFT),
+                                egui::StrokeKind::Middle,
+                            );
+                            let text_rect = egui::Rect::from_min_max(
+                                egui::pos2(rect.left() + 10.0, rect.top() + 2.0),
+                                egui::pos2(rect.right() - 10.0, rect.bottom() - 2.0),
+                            );
+                            let lbl = ui.put(
+                                text_rect,
+                                egui::Label::new(theme::caption(&display_folder))
+                                    
+                                    .truncate(),
+                            );
+                            lbl.on_hover_text(full_folder);
+                            if widgets::button_fixed_width(
                                 ui,
-                                "Browse\u{2026}",
+                                "Change",
                                 widgets::ButtonKind::Secondary,
                                 true,
+                                btn_w,
                             )
                             .clicked()
                             {
@@ -1525,41 +2516,70 @@ impl RapidGrabApp {
                             }
                         });
 
+                        // --- Source: label above field (+ Copy button) -------
+                        ui.add(egui::Label::new(theme::caption("Source")));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = theme::SP_S;
+                            // SAME geometry as Save to: 76px tonal button +
+                            // field filling the rest, identical edges.
+                            let row_w = ui.available_rect_before_wrap().width();
+                            let field_w = (row_w - 76.0 - theme::SP_S).max(80.0);
+                            let display_url = ellipsize_end(&full_url, 64);
+                            let (rect, _resp) = ui.allocate_exact_size(
+                                egui::vec2(field_w, 36.0),
+                                egui::Sense::hover(),
+                            );
+                            let painter = ui.painter();
+                            painter.rect_filled(rect, egui::CornerRadius::same(6), theme::CONTROL);
+                            painter.rect_stroke(
+                                rect,
+                                egui::CornerRadius::same(6),
+                                egui::Stroke::new(1.0, theme::STROKE_SOFT),
+                                egui::StrokeKind::Middle,
+                            );
+                            let text_rect = egui::Rect::from_min_max(
+                                egui::pos2(rect.left() + 10.0, rect.top() + 2.0),
+                                egui::pos2(rect.right() - 10.0, rect.bottom() - 2.0),
+                            );
+                            let url_label = ui.put(
+                                text_rect,
+                                egui::Label::new(theme::caption_tertiary(&display_url))
+                                    
+                                    .truncate(),
+                            );
+                            url_label.on_hover_text(full_url.clone());
+                            let copy_label = if copied_active { "Copied" } else { "Copy" };
+                            if widgets::button_fixed_width(
+                                ui,
+                                copy_label,
+                                widgets::ButtonKind::Secondary,
+                                true,
+                                76.0,
+                            )
+                            .clicked()
+                            {
+                                ui.ctx().copy_text(full_url.clone());
+                                state.copied_at = Some(Instant::now());
+                            }
+                        });
+
+                        ui.add_space(theme::SP_S);
+
                         widgets::checkbox(
                             ui,
                             "rg-popup-dontask",
                             &mut state.dont_ask_again,
                             "Don't ask again for this site",
                         );
-
-                        ui.horizontal(|ui| {
-                            if widgets::button(ui, "Cancel", widgets::ButtonKind::Secondary, true)
-                                .clicked()
-                            {
-                                state.action = Some(PopupAction::Cancel);
-                            }
-                            if widgets::button(
-                                ui,
-                                "Download Later",
-                                widgets::ButtonKind::Secondary,
-                                true,
-                            )
-                            .clicked()
-                            {
-                                state.action = Some(PopupAction::Later);
-                            }
-                            if widgets::button(
-                                ui,
-                                "Start download",
-                                widgets::ButtonKind::Primary,
-                                true,
-                            )
-                            .clicked()
-                            {
-                                state.action = Some(PopupAction::Start);
-                            }
-                        });
                     });
+
+                // Keyboard: Escape cancels (Enter is handled by the
+                // Save-as field's `submitted` in the body panel).
+                if state.action.is_none()
+                    && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape))
+                {
+                    state.action = Some(PopupAction::Cancel);
+                }
                 // Keep the popup repainting while it is up (probe updates).
                 ui.ctx().request_repaint_after(Duration::from_millis(500));
             },
@@ -1572,7 +2592,17 @@ impl RapidGrabApp {
         };
         if let Some(pending) = &mut self.pending_capture {
             let state = self.popup_shared.lock().unwrap();
-            pending.output = state.output.clone();
+            pending.folder = state.folder.clone();
+            pending.name_stem = state.name_stem.clone();
+            pending.name_ext = state.name_ext.clone();
+            pending.output = std::path::Path::new(&state.folder)
+                .join(format!(
+                    "{}{}",
+                    sanitize_stem(&state.name_stem),
+                    state.name_ext
+                ))
+                .display()
+                .to_string();
             pending.dont_ask_again = state.dont_ask_again;
         }
         match action {
@@ -1592,11 +2622,15 @@ impl RapidGrabApp {
                 self.popup_shared.lock().unwrap().action = None;
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                     if let Some(pending) = &mut self.pending_capture {
-                        let name = std::path::Path::new(&pending.filename)
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "download.bin".to_string());
-                        pending.output = dir.join(name).display().to_string();
+                        pending.folder = dir.display().to_string();
+                        pending.output = dir
+                            .join(format!(
+                                "{}{}",
+                                sanitize_stem(&pending.name_stem),
+                                pending.name_ext
+                            ))
+                            .display()
+                            .to_string();
                     }
                 }
             }
@@ -1634,8 +2668,19 @@ impl eframe::App for RapidGrabApp {
             yt_dlp_args: self.settings.yt_dlp_args.clone(),
             auto_start_hosts: self.settings.auto_start_hosts.clone(),
             proxy: self.settings.proxy.clone(),
+            organize_by_category: self.settings.organize_by_category,
+            category_dirs: self.settings.category_dirs.clone(),
+            queue_paused: self.settings.queue_paused,
+            daily_limit_mb: self.settings.daily_limit_mb,
+            schedule_enabled: self.settings.schedule_enabled,
+            schedule_start: self.settings.schedule_start.clone(),
+            schedule_stop: self.settings.schedule_stop.clone(),
+            after_queue: self.settings.after_queue,
         };
         eframe::set_value(storage, SETTINGS_KEY, &settings);
+        // Mirror the shared fields for the standalone popup process.
+        self.persist_shared();
+        self.persist_queue();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1653,6 +2698,7 @@ impl eframe::App for RapidGrabApp {
                 job.error = Some("download worker exited unexpectedly".to_string());
             }
         }
+        self.scheduler_tick();
         self.pump_queue();
         self.show_auth_prompt(&ctx);
 
@@ -1691,8 +2737,22 @@ impl eframe::App for RapidGrabApp {
                 }
                 area.show(ui, |ui| {
                     widgets::content_column(ui, |ui| {
-                        header(ui, self, active, queued, total_speed);
+                        header(ui, self, active, queued, total_speed, &mut actions);
                         ui.add_space(theme::SP_M);
+
+                        if let Some(notice) = self.last_notice.clone() {
+                            widgets::warning_line(ui, &notice);
+                            ui.add_space(theme::SP_S);
+                        }
+                        if self.settings.queue_paused {
+                            widgets::info_line(ui, "Queue stopped — use Start Queue to resume.");
+                            ui.add_space(theme::SP_S);
+                        }
+
+                        if self.show_history {
+                            history_section(ui, self, &mut actions);
+                            return;
+                        }
 
                         if self.show_add_panel {
                             add_download_card(ui, self);
@@ -1739,31 +2799,6 @@ fn capture_host(url: &str) -> Option<String> {
                 .to_string()
         })
         .filter(|h| !h.is_empty())
-}
-
-/// `<last dir>/<filename or name from url>`, mirroring `suggest_output`.
-fn suggested_output_for(last_dir: &str, filename: Option<&str>, url: &str) -> String {
-    let name = filename
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            url.split(['?', '#'])
-                .next()
-                .unwrap_or("")
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("download.bin")
-                .to_string()
-        });
-    let dir = if last_dir.is_empty() {
-        dirs::download_dir().unwrap_or_else(|| PathBuf::from("."))
-    } else {
-        PathBuf::from(last_dir)
-    };
-    dir.join(name).display().to_string()
 }
 
 fn media_stage_label(stage: MediaStage) -> &'static str {
@@ -1823,6 +2858,7 @@ fn header(
     active: usize,
     queued: usize,
     total_speed: f64,
+    actions: &mut Vec<Action>,
 ) {
     ui.horizontal(|ui| {
         ui.add(
@@ -1841,6 +2877,22 @@ fn header(
             )));
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let queue_label = if app.settings.queue_paused {
+                "Start Queue"
+            } else {
+                "Stop Queue"
+            };
+            if widgets::button(ui, queue_label, widgets::ButtonKind::Secondary, true).clicked() {
+                actions.push(Action::ToggleQueue);
+            }
+            let history_label = if app.show_history {
+                "Downloads"
+            } else {
+                "History"
+            };
+            if widgets::button(ui, history_label, widgets::ButtonKind::Secondary, true).clicked() {
+                actions.push(Action::ToggleHistory);
+            }
             let label = if app.show_add_panel {
                 "Hide"
             } else {
@@ -2119,6 +3171,101 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
 
         widgets::divider(ui);
 
+        widgets::collapsible(ui, "rg-categories", "Categories", false, |ui| {
+            ui.spacing_mut().item_spacing.y = theme::SP_XS;
+            widgets::checkbox(
+                ui,
+                "rg-organize",
+                &mut app.settings.organize_by_category,
+                "Save downloads into per-category folders",
+            );
+            ui.add_space(theme::SP_XS);
+            for category in Category::all() {
+                let current = app
+                    .settings
+                    .category_dirs
+                    .get(&category)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        dirs::download_dir()
+                            .map(|dir| dir.join(category.default_subdir()).display().to_string())
+                            .unwrap_or_default()
+                    });
+                let mut value = current;
+                ui.add(egui::Label::new(theme::label(category.name())));
+                widgets::text_field(
+                    ui,
+                    widgets::Field::new(
+                        &format!("rg-category-{}", category.name().to_ascii_lowercase()),
+                        "default folder",
+                    ),
+                    &mut value,
+                );
+                let default_dir = dirs::download_dir()
+                    .map(|dir| dir.join(category.default_subdir()).display().to_string())
+                    .unwrap_or_default();
+                if value != default_dir {
+                    app.settings.category_dirs.insert(category, value);
+                } else {
+                    app.settings.category_dirs.remove(&category);
+                }
+            }
+            ui.add(egui::Label::new(theme::caption_tertiary(
+                "Blank or default folders are recomputed from the download directory.",
+            )));
+        });
+
+        widgets::divider(ui);
+
+        widgets::collapsible(ui, "rg-scheduler", "Scheduler", false, |ui| {
+            ui.spacing_mut().item_spacing.y = theme::SP_XS;
+            widgets::checkbox(
+                ui,
+                "rg-schedule-enabled",
+                &mut app.settings.schedule_enabled,
+                "Run the queue only inside the scheduled window (local time)",
+            );
+            ui.add_space(theme::SP_XS);
+            form_columns(
+                ui,
+                |ui| {
+                    ui.add(egui::Label::new(theme::label("Start (HH:MM, empty = always)")));
+                    widgets::text_field(
+                        ui,
+                        widgets::Field::new("rg-schedule-start", "22:00"),
+                        &mut app.settings.schedule_start,
+                    );
+                },
+                |ui| {
+                    ui.add(egui::Label::new(theme::label("Stop (HH:MM, empty = never)")));
+                    widgets::text_field(
+                        ui,
+                        widgets::Field::new("rg-schedule-stop", "06:00"),
+                        &mut app.settings.schedule_stop,
+                    );
+                },
+            );
+            ui.add_space(theme::SP_XS);
+            let after_labels: Vec<&str> = AfterAction::all().iter().map(|a| a.label()).collect();
+            let selected = AfterAction::all()
+                .iter()
+                .position(|a| *a == app.settings.after_queue)
+                .unwrap_or(0);
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new(theme::label("After the queue finishes")));
+                if let Some(index) = widgets::dropdown(ui, "rg-after-queue", selected, &after_labels, theme::DROPDOWN_W) {
+                    app.settings.after_queue = AfterAction::all()[index];
+                }
+            });
+            ui.add_space(theme::SP_XS);
+            widgets::stepper(ui, "rg-daily-limit", &mut app.settings.daily_limit_mb, 0..=1_000_000);
+            ui.add(egui::Label::new(theme::caption_tertiary(
+                "Daily download limit in MB (0 = unlimited). Usage resets at midnight.",
+            )));
+        });
+
+        widgets::divider(ui);
+
         if app.settings.auto_resolve {
             widgets::info_line(
                 ui,
@@ -2292,6 +3439,90 @@ fn max_height_picker(ui: &mut egui::Ui, value: &mut u32) {
             *value = values[index];
         }
     });
+}
+
+/// History page: finished downloads from `history.jsonl`, newest first.
+fn history_section(ui: &mut egui::Ui, app: &mut RapidGrabApp, actions: &mut Vec<Action>) {
+    ui.horizontal(|ui| {
+        ui.add(egui::Label::new(theme::section("History")));
+        widgets::chip(ui, &app.history_cache.len().to_string(), theme::ACCENT);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if widgets::button(ui, "Clear history", widgets::ButtonKind::Secondary, true).clicked() {
+                actions.push(Action::ClearHistory);
+            }
+        });
+    });
+    ui.add_space(theme::SP_S);
+
+    if app.history_cache.is_empty() {
+        widgets::card().show(ui, |ui| {
+            widgets::empty_state(
+                ui,
+                theme::Icon::Download,
+                "No history yet",
+                "Finished downloads will appear here.",
+            );
+        });
+        return;
+    }
+
+    let entries: Vec<rg_config::HistoryEntry> = app.history_cache.clone();
+    for (index, entry) in entries.iter().enumerate().rev() {
+        let name = entry
+            .output
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&entry.output)
+            .to_string();
+        let status_color = match entry.status.as_str() {
+            "completed" => theme::SUCCESS_MUTED,
+            "failed" => theme::ERROR,
+            _ => theme::NEUTRAL,
+        };
+        widgets::card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new(theme::label(truncate_url(&name, 60))).truncate());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    widgets::chip(ui, &entry.status, status_color);
+                    widgets::chip(ui, entry.category.name(), theme::TEXT_SECONDARY);
+                });
+            });
+            ui.add(egui::Label::new(theme::caption_tertiary(view_host(&entry.url))).truncate());
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new(theme::caption(format!(
+                    "{} · {} · {}",
+                    human_bytes(entry.bytes),
+                    fmt_duration(Duration::from_millis(entry.elapsed_ms)),
+                    format_history_time(entry.ts)
+                ))));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if widgets::button(ui, "Retry", widgets::ButtonKind::Secondary, true).clicked() {
+                        actions.push(Action::HistoryRetry(index));
+                    }
+                    if widgets::button(ui, "Folder", widgets::ButtonKind::Secondary, true).clicked() {
+                        actions.push(Action::HistoryFolder(index));
+                    }
+                    if widgets::button(ui, "Open", widgets::ButtonKind::Secondary, true).clicked() {
+                        actions.push(Action::HistoryOpen(index));
+                    }
+                    if widgets::button(ui, "Copy URL", widgets::ButtonKind::Secondary, true).clicked() {
+                        ui.ctx().copy_text(entry.url.clone());
+                    }
+                });
+            });
+            if let Some(error) = &entry.error {
+                ui.add_space(theme::SP_XS);
+                widgets::alert(ui, error, theme::ERROR);
+            }
+        });
+        ui.add_space(theme::SP_M);
+    }
+}
+
+fn format_history_time(ts: u64) -> String {
+    chrono::DateTime::from_timestamp(ts as i64, 0)
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| ts.to_string())
 }
 
 /// Downloads heading plus either the empty state or the scrolling card list.
@@ -2567,6 +3798,15 @@ fn job_card(ui: &mut egui::Ui, view: &JobView, actions: &mut Vec<Action>) {
             ui.add(egui::Label::new(theme::caption_tertiary(view_host(
                 &view.url,
             ))));
+            widgets::chip(ui, view.category.name(), theme::TEXT_SECONDARY);
+            // Priority cycles Low → Normal → High → Low.
+            let prio_label = format!("{} priority", view.priority.label());
+            if widgets::button(ui, &prio_label, widgets::ButtonKind::Secondary, true)
+                .on_hover_text("Cycle queue priority (High runs first)")
+                .clicked()
+            {
+                actions.push(Action::CyclePriority(view.id));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 widgets::status_chip(ui, &view.status);
             });
