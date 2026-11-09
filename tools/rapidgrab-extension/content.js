@@ -46,8 +46,29 @@
     return null;
   }
 
-  function titleFor() {
-    return document.title || "";
+  // A human title for the capture: the player's own label first, then the
+  // enclosing post's text (Facebook feed videos), then the document title.
+  // The background rejects generic values, so returning "" is safe.
+  function cleanTitle(text) {
+    return String(text || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 120);
+  }
+
+  function titleFor(video) {
+    const labelled = cleanTitle(
+      (video && (video.title || video.getAttribute("aria-label"))) ||
+        (video && video.closest('[aria-label]') && video.closest('[aria-label]').getAttribute("aria-label"))
+    );
+    if (labelled) return labelled;
+
+    const post = video && video.closest('[role="article"], article, main');
+    if (post) {
+      const text = cleanTitle(post.innerText || post.textContent || "");
+      if (text) return text;
+    }
+    return cleanTitle(document.title);
   }
 
   function isRealPlayer(video) {
@@ -235,7 +256,7 @@
         .sendMessage({
           type: "rapidgrab-media",
           url,
-          title: titleFor(),
+          title: titleFor(video),
         })
         .catch(() => {});
     });

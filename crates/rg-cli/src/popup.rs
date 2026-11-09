@@ -106,6 +106,29 @@ fn suggested_output(filename: &str) -> String {
     download_dir().join(filename).display().to_string()
 }
 
+/// One-line summary of a capture URL for the popup: host + last path
+/// segment. Signed CDN URLs (Facebook) can run to hundreds of characters of
+/// query tokens; the full URL stays available through the copy button and
+/// the hover tooltip instead of filling the window.
+fn short_url_display(url: &str) -> String {
+    let without_query = url.split(['?', '#']).next().unwrap_or(url);
+    let mut parts = without_query.splitn(4, '/');
+    let scheme = parts.next().unwrap_or("");
+    let host = parts.next().unwrap_or("");
+    let rest = without_query
+        .strip_prefix(&format!("{scheme}//{host}"))
+        .unwrap_or("");
+    let basename = rest.rsplit('/').next().unwrap_or("");
+    if host.is_empty() {
+        return url.to_string();
+    }
+    if basename.is_empty() {
+        format!("{host}/")
+    } else {
+        format!("{host}/…/{basename}")
+    }
+}
+
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
@@ -183,22 +206,40 @@ impl eframe::App for PopupApp {
                     .inner_margin(egui::Margin::same(16)),
             )
             .show(ui, |ui: &mut egui::Ui| {
-                ui.add(egui::Label::new(
-                    egui::RichText::new(&self.display_name)
-                        .strong()
-                        .size(16.0)
-                        .color(TEXT),
-                ));
+                let title = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&self.display_name)
+                            .strong()
+                            .size(16.0)
+                            .color(TEXT),
+                    )
+                    .truncate(),
+                );
+                title.on_hover_text(&self.display_name);
                 ui.add(egui::Label::new(
                     egui::RichText::new(format!("{source_label} · {size_label} · {type_label}"))
                         .color(TEXT_SECONDARY)
                         .size(12.0),
                 ));
-                ui.add(egui::Label::new(
-                    egui::RichText::new(&self.capture.url)
-                        .color(TEXT_SECONDARY)
-                        .size(12.0),
-                ));
+                ui.horizontal(|ui| {
+                    let short_url = short_url_display(&self.capture.url);
+                    let url_label = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&short_url)
+                                .color(TEXT_SECONDARY)
+                                .size(12.0),
+                        )
+                        .truncate(),
+                    );
+                    url_label.on_hover_text(&self.capture.url);
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("Copy link").size(12.0)))
+                        .on_hover_text("Copy the full download URL")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(self.capture.url.clone());
+                    }
+                });
                 ui.add(egui::Label::new(
                     egui::RichText::new("Save as").color(TEXT).size(13.0),
                 ));
@@ -311,9 +352,9 @@ fn spawn_probe(capture: CaptureRequest, probe: Arc<Mutex<ProbeState>>) {
 /// Title and default file name for a capture.
 ///
 /// The browser-provided name wins; when it is missing (sniffed CDN streams)
-/// fall back to the last URL path segment, which is a real file name such as
-/// `AQM…ZA.mp4`. The whole URL is printed above the title anyway, so keeping
-/// it there as well adds nothing.
+/// fall back to the last URL path segment (a real file name such as
+/// `AQM…ZA.mp4`, still a hash on Facebook, but the Save-as name needs an
+/// extension anyway; the URL row below shows where it comes from).
 fn display_name_for(capture: &CaptureRequest) -> String {
     if let Some(name) = capture
         .content_disposition_filename
@@ -369,7 +410,7 @@ fn main() -> Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Download")
-            .with_inner_size([420.0, 360.0])
+            .with_inner_size([560.0, 380.0])
             .with_resizable(false)
             .with_active(true),
         ..Default::default()

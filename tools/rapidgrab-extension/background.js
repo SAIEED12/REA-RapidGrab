@@ -297,10 +297,27 @@ function isYouTubePage(url) {
   }
 }
 
+/// Generic titles that name nothing (site shells, feeds). A player title
+/// worth using as a filename must say more than this.
+const GENERIC_TITLES = new Set([
+  "facebook", "watch", "home", "feed", "youtube", "video", "videos", "reels",
+]);
+
+/// True when a title is specific enough to be a useful file name.
+function isMeaningfulTitle(title) {
+  if (!title) return false;
+  const name = String(title).trim().toLowerCase();
+  if (!name || GENERIC_TITLES.has(name)) return false;
+  // The site shell's own document title ("Facebook" alone, favicon suffixes
+  // aside) is not a video title.
+  if (/^(facebook|youtube|watch)(?:\s*[-–—|].*)?$/i.test(name)) return false;
+  return true;
+}
+
 /// Turn a YouTube tab title ("My Video - YouTube") into a safe
 /// "My Video.mp4" filename. Returns null when there is no usable title.
 function filenameFromTitle(title) {
-  if (!title) return null;
+  if (!title || !isMeaningfulTitle(title)) return null;
   let name = String(title)
     .replace(/\s*[-–—|]\s*YouTube(?:\s+Music)?\s*$/i, "")
     .replace(/[<>:"/\\|?*\x00-\x1f]/g, "")
@@ -427,10 +444,11 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const tab = sender.tab
         ? { url: sender.tab.url, title: msg.title }
         : null;
+      // Prefer a human title (post caption, player label) for both paths.
+      // A sniffed CDN URL only borrows it when it is specific; generic site
+      // titles ("Facebook", "Watch") fall back to the CDN basename.
       sendCapture(url, tab, {
-        // A sniffed CDN URL has a usable name of its own; the tab title is
-        // only a good name for the page-resolver fallback.
-        filename: !sniffed && msg.title ? filenameFromTitle(msg.title) : null,
+        filename: msg.title ? filenameFromTitle(msg.title) : null,
         source: "media",
       });
       sendResponse({ ok: true });
