@@ -282,73 +282,21 @@ function guessFilename(url) {
   return null;
 }
 
-/// True for YouTube watch/share pages where the URL itself carries no
-/// filename — the video filename can only come from the tab title.
-function isYouTubePage(url) {
-  try {
-    const host = new URL(url).hostname.toLowerCase();
-    return (
-      host === "youtube.com" ||
-      host.endsWith(".youtube.com") ||
-      host === "youtu.be"
-    );
-  } catch (_) {
-    return false;
-  }
-}
-
-/// Generic titles that name nothing (site shells, feeds). A player title
-/// worth using as a filename must say more than this.
-const GENERIC_TITLES = new Set([
-  "facebook", "watch", "home", "feed", "youtube", "video", "videos", "reels",
-]);
-
-/// True when a title is specific enough to be a useful file name.
-function isMeaningfulTitle(title) {
-  if (!title) return false;
-  const name = String(title).trim().toLowerCase();
-  if (!name || GENERIC_TITLES.has(name)) return false;
-  // The site shell's own document title ("Facebook" alone, favicon suffixes
-  // aside) is not a video title.
-  if (/^(facebook|youtube|watch)(?:\s*[-–—|].*)?$/i.test(name)) return false;
-  return true;
-}
-
-/// Turn a YouTube tab title ("My Video - YouTube") into a safe
-/// "My Video.mp4" filename. Returns null when there is no usable title.
-function filenameFromTitle(title) {
-  if (!title || !isMeaningfulTitle(title)) return null;
-  let name = String(title)
-    .replace(/\s*[-–—|]\s*YouTube(?:\s+Music)?\s*$/i, "")
-    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "")
-    .replace(/\s+/g, " ")
-    .replace(/[. ]+$/, "")
-    .trim()
-    .slice(0, 120);
-  if (!name) return null;
-  if (!/\.(mp4|webm|mkv|mov|avi|mp3|m4a|wav)$/i.test(name)) {
-    name += ".mp4";
-  }
-  return name;
-}
-
 async function sendCapture(url, tab, info) {
   if (!/^https?:\/\//i.test(url)) {
     console.warn("[RapidGrab] not an http(s) URL:", url);
     return;
   }
   info = info || {};
-  let filename = info.filename || guessFilename(url);
-  // YouTube watch/share pages carry no filename in the URL — name the
-  // capture from the tab title instead of falling back to download.bin.
-  if (!filename && isYouTubePage(url)) {
-    filename = filenameFromTitle(tab && tab.title);
-  }
+  // Send the title raw. rg-core's clean_title owns site-suffix stripping,
+  // notification counters, generic rejection, and Windows sanitizing.
+  const rawTitle = info.title || (tab && tab.title) || "";
   const payload = {
     url,
-    filename: filename || undefined,
+    filename: info.filename || guessFilename(url) || undefined,
     referer: (tab && tab.url) || undefined,
     user_agent: navigator.userAgent,
+    title: String(rawTitle).trim() || undefined,
     content_disposition_filename: info.contentDisposition
       ? parseDispositionFilename(info.contentDisposition) || undefined
       : undefined,
@@ -430,25 +378,22 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // response seen on this tab. Falls back to the page URL (the resolver
     // handles it) when nothing recent was recorded or the host needs yt-dlp.
     let url = msg.url || "";
-    let sniffed = false;
     if (!/^https?:\/\//i.test(url)) {
       const recent = tabId !== undefined ? recentMediaFor(tabId, now) : null;
       if (recent) {
         url = recent;
-        sniffed = true;
       } else {
         url = (sender.tab && sender.tab.url) || "";
       }
     }
     if (/^https?:\/\//i.test(url)) {
+      // Keep the tab's own title as a second source; the content script's
+      // click-time title (post text / watch h1 / og:title) is more precise.
       const tab = sender.tab
-        ? { url: sender.tab.url, title: msg.title }
+        ? { url: sender.tab.url, title: sender.tab.title }
         : null;
-      // Prefer a human title (post caption, player label) for both paths.
-      // A sniffed CDN URL only borrows it when it is specific; generic site
-      // titles ("Facebook", "Watch") fall back to the CDN basename.
       sendCapture(url, tab, {
-        filename: msg.title ? filenameFromTitle(msg.title) : null,
+        title: msg.title,
         source: "media",
       });
       sendResponse({ ok: true });

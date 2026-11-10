@@ -46,29 +46,95 @@
     return null;
   }
 
-  // A human title for the capture: the player's own label first, then the
-  // enclosing post's text (Facebook feed videos), then the document title.
-  // The background rejects generic values, so returning "" is safe.
-  function cleanTitle(text) {
-    return String(text || "")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 120);
+  // Raw, click-time title extraction. All cleaning (site suffixes,
+  // notification counters, generic placeholders, Windows-safe output) lives
+  // in rg-core; this script deliberately sends the page's own text.
+  function firstLine(text) {
+    const line = String(text || "")
+      .split(/\r?\n/)
+      .map((part) => part.trim())
+      .find(Boolean);
+    return line || "";
+  }
+
+  // Feeds never carry one video's title, so og:title is only trusted on a
+  // single-video/permalink URL. YouTube is an SPA: this runs at click time.
+  function isSingleVideoUrl() {
+    try {
+      const url = new URL(location.href);
+      const host = url.hostname.toLowerCase();
+      const path = url.pathname.toLowerCase();
+      if (host === "youtu.be") return /^\/[\w-]{6,}\/?$/.test(path);
+      if (host === "youtube.com" || host.endsWith(".youtube.com")) {
+        if (path === "/watch") return url.searchParams.has("v");
+        return /^\/(shorts|live|embed)\/[\w-]{6,}/.test(path);
+      }
+      if (host === "facebook.com" || host.endsWith(".facebook.com")) {
+        if (path.startsWith("/watch") && !url.searchParams.has("v")) return false;
+        return /^\/(reel|videos?|watch|permalink\.php|photo\.php|story\.php)/.test(path);
+      }
+      if (host === "instagram.com" || host.endsWith(".instagram.com")) {
+        return /^\/(p|reel|reels|tv)\//.test(path);
+      }
+      if (host === "tiktok.com" || host.endsWith(".tiktok.com")) {
+        return /\/video\/\d+/.test(path);
+      }
+      if (host === "twitter.com" || host === "x.com" ||
+          host.endsWith(".twitter.com") || host.endsWith(".x.com")) {
+        return /\/status\/\d+/.test(path);
+      }
+      if (host === "vimeo.com" || host.endsWith(".vimeo.com")) {
+        return /^\/\d+/.test(path);
+      }
+      return path !== "/" &&
+        !/^\/(feed|home|watch|results|search|explore|reels)\/?$/.test(path);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function metaTitle() {
+    const meta = document.querySelector(
+      'meta[property="og:title"], meta[name="og:title"]'
+    );
+    return meta ? firstLine(meta.getAttribute("content")) : "";
   }
 
   function titleFor(video) {
-    const labelled = cleanTitle(
+    // 1. The video's own post/article container (Facebook feed captions).
+    const post = video && video.closest('[role="article"], article');
+    if (post) {
+      const text = firstLine(post.innerText || post.textContent);
+      if (text) return text;
+    }
+
+    // 2. Watch-page h1 (YouTube's metadata heading survives SPA navigation).
+    const heading = document.querySelector(
+      "ytd-watch-metadata h1, ytd-watch-metadata #title h1, " +
+        "h1.title.ytd-video-primary-info-renderer"
+    );
+    if (heading) {
+      const text = firstLine(heading.innerText || heading.textContent);
+      if (text) return text;
+    }
+
+    // 3. og:title only on a single-video/permalink page.
+    if (isSingleVideoUrl()) {
+      const text = metaTitle();
+      if (text) return text;
+    }
+
+    // 4. The player's own label (often the generic "YouTube Video Player";
+    //    the native side rejects generic values and moves on).
+    const labelled = firstLine(
       (video && (video.title || video.getAttribute("aria-label"))) ||
-        (video && video.closest('[aria-label]') && video.closest('[aria-label]').getAttribute("aria-label"))
+        (video && video.closest('[aria-label]') &&
+          video.closest('[aria-label]').getAttribute("aria-label"))
     );
     if (labelled) return labelled;
 
-    const post = video && video.closest('[role="article"], article, main');
-    if (post) {
-      const text = cleanTitle(post.innerText || post.textContent || "");
-      if (text) return text;
-    }
-    return cleanTitle(document.title);
+    // 5. Last resort: the tab title (also cleaned natively).
+    return firstLine(document.title);
   }
 
   function isRealPlayer(video) {

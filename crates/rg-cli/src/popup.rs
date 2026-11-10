@@ -128,12 +128,15 @@ fn download_dir() -> std::path::PathBuf {
     }
 }
 
-/// Default Save-as path, routed into the per-category folder when the shared
-/// config enables organizing (the GUI writes `settings.json` on save).
-fn suggested_output_routed(filename: &str, content_type: Option<&str>) -> String {
+/// Default Save-as name and path, routed into the per-category folder when
+/// the shared config enables organizing (the GUI writes `settings.json` on
+/// save). An existing file becomes `name (1).ext` so nothing is overwritten.
+fn suggested_output_routed(filename: &str, content_type: Option<&str>) -> (String, String) {
     let config = rg_config::AppConfig::load();
     let dir = config.dir_for(&download_dir(), filename, content_type);
-    dir.join(filename).display().to_string()
+    let name = rg_core::unique_file_name(&dir, filename);
+    let path = dir.join(&name).display().to_string();
+    (name, path)
 }
 
 /// Pretty display host for header chips: prefer the page (referer) host —
@@ -182,14 +185,6 @@ impl FileKind {
         }
     }
 
-    fn word(self) -> &'static str {
-        match self {
-            FileKind::Video => "video",
-            FileKind::Audio => "audio",
-            FileKind::Image => "image",
-            FileKind::File => "file",
-        }
-    }
 }
 
 /// Split a full name into its editable stem and locked extension.
@@ -202,97 +197,10 @@ fn split_name(name: &str) -> (String, String) {
     (name.to_string(), String::new())
 }
 
-/// True for CDN hash names such as `AQN6GyYVlQ5c…mp4`: long, no spaces,
-/// mixed case with digits.
-fn is_hash_like(stem: &str) -> bool {
-    let len = stem.chars().count();
-    if len < 16 || stem.contains(' ') || stem.contains('-') || stem.contains('_') {
-        return false;
-    }
-    let lower = stem.chars().filter(|c| c.is_ascii_lowercase()).count();
-    let upper = stem.chars().filter(|c| c.is_ascii_uppercase()).count();
-    let digits = stem.chars().filter(|c| c.is_ascii_digit()).count();
-    lower >= 3 && upper >= 3 && digits >= 3
-}
-
-/// Second-level label of a host for the default name
-/// (`www.facebook.com` → `facebook`).
-fn site_label(host: &str) -> String {
-    let host = host.trim();
-    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
-    let pick = if labels.len() >= 2 {
-        labels[labels.len() - 2]
-    } else {
-        host
-    };
-    pick.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .collect::<String>()
-        .to_ascii_lowercase()
-}
-
-/// Extension for a default name: the download's own extension wins,
-/// otherwise one derived from Content-Type.
-fn ext_for_type(content_type: Option<&str>) -> &'static str {
-    match content_type.unwrap_or("").to_ascii_lowercase().as_str() {
-        t if t.starts_with("video/") => {
-            if t.contains("webm") { ".webm" } else if t.contains("quicktime") { ".mov" } else { ".mp4" }
-        }
-        t if t.starts_with("audio/") => {
-            if t.contains("mpeg") { ".mp3" } else { ".m4a" }
-        }
-        t if t.starts_with("image/") => {
-            if t.contains("png") { ".png" } else if t.contains("webp") { ".webp" } else { ".jpg" }
-        }
-        _ => ".bin",
-    }
-}
-
-/// Readable default for hash / over-long names:
-/// `facebook_video_2026-11-09.mp4`.
-fn suggested_media_name(
-    original: &str,
-    referer: Option<&str>,
-    url: &str,
-    content_type: Option<&str>,
-) -> String {
-    let (stem, ext) = split_name(original);
-    if !is_hash_like(&stem) && stem.chars().count() <= 40 {
-        return original.to_string();
-    }
-    let host = referer
-        .map(pretty_host)
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| pretty_host(url));
-    let site = site_label(&host);
-    let site = if site.is_empty() { "download".to_string() } else { site };
-    // Classify from the full name (extension included) — the stem alone
-    // has no extension and would always fall through to File.
-    let kind = FileKind::from_parts(original, content_type);
-    let date = chrono::Local::now().format("%Y-%m-%d");
-    let ext = if ext.is_empty() {
-        ext_for_type(content_type).to_string()
-    } else {
-        ext
-    };
-    format!("{site}_{}_{date}{ext}", kind.word())
-}
-
 /// Strip characters that Windows forbids in file names; used for the
 /// editable stem so a pasted path can't escape the save folder.
 fn sanitize_stem(stem: &str) -> String {
-    let cleaned: String = stem
-        .chars()
-        .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
-        .filter(|c| !c.is_control())
-        .collect::<String>()
-        .trim()
-        .to_string();
-    if cleaned.is_empty() {
-        "download".to_string()
-    } else {
-        cleaned
-    }
+    rg_core::sanitize_file_stem(stem)
 }
 
 /// Keep the head and tail visible for long paths
@@ -596,6 +504,7 @@ impl PopupApp {
             referer: self.capture.referer.clone(),
             cookies: self.capture.cookies.clone(),
             user_agent: self.capture.user_agent.clone(),
+            title: self.capture.title.clone(),
             content_disposition_filename: self.capture.content_disposition_filename.clone(),
             content_type: self.capture.content_type.clone(),
             content_length: self.capture.content_length.clone(),
@@ -626,7 +535,9 @@ impl eframe::App for PopupApp {
         let is_media_page = self.capture.source.as_deref() == Some("media")
             && !rg_bridge::is_media_file_url(&self.capture.url);
         let (size_label, type_label) = if is_media_page {
-            ("Video page".to_string(), "resolved on Start".to_string())
+            // The resolver runs on Start; there is no probe type yet. Keep
+            // this in the tooltip instead of a permanent "RESOLVED" chip.
+            ("Video page".to_string(), String::new())
         } else {
             // While probing, the stored size may be the browser's partial
             // (206 range) value — don't show it until the probe settles.
@@ -805,11 +716,17 @@ impl eframe::App for PopupApp {
                             );
                         }
                         // Chips: size · type · host, plus a warning when the
-                        // probed size may be a partial range chunk.
-                        ui.horizontal(|ui| {
+                        // probed size may be a partial range chunk. Wrapped
+                        // so a long host never overflows the card.
+                        ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
-                            chip(ui, &size_label, TEXT_SECONDARY, 0.14);
-                            if type_chip != "—" && type_chip != "…" {
+                            let size = chip(ui, &size_label, TEXT_SECONDARY, 0.14);
+                            if is_media_page {
+                                size.on_hover_text(
+                                    "The media URL is resolved when the download starts.",
+                                );
+                            }
+                            if !type_chip.is_empty() && type_chip != "—" && type_chip != "…" {
                                 chip(ui, &type_chip, TEXT_SECONDARY, 0.14);
                             }
                             if !display_host.is_empty() {
@@ -1020,53 +937,32 @@ fn spawn_probe(capture: CaptureRequest, probe: Arc<Mutex<ProbeState>>) {
     });
 }
 
-/// Title and default file name for a capture.
+/// Default Save-as name for a capture.
 ///
-/// The browser-provided name wins; when it is missing (sniffed CDN streams)
-/// fall back to the last URL path segment (a real file name such as
-/// `AQM…ZA.mp4`, still a hash on Facebook, but the Save-as name needs an
-/// extension anyway; the URL row below shows where it comes from).
-fn display_name_for(capture: &CaptureRequest) -> String {
-    if let Some(name) = capture
-        .content_disposition_filename
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        return name.to_string();
-    }
-    if let Some(name) = capture
-        .filename
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        return name.to_string();
-    }
-    let path = capture.url.split(['?', '#']).next().unwrap_or("");
-    if let Some(segment) = path.rsplit('/').find(|part| !part.is_empty()) {
-        if let Some(dot) = segment.rfind('.') {
-            if dot > 0 && segment.len() > dot + 1 {
-                return segment.to_string();
-            }
-        }
-    }
-    capture.url.clone()
+/// All title cleaning lives in rg-core so the popup and the GUI agree:
+/// Content-Disposition (unless generic) → cleaned page/video title → browser
+/// filename → readable URL basename → dated site fallback.
+fn default_display_name(capture: &CaptureRequest) -> String {
+    rg_core::default_capture_name(&rg_core::NamingContext {
+        title: capture.title.as_deref(),
+        content_disposition: capture.content_disposition_filename.as_deref(),
+        filename: capture.filename.as_deref(),
+        url: &capture.url,
+        referer: capture.referer.as_deref(),
+        content_type: capture.content_type.as_deref(),
+        media_capture: capture.source.as_deref() == Some("media"),
+    })
 }
 
 fn main() -> Result<()> {
     let capture = rg_bridge::read_frame(std::io::stdin())?;
 
-    let raw_name = display_name_for(&capture);
-    let display_name = suggested_media_name(
-        &raw_name,
-        capture.referer.as_deref(),
-        &capture.url,
-        capture.content_type.as_deref(),
-    );
+    let default_name = default_display_name(&capture);
+    let (display_name, output) = match capture.output.clone() {
+        Some(output) => (default_name, output),
+        None => suggested_output_routed(&default_name, capture.content_type.as_deref()),
+    };
     let (name_stem, name_ext) = split_name(&display_name);
-    let output = capture
-        .output
-        .clone()
-        .unwrap_or_else(|| suggested_output_routed(&display_name, capture.content_type.as_deref()));
     let folder = std::path::Path::new(&output)
         .parent()
         .map(|p| p.display().to_string())
@@ -1096,7 +992,7 @@ fn main() -> Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("New download — RapidGrab")
-            .with_inner_size([520.0, 288.0])
+            .with_inner_size([520.0, 304.0])
             .with_resizable(false)
             .with_active(true),
         ..Default::default()
@@ -1136,6 +1032,7 @@ fn main() -> Result<()> {
                 referer: None,
                 cookies: None,
                 user_agent: None,
+                title: None,
                 content_disposition_filename: None,
                 content_type: None,
                 content_length: None,

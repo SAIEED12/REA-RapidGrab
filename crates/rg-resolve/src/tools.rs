@@ -52,27 +52,58 @@ impl Tools {
     }
 }
 
-/// Search `PATH`, then known install directories (pip --user, WinGet, Scoop,
-/// Chocolatey, and the Python launcher directories).
+/// Search bundled tool folders, then `PATH`, then known install directories.
+///
+/// Bundled folders are checked first so a copy dropped into the install
+/// directory wins over a stale system install:
+/// * `%LOCALAPPDATA%\Programs\RapidGrab\tools`
+/// * `<folder containing the running exe>\tools` (portable `dist\` layout)
 pub fn find_tool(name: &str) -> Option<PathBuf> {
-    let names: Vec<OsString> = if cfg!(windows) {
-        vec![format!("{name}.exe").into(), name.into()]
-    } else {
-        vec![name.into()]
-    };
+    if let Some(path) = find_in_dirs(bundled_tool_dirs(), name) {
+        return Some(path);
+    }
 
     if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            for candidate in &names {
-                let full = dir.join(candidate);
-                if full.is_file() {
-                    return Some(full);
-                }
-            }
+        if let Some(found) = find_in_dirs(std::env::split_paths(&path), name) {
+            return Some(found);
         }
     }
 
-    for dir in extra_dirs() {
+    find_in_dirs(extra_dirs(), name)
+}
+
+/// Directories whose `tools\` subfolder may hold helper binaries, in order.
+/// Kept separate from [`find_tool`] so it can be unit-tested.
+pub fn bundled_tool_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        dirs.push(
+            PathBuf::from(local)
+                .join("Programs")
+                .join("RapidGrab")
+                .join("tools"),
+        );
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.join("tools"));
+        }
+    }
+    dirs
+}
+
+/// Platform file names to try for `name` (`tool.exe` first on Windows).
+fn tool_names(name: &str) -> Vec<OsString> {
+    if cfg!(windows) {
+        vec![format!("{name}.exe").into(), name.into()]
+    } else {
+        vec![name.into()]
+    }
+}
+
+fn find_in_dirs(dirs: impl IntoIterator<Item = PathBuf>, name: &str) -> Option<PathBuf> {
+    let names = tool_names(name);
+    for dir in dirs {
         for candidate in &names {
             let full = dir.join(candidate);
             if full.is_file() {
@@ -218,5 +249,30 @@ mod tests {
         if cfg!(windows) {
             assert!(find_tool("cmd").is_some(), "cmd.exe should be on PATH");
         }
+    }
+
+    #[test]
+    fn bundled_dirs_are_searched_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let exe = if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" };
+        std::fs::write(first.join(exe), b"first").unwrap();
+        std::fs::write(second.join(exe), b"second").unwrap();
+
+        let found = find_in_dirs(vec![first.clone(), second], "yt-dlp").unwrap();
+        assert_eq!(found, first.join(exe));
+    }
+
+    #[test]
+    fn missing_bundled_tool_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(find_in_dirs(
+            vec![dir.path().to_path_buf()],
+            "definitely-not-a-real-tool"
+        )
+        .is_none());
     }
 }

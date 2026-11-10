@@ -45,6 +45,10 @@ pub struct CaptureRequest {
     pub cookies: Option<String>,
     #[serde(default)]
     pub user_agent: Option<String>,
+    /// Raw page/video title (og:title, watch-page h1, post text, …). Cleaned
+    /// by `rg_core::clean_title`; the extension deliberately sends it raw.
+    #[serde(default)]
+    pub title: Option<String>,
     /// Value of the `Content-Disposition: filename=` (or `filename*=`) header.
     #[serde(default)]
     pub content_disposition_filename: Option<String>,
@@ -294,6 +298,7 @@ mod tests {
             referer: Some("http://example.com/".into()),
             cookies: Some("a=1; b=2".into()),
             user_agent: Some("UA".into()),
+            title: Some("My Video - YouTube".into()),
             content_disposition_filename: Some("file.bin".into()),
             content_type: Some("application/octet-stream".into()),
             content_length: Some(123),
@@ -311,6 +316,7 @@ mod tests {
         assert_eq!(back.referer, req.referer);
         assert_eq!(back.cookies, req.cookies);
         assert_eq!(back.user_agent, req.user_agent);
+        assert_eq!(back.title, req.title);
         assert_eq!(back.content_length, req.content_length);
         assert_eq!(back.source, req.source);
     }

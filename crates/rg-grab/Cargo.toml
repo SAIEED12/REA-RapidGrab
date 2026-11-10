@@ -1,0 +1,17 @@
+[package]
+name = "rg-grab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Site Grabber crawler: collect downloadable files from a site"
+
+[dependencies]
+rg-core = { path = "../rg-core" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+futures-util = "0.3"
+anyhow = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }

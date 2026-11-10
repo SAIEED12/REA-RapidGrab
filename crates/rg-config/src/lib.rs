@@ -255,6 +255,69 @@ pub struct AppConfig {
     pub daily_limit_mb: u64,
     #[serde(default)]
     pub scheduler: ScheduleSettings,
+    /// Site Grabber form state (Phase 5), so a scan can be resumed later.
+    #[serde(default)]
+    pub grabber: GrabberSettings,
+}
+
+/// Site Grabber inputs persisted with the shared configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrabberSettings {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default = "default_true")]
+    pub same_domain: bool,
+    #[serde(default = "default_grab_depth")]
+    pub max_depth: usize,
+    #[serde(default = "default_grab_pages")]
+    pub max_pages: usize,
+    /// Selected preset names ("Video", "Audio", …).
+    #[serde(default = "default_grab_presets")]
+    pub presets: Vec<String>,
+    /// Extra extensions typed by the user (with or without leading dots).
+    #[serde(default)]
+    pub custom_extensions: String,
+    /// URL substring / `*` wildcard patterns.
+    #[serde(default)]
+    pub include: String,
+    #[serde(default)]
+    pub exclude: String,
+    #[serde(default = "default_true")]
+    pub respect_robots: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_grab_depth() -> usize {
+    2
+}
+
+fn default_grab_pages() -> usize {
+    200
+}
+
+fn default_grab_presets() -> Vec<String> {
+    ["Video", "Audio", "Archives", "Documents", "Programs"]
+        .map(str::to_string)
+        .to_vec()
+}
+
+impl Default for GrabberSettings {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            same_domain: true,
+            max_depth: default_grab_depth(),
+            max_pages: default_grab_pages(),
+            presets: default_grab_presets(),
+            custom_extensions: String::new(),
+            include: String::new(),
+            exclude: String::new(),
+            respect_robots: true,
+        }
+    }
 }
 
 impl AppConfig {
@@ -581,6 +644,26 @@ mod tests {
         );
         config.organize_by_category = false;
         assert_eq!(config.dir_for(&download, "clip.mkv", None), download);
+    }
+
+    #[test]
+    fn grabber_defaults_survive_missing_fields() {
+        let config: AppConfig = serde_json::from_str(r#"{"organize_by_category":true}"#).unwrap();
+        assert!(config.grabber.same_domain);
+        assert!(config.grabber.respect_robots);
+        assert_eq!(config.grabber.max_depth, 2);
+        assert_eq!(config.grabber.max_pages, 200);
+        assert_eq!(config.grabber.presets.len(), 5);
+        let grabber = GrabberSettings {
+            url: "https://ex.com".into(),
+            max_depth: 5,
+            ..GrabberSettings::default()
+        };
+        let json = serde_json::to_string(&grabber).unwrap();
+        let back: GrabberSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.url, "https://ex.com");
+        assert_eq!(back.max_depth, 5);
+        assert!(back.presets.iter().any(|p| p == "Video"));
     }
 
     #[test]

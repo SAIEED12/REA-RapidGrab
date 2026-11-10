@@ -8,6 +8,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
 use rg_config::{AfterAction, AppConfig, Category, Priority};
 use rg_core::{Credentials, Download, NetworkConfig, Progress, ProxyConfig, ProxyMode};
+use rg_grab::{GrabEvent, GrabFile, GrabRules, ScanOptions};
 use rg_resolve::{MediaEvent, MediaProgress, MediaRequest, MediaStage, Tools};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
@@ -253,11 +254,89 @@ enum Action {
     Remove(usize),
     CyclePriority(usize),
     ToggleQueue,
-    ToggleHistory,
+    ShowPage(Page),
     HistoryRetry(usize),
     HistoryOpen(usize),
     HistoryFolder(usize),
     ClearHistory,
+    GrabStart,
+    GrabCancel,
+    GrabAdd,
+}
+
+/// Top-level page shown below the header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Downloads,
+    History,
+    Grabber,
+}
+
+/// One file found by the Site Grabber, with its checkbox state.
+struct GrabResult {
+    file: GrabFile,
+    selected: bool,
+}
+
+/// Site Grabber page state (persisted through [`rg_config::GrabberSettings`]).
+struct GrabberState {
+    url: String,
+    same_domain: bool,
+    max_depth: usize,
+    max_pages: usize,
+    /// Selected preset names ("Video", "Audio", …).
+    presets: Vec<String>,
+    /// Free-form extension list as typed (comma/space separated).
+    custom_extensions: String,
+    include: String,
+    exclude: String,
+    respect_robots: bool,
+    scanning: bool,
+    cancel: Arc<AtomicBool>,
+    results: Vec<GrabResult>,
+    status: String,
+    pages: usize,
+    errors: usize,
+}
+
+impl GrabberState {
+    fn from_settings(settings: &rg_config::GrabberSettings) -> Self {
+        Self {
+            url: settings.url.clone(),
+            same_domain: settings.same_domain,
+            max_depth: settings.max_depth.min(5),
+            max_pages: settings.max_pages.clamp(1, 5000),
+            presets: settings.presets.clone(),
+            custom_extensions: settings.custom_extensions.clone(),
+            include: settings.include.clone(),
+            exclude: settings.exclude.clone(),
+            respect_robots: settings.respect_robots,
+            scanning: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            results: Vec::new(),
+            status: String::new(),
+            pages: 0,
+            errors: 0,
+        }
+    }
+
+    fn to_settings(&self) -> rg_config::GrabberSettings {
+        rg_config::GrabberSettings {
+            url: self.url.clone(),
+            same_domain: self.same_domain,
+            max_depth: self.max_depth,
+            max_pages: self.max_pages,
+            presets: self.presets.clone(),
+            custom_extensions: self.custom_extensions.clone(),
+            include: self.include.clone(),
+            exclude: self.exclude.clone(),
+            respect_robots: self.respect_robots,
+        }
+    }
+
+    fn selected_count(&self) -> usize {
+        self.results.iter().filter(|result| result.selected).count()
+    }
 }
 
 pub struct RapidGrabApp {
@@ -267,6 +346,8 @@ pub struct RapidGrabApp {
     capture_rx: Receiver<rg_bridge::CaptureRequest>,
     probe_rx: Receiver<(String, Option<u64>, Option<String>, bool)>,
     probe_tx: Sender<(String, Option<u64>, Option<String>, bool)>,
+    grab_rx: Receiver<GrabEvent>,
+    grab_tx: Sender<GrabEvent>,
     #[allow(dead_code)]
     pipe_guard: Option<rg_bridge::PipeGuard>,
     jobs: HashMap<usize, DownloadJob>,
@@ -303,8 +384,9 @@ pub struct RapidGrabApp {
     /// Shared snapshot for the deferred popup viewport ('static callback).
     popup_shared: Arc<std::sync::Mutex<PopupShared>>,
 
-    /// Phase 4: history page + scheduler state.
-    show_history: bool,
+    /// Phase 4/5: current page and page-specific state.
+    page: Page,
+    grabber: GrabberState,
     history_cache: Vec<rg_config::HistoryEntry>,
     /// Set while the queue has work; after-queue actions fire once it drains.
     scheduler_armed: bool,
@@ -373,6 +455,15 @@ impl PopupShared {
     }
 }
 
+/// Split a comma/whitespace separated list, dropping empty entries.
+fn split_list(text: &str) -> Vec<String> {
+    text.split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Pretty display host: strip scheme / www / port, lowercase.
 /// Prefer the page (referer) host over a sniffed CDN host.
 fn pretty_host(url: &str) -> String {
@@ -423,97 +514,9 @@ fn split_name(name: &str) -> (String, String) {
     (name.to_string(), String::new())
 }
 
-/// True for CDN hash names such as `AQN6GyYVlQ5c…mp4`.
-fn is_hash_like(stem: &str) -> bool {
-    let len = stem.chars().count();
-    if len < 16 || stem.contains(' ') || stem.contains('-') || stem.contains('_') {
-        return false;
-    }
-    let lower = stem.chars().filter(|c| c.is_ascii_lowercase()).count();
-    let upper = stem.chars().filter(|c| c.is_ascii_uppercase()).count();
-    let digits = stem.chars().filter(|c| c.is_ascii_digit()).count();
-    lower >= 3 && upper >= 3 && digits >= 3
-}
-
-/// Second-level label of a host for the default name.
-fn site_label(host: &str) -> String {
-    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
-    let pick = if labels.len() >= 2 {
-        labels[labels.len() - 2]
-    } else {
-        host
-    };
-    pick.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .collect::<String>()
-        .to_ascii_lowercase()
-}
-
-/// Extension for a default name from Content-Type.
-fn ext_for_type(content_type: Option<&str>) -> &'static str {
-    match content_type.unwrap_or("").to_ascii_lowercase().as_str() {
-        t if t.starts_with("video/") => {
-            if t.contains("webm") { ".webm" } else if t.contains("quicktime") { ".mov" } else { ".mp4" }
-        }
-        t if t.starts_with("audio/") => {
-            if t.contains("mpeg") { ".mp3" } else { ".m4a" }
-        }
-        t if t.starts_with("image/") => {
-            if t.contains("png") { ".png" } else if t.contains("webp") { ".webp" } else { ".jpg" }
-        }
-        _ => ".bin",
-    }
-}
-
-/// Readable default for hash / over-long names:
-/// `facebook_video_2026-11-09.mp4`.
-fn suggested_media_name(
-    original: &str,
-    referer: Option<&str>,
-    url: &str,
-    content_type: Option<&str>,
-) -> String {
-    let (stem, ext) = split_name(original);
-    if !is_hash_like(&stem) && stem.chars().count() <= 40 {
-        return original.to_string();
-    }
-    let host = referer
-        .map(pretty_host)
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| pretty_host(url));
-    let site = site_label(&host);
-    let site = if site.is_empty() { "download".to_string() } else { site };
-    // Classify from the full name (extension included) — the stem alone
-    // has no extension and would always fall through to "file".
-    let word = match file_kind_for(original, content_type) {
-        1 => "video",
-        2 => "audio",
-        3 => "image",
-        _ => "file",
-    };
-    let date = chrono::Local::now().format("%Y-%m-%d");
-    let ext = if ext.is_empty() {
-        ext_for_type(content_type).to_string()
-    } else {
-        ext
-    };
-    format!("{site}_{word}_{date}{ext}")
-}
-
 /// Strip Windows-forbidden characters from the editable stem.
 fn sanitize_stem(stem: &str) -> String {
-    let cleaned: String = stem
-        .chars()
-        .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
-        .filter(|c| !c.is_control())
-        .collect::<String>()
-        .trim()
-        .to_string();
-    if cleaned.is_empty() {
-        "download".to_string()
-    } else {
-        cleaned
-    }
+    rg_core::sanitize_file_stem(stem)
 }
 
 /// Keep head + tail visible for long paths, ellipsizing the middle.
@@ -594,6 +597,7 @@ impl RapidGrabApp {
         let (update_tx, update_rx) = unbounded();
         let (capture_tx, capture_rx) = unbounded::<rg_bridge::CaptureRequest>();
         let (probe_tx, probe_rx) = unbounded::<(String, Option<u64>, Option<String>, bool)>();
+        let (grab_tx, grab_rx) = unbounded::<GrabEvent>();
         let repaint_ctx = cc.egui_ctx.clone();
         let pipe_guard = if cfg!(windows) {
             rg_bridge::listen(move |req| {
@@ -670,6 +674,8 @@ impl RapidGrabApp {
             capture_rx,
             probe_rx,
             probe_tx,
+            grab_rx,
+            grab_tx,
             pipe_guard,
             jobs: HashMap::new(),
             next_id: 1,
@@ -692,7 +698,8 @@ impl RapidGrabApp {
             pending_capture: None,
             auth_prompt: None,
             popup_shared: Arc::new(std::sync::Mutex::new(PopupShared::blank())),
-            show_history: false,
+            page: Page::Downloads,
+            grabber: GrabberState::from_settings(&shared.grabber),
             history_cache: Vec::new(),
             scheduler_armed: false,
             last_notice: None,
@@ -715,6 +722,7 @@ impl RapidGrabApp {
                 stop: self.settings.schedule_stop.clone(),
                 after_queue: self.settings.after_queue,
             },
+            grabber: self.grabber.to_settings(),
         }
     }
 
@@ -722,6 +730,158 @@ impl RapidGrabApp {
     fn persist_shared(&self) {
         if let Err(error) = self.shared_config().save() {
             tracing::warn!("could not save shared config: {error}");
+        }
+    }
+
+    /// Crawl rules built from the Grabber form.
+    fn grabber_rules(&self) -> GrabRules {
+        GrabRules {
+            same_domain: self.grabber.same_domain,
+            max_depth: self.grabber.max_depth.min(5),
+            max_pages: self.grabber.max_pages.clamp(1, 5000),
+            extensions: rg_grab::extensions_from(
+                &self.grabber.presets,
+                &split_list(&self.grabber.custom_extensions),
+            ),
+            include: split_list(&self.grabber.include),
+            exclude: split_list(&self.grabber.exclude),
+            respect_robots: self.grabber.respect_robots,
+            delay: Duration::from_millis(120),
+        }
+    }
+
+    /// Starts a Site Grabber scan on the tokio runtime.
+    fn start_grab(&mut self) {
+        if self.grabber.scanning {
+            return;
+        }
+        let url = self.grabber.url.trim().to_string();
+        if url.is_empty() {
+            self.grabber.status = "Enter a site URL to scan.".to_string();
+            return;
+        }
+        let rules = self.grabber_rules();
+        let user_agent = if self.new_user_agent.trim().is_empty() {
+            rg_core::DEFAULT_USER_AGENT.to_string()
+        } else {
+            self.new_user_agent.trim().to_string()
+        };
+        let options = ScanOptions {
+            network: NetworkConfig {
+                proxy: self.settings.proxy.clone(),
+                credentials: None,
+            },
+            user_agent: Some(user_agent),
+            cookie: (!self.new_cookie.trim().is_empty())
+                .then(|| self.new_cookie.trim().to_string()),
+        };
+
+        self.grabber.results.clear();
+        self.grabber.pages = 0;
+        self.grabber.errors = 0;
+        self.grabber.scanning = true;
+        self.grabber.cancel = Arc::new(AtomicBool::new(false));
+        self.grabber.status = "Scanning…".to_string();
+        self.persist_shared();
+
+        let tx = self.grab_tx.clone();
+        let cancel = self.grabber.cancel.clone();
+        self.rt.spawn(async move {
+            let mut emit = |event: GrabEvent| {
+                let _ = tx.send(event);
+            };
+            let report = rg_grab::scan(&url, &rules, &options, cancel, &mut emit).await;
+            tracing::info!(
+                pages = report.pages,
+                files = report.files,
+                errors = report.errors,
+                cancelled = report.cancelled,
+                "site scan finished"
+            );
+        });
+    }
+
+    fn cancel_grab(&mut self) {
+        if self.grabber.scanning {
+            self.grabber.cancel.store(true, Ordering::Relaxed);
+            self.grabber.status = "Stopping…".to_string();
+        }
+    }
+
+    /// Enqueues every checked grab result, using the page URL as Referer.
+    fn add_selected(&mut self) {
+        let files: Vec<GrabFile> = self
+            .grabber
+            .results
+            .iter()
+            .filter(|result| result.selected)
+            .map(|result| result.file.clone())
+            .collect();
+        if files.is_empty() {
+            self.grabber.status = "Select at least one file first.".to_string();
+            return;
+        }
+        let connections = self.new_connections.max(1);
+        let cookie =
+            (!self.new_cookie.trim().is_empty()).then(|| self.new_cookie.trim().to_string());
+        let count = files.len();
+        for file in files {
+            let output = self
+                .routed_dir(&file.filename, None)
+                .join(&file.filename)
+                .display()
+                .to_string();
+            self.enqueue(
+                file.url,
+                output,
+                connections,
+                None,
+                None,
+                None,
+                Some(file.page_url),
+                cookie.clone(),
+                false,
+                None,
+            );
+        }
+        self.grabber.status = format!("Added {count} file(s) to the queue.");
+        self.persist_queue();
+    }
+
+    /// Drains scanner events (called from both `logic` and `ui`).
+    fn pump_grab_events(&mut self) {
+        while let Ok(event) = self.grab_rx.try_recv() {
+            match event {
+                GrabEvent::Page { .. } => {
+                    self.grabber.pages += 1;
+                    self.grabber.status = format!(
+                        "Scanning… {} pages, {} files",
+                        self.grabber.pages,
+                        self.grabber.results.len()
+                    );
+                }
+                GrabEvent::Found(file) => {
+                    self.grabber.results.push(GrabResult {
+                        file,
+                        selected: true,
+                    });
+                }
+                GrabEvent::Failed { error, .. } => {
+                    self.grabber.errors += 1;
+                    tracing::warn!("site scan: {error}");
+                }
+                GrabEvent::Done(report) => {
+                    self.grabber.scanning = false;
+                    self.grabber.status = if report.cancelled {
+                        format!(
+                            "Cancelled — {} files from {} pages",
+                            report.files, report.pages
+                        )
+                    } else {
+                        format!("Done — {} files from {} pages", report.files, report.pages)
+                    };
+                }
+            }
         }
     }
 
@@ -791,43 +951,24 @@ impl RapidGrabApp {
     fn handle_captures(&mut self) {
         // Browser captures: intercept = Download popup, click/link = pre-fill.
         while let Ok(capture) = self.capture_rx.try_recv() {
-            // Best filename: Content-Disposition header wins, then the
-            // extension's guess, then the tab title for YouTube.
-            let filename = capture
-                .content_disposition_filename
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .or(capture.filename.as_deref().filter(|s| !s.trim().is_empty()));
             // Suggest into the category folder (unless the popup already
-            // picked an output, which is always respected below).
-            let suggested_name = filename
-                .unwrap_or_else(|| {
-                    capture
-                        .url
-                        .split(['?', '#'])
-                        .next()
-                        .unwrap_or("")
-                        .trim_end_matches('/')
-                        .rsplit('/')
-                        .next()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("download.bin")
-                })
-                .to_string();
-            // Hash / over-long CDN names become a readable default
-            // (`facebook_video_2026-11-09.mp4`) before suggesting the path.
-            let display_name = suggested_media_name(
-                &suggested_name,
-                capture.referer.as_deref(),
-                &capture.url,
-                capture.content_type.as_deref(),
-            );
+            // picked an output, which is always respected below). The shared
+            // resolver owns the Content-Disposition → title → filename → URL
+            // → fallback chain, so the GUI matches the standalone popup.
+            let default_name = rg_core::default_capture_name(&rg_core::NamingContext {
+                title: capture.title.as_deref(),
+                content_disposition: capture.content_disposition_filename.as_deref(),
+                filename: capture.filename.as_deref(),
+                url: &capture.url,
+                referer: capture.referer.as_deref(),
+                content_type: capture.content_type.as_deref(),
+                media_capture: capture.source.as_deref() == Some("media"),
+            });
+            // Never suggest a name that already exists: `name (1).ext`.
+            let display_dir = self.routed_dir(&default_name, capture.content_type.as_deref());
+            let display_name = rg_core::unique_file_name(&display_dir, &default_name);
             let (pending_stem, pending_ext) = split_name(&display_name);
-            let suggested = self
-                .routed_dir(&display_name, capture.content_type.as_deref())
-                .join(&display_name)
-                .display()
-                .to_string();
+            let suggested = display_dir.join(&display_name).display().to_string();
             let pending_folder = std::path::Path::new(&suggested)
                 .parent()
                 .map(|p| p.display().to_string())
@@ -888,10 +1029,7 @@ impl RapidGrabApp {
 
             // Always pre-fill the form as a fallback (confirm-first backup).
             self.new_url = capture.url.clone();
-            if let Some(ref name) = filename {
-                self.new_output = suggested.clone();
-                let _ = name;
-            }
+            self.new_output = suggested.clone();
             if let Some(referer) = &capture.referer {
                 self.new_referer = referer.clone();
             }
@@ -1932,16 +2070,16 @@ impl RapidGrabApp {
                     self.settings.queue_paused = !self.settings.queue_paused;
                     self.persist_shared();
                 }
-                Action::ToggleHistory => {
-                    self.show_history = !self.show_history;
-                    if self.show_history {
+                Action::ShowPage(page) => {
+                    self.page = page;
+                    if page == Page::History {
                         self.history_cache = rg_config::load_history();
                     }
                 }
                 Action::HistoryRetry(index) => {
                     if let Some(entry) = self.history_cache.get(index).cloned() {
                         self.enqueue(entry.url.clone(), entry.output.clone(), self.settings.connections.max(1), None, entry.sha256.clone(), None, None, None, false, None);
-                        self.show_history = false;
+                        self.page = Page::Downloads;
                     }
                 }
                 Action::HistoryOpen(index) => {
@@ -1960,6 +2098,9 @@ impl RapidGrabApp {
                     let _ = rg_config::clear_history();
                     self.history_cache.clear();
                 }
+                Action::GrabStart => self.start_grab(),
+                Action::GrabCancel => self.cancel_grab(),
+                Action::GrabAdd => self.add_selected(),
             }
         }
         if queue_changed {
@@ -2177,7 +2318,8 @@ impl RapidGrabApp {
             let is_media_page = pending.capture.source.as_deref() == Some("media")
                 && !rg_bridge::is_media_file_url(&pending.capture.url);
             let (size_label, type_label) = if is_media_page {
-                ("Video page".to_string(), "resolved on Start".to_string())
+                // No probe type exists until Start; hide the empty chip.
+                ("Video page".to_string(), String::new())
             } else {
                 // While probing, the stored size may be the browser's
                 // partial (206 range) value — don't show it until the
@@ -2444,10 +2586,13 @@ impl RapidGrabApp {
                                         state.action = Some(PopupAction::Start);
                                     }
                                 });
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = 6.0;
                                     widgets::chip(ui, &size_label, theme::ACCENT);
-                                    if type_chip != "\u{2014}" && type_chip != "\u{2026}" {
+                                    if !type_chip.is_empty()
+                                        && type_chip != "\u{2014}"
+                                        && type_chip != "\u{2026}"
+                                    {
                                         widgets::chip(ui, &type_chip, theme::ACCENT);
                                     }
                                     if !host_label.is_empty() {
@@ -2646,11 +2791,15 @@ impl eframe::App for RapidGrabApp {
         while let Ok(update) = self.update_rx.try_recv() {
             self.apply_update(update);
         }
+        self.pump_grab_events();
         self.handle_captures();
         self.pump_queue();
         self.show_capture_popup(ctx);
         if self.pending_capture.is_some() {
             ctx.request_repaint_after(Duration::from_millis(500));
+        }
+        if self.grabber.scanning {
+            ctx.request_repaint_after(Duration::from_millis(150));
         }
     }
 
@@ -2688,6 +2837,7 @@ impl eframe::App for RapidGrabApp {
         while let Ok(update) = self.update_rx.try_recv() {
             self.apply_update(update);
         }
+        self.pump_grab_events();
         self.handle_captures();
         for job in self.jobs.values_mut() {
             if job.status.is_active() && job.handle.as_ref().is_some_and(|h| h.is_finished()) {
@@ -2749,9 +2899,16 @@ impl eframe::App for RapidGrabApp {
                             ui.add_space(theme::SP_S);
                         }
 
-                        if self.show_history {
-                            history_section(ui, self, &mut actions);
-                            return;
+                        match self.page {
+                            Page::History => {
+                                history_section(ui, self, &mut actions);
+                                return;
+                            }
+                            Page::Grabber => {
+                                grabber_section(ui, self, &mut actions);
+                                return;
+                            }
+                            Page::Downloads => {}
                         }
 
                         if self.show_add_panel {
@@ -2885,13 +3042,14 @@ fn header(
             if widgets::button(ui, queue_label, widgets::ButtonKind::Secondary, true).clicked() {
                 actions.push(Action::ToggleQueue);
             }
-            let history_label = if app.show_history {
-                "Downloads"
-            } else {
-                "History"
-            };
-            if widgets::button(ui, history_label, widgets::ButtonKind::Secondary, true).clicked() {
-                actions.push(Action::ToggleHistory);
+            if widgets::button(ui, "Grabber", widgets::ButtonKind::Secondary, true).clicked() {
+                actions.push(Action::ShowPage(Page::Grabber));
+            }
+            if widgets::button(ui, "History", widgets::ButtonKind::Secondary, true).clicked() {
+                actions.push(Action::ShowPage(Page::History));
+            }
+            if widgets::button(ui, "Downloads", widgets::ButtonKind::Secondary, true).clicked() {
+                actions.push(Action::ShowPage(Page::Downloads));
             }
             let label = if app.show_add_panel {
                 "Hide"
@@ -3439,6 +3597,224 @@ fn max_height_picker(ui: &mut egui::Ui, value: &mut u32) {
             *value = values[index];
         }
     });
+}
+
+/// Site Grabber page: crawl form plus the live list of found files.
+fn grabber_section(ui: &mut egui::Ui, app: &mut RapidGrabApp, actions: &mut Vec<Action>) {
+    ui.horizontal(|ui| {
+        ui.add(egui::Label::new(theme::section("Site Grabber")));
+        widgets::chip(ui, &app.grabber.results.len().to_string(), theme::ACCENT);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let selected = app.grabber.selected_count();
+            let add_enabled = !app.grabber.scanning && selected > 0;
+            if widgets::button(
+                ui,
+                &format!("Add selected ({selected})"),
+                widgets::ButtonKind::Primary,
+                add_enabled,
+            )
+            .clicked()
+            {
+                actions.push(Action::GrabAdd);
+            }
+            if app.grabber.scanning {
+                if widgets::button(ui, "Cancel scan", widgets::ButtonKind::Secondary, true)
+                    .clicked()
+                {
+                    actions.push(Action::GrabCancel);
+                }
+            } else if widgets::button(ui, "Scan", widgets::ButtonKind::Primary, true).clicked() {
+                actions.push(Action::GrabStart);
+            }
+        });
+    });
+    ui.add_space(theme::SP_S);
+
+    widgets::card().show(ui, |ui| {
+        ui.add(egui::Label::new(theme::label("Site URL")));
+        let response = widgets::text_field(
+            ui,
+            widgets::Field::new("rg-grab-url", "https://example.com/downloads/"),
+            &mut app.grabber.url,
+        );
+        if response.submitted {
+            actions.push(Action::GrabStart);
+        }
+
+        ui.add_space(theme::SP_S);
+        widgets::checkbox(
+            ui,
+            "rg-grab-same-domain",
+            &mut app.grabber.same_domain,
+            "Stay on this site (files on other hosts are still listed)",
+        );
+        widgets::checkbox(
+            ui,
+            "rg-grab-robots",
+            &mut app.grabber.respect_robots,
+            "Respect robots.txt",
+        );
+
+        ui.add_space(theme::SP_XS);
+        ui.horizontal(|ui| {
+            ui.add(egui::Label::new(theme::label("Depth")));
+            widgets::stepper(ui, "rg-grab-depth", &mut app.grabber.max_depth, 0..=5);
+            ui.add_space(theme::SP_M);
+            ui.add(egui::Label::new(theme::label("Max pages")));
+            widgets::stepper(ui, "rg-grab-pages", &mut app.grabber.max_pages, 1..=5000);
+        });
+
+        ui.add_space(theme::SP_S);
+        ui.add(egui::Label::new(theme::label("File types")));
+        ui.spacing_mut().item_spacing.y = theme::SP_XS;
+        widget_presets(ui, app);
+
+        ui.add_space(theme::SP_XS);
+        ui.add(egui::Label::new(theme::label("Extra extensions")));
+        widgets::text_field(
+            ui,
+            widgets::Field::new("rg-grab-ext", "comma separated, e.g. mp4, mkv, pdf")
+                .dim_hint(),
+            &mut app.grabber.custom_extensions,
+        );
+
+        ui.add_space(theme::SP_S);
+        widgets::collapsible(ui, "rg-grab-filters", "URL filters", false, |ui| {
+            ui.add(egui::Label::new(theme::label("Include (substring or * wildcard)")));
+            widgets::text_field(
+                ui,
+                widgets::Field::new("rg-grab-include", "*example.com/movies/*").dim_hint(),
+                &mut app.grabber.include,
+            );
+            ui.add_space(theme::SP_XS);
+            ui.add(egui::Label::new(theme::label("Exclude")));
+            widgets::text_field(
+                ui,
+                widgets::Field::new("rg-grab-exclude", "*trailer*, *sample*").dim_hint(),
+                &mut app.grabber.exclude,
+            );
+            ui.add(egui::Label::new(theme::caption_tertiary(
+                "Filters apply to file URLs. Separate entries with commas or spaces.",
+            )));
+        });
+    });
+
+    if !app.grabber.status.is_empty() {
+        ui.add_space(theme::SP_S);
+        let color = if app.grabber.scanning {
+            theme::ACCENT
+        } else {
+            theme::TEXT_SECONDARY
+        };
+        ui.add(egui::Label::new(egui::RichText::new(&app.grabber.status).color(color)));
+    }
+
+    ui.add_space(theme::SP_M);
+    ui.horizontal(|ui| {
+        ui.add(egui::Label::new(theme::section("Results")));
+        widgets::chip(
+            ui,
+            &format!("{} selected", app.grabber.selected_count()),
+            theme::ACCENT,
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if widgets::button(ui, "Clear", widgets::ButtonKind::Secondary, true).clicked() {
+                app.grabber.results.clear();
+            }
+            if widgets::button(ui, "Select none", widgets::ButtonKind::Secondary, true).clicked()
+            {
+                for result in &mut app.grabber.results {
+                    result.selected = false;
+                }
+            }
+            if widgets::button(ui, "Select all", widgets::ButtonKind::Secondary, true).clicked() {
+                for result in &mut app.grabber.results {
+                    result.selected = true;
+                }
+            }
+        });
+    });
+    ui.add_space(theme::SP_S);
+
+    if app.grabber.results.is_empty() {
+        widgets::card().show(ui, |ui| {
+            widgets::empty_state(
+                ui,
+                theme::Icon::Link,
+                "Nothing scanned yet",
+                "Enter a page URL above; every matching file link will be listed here.",
+            );
+        });
+        return;
+    }
+
+    for index in 0..app.grabber.results.len() {
+        let file = app.grabber.results[index].file.clone();
+        let label = format!(
+            "{}  ·  {}",
+            file.filename,
+            file.extension.to_ascii_uppercase()
+        );
+        widgets::card().show(ui, |ui| {
+            widgets::checkbox(
+                ui,
+                &format!("rg-grab-sel-{index}"),
+                &mut app.grabber.results[index].selected,
+                &label,
+            );
+            ui.add(
+                egui::Label::new(theme::caption_tertiary(truncate_url(&file.url, 110)))
+                    .truncate(),
+            )
+            .on_hover_text(&file.url);
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Label::new(theme::caption_tertiary(format!(
+                        "found on {}",
+                        view_host(&file.page_url)
+                    )))
+                    .truncate(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if widgets::button(ui, "Copy URL", widgets::ButtonKind::Secondary, true)
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(file.url.clone());
+                    }
+                });
+            });
+        });
+        ui.add_space(theme::SP_S);
+    }
+}
+
+/// Preset checkbox list; toggling keeps `grabber.presets` in sync.
+fn widget_presets(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
+    for (name, _) in rg_grab::PRESETS {
+        let name: &str = *name;
+        let mut checked = app
+            .grabber
+            .presets
+            .iter()
+            .any(|preset| preset.eq_ignore_ascii_case(name));
+        let id = format!("rg-grab-preset-{}", name.to_ascii_lowercase());
+        if widgets::checkbox(ui, &id, &mut checked, name).changed() {
+            if checked {
+                if !app
+                    .grabber
+                    .presets
+                    .iter()
+                    .any(|preset| preset.eq_ignore_ascii_case(name))
+                {
+                    app.grabber.presets.push(name.to_string());
+                }
+            } else {
+                app.grabber
+                    .presets
+                    .retain(|preset| !preset.eq_ignore_ascii_case(name));
+            }
+        }
+    }
 }
 
 /// History page: finished downloads from `history.jsonl`, newest first.

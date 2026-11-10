@@ -14,6 +14,7 @@ pub use error::{Error, Result};
 pub use manifest::{parts_dir_for, Manifest, Segment};
 pub use net::{Credentials, NetworkConfig, ProxyConfig, ProxyMode, ResolvedProxy};
 pub use naming::{
-    extension_for_content_type, filename_from_content_disposition, infer_output_path, is_web_page,
-    sanitize_filename,
+    clean_title, default_capture_name, extension_for_content_type,
+    filename_from_content_disposition, infer_output_path, is_generic_title, is_web_page,
+    sanitize_file_stem, sanitize_filename, unique_file_name, NamingContext,
 };

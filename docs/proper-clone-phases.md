@@ -48,15 +48,19 @@ real proxy (docs in README §6).
 Gate: schedule an overnight queue; category auto-routing verified. ✅ (manual: set Scheduler 22:00–06:00 + Sleep; add an MP4 and a ZIP and check `Downloads\Video` / `Downloads\Compressed`; restart the GUI — queue and history survive.)
 `crates/rg-config/tests` — category mapping, schedule windows incl. midnight crossing, priority ordering, atomic config round-trip.
 
-## Phase 5 — Site Grabber + media (1 week)
-- Grabber crawler: site URL + rules → same-domain crawl, file-type filter → project list → batch download.
-- YouTube: keep yt-dlp path but vendor pinned `yt-dlp.exe` (+ ffmpeg mux) so it works offline; or native get_video_info later.
-- Virus-check hook (launch AV on completion) — low priority.
+## Phase 5 — Site Grabber + media (1 week) ✅ DONE (tool vendoring deferred)
+- Grabber crawler: site URL + rules → same-domain crawl, file-type filter → project list → batch download. ✅ New `crates/rg-grab`: BFS `scan` over `href`/`src`/`data-*` attributes plus absolute URLs in inline script JSON; relative-URL resolution, depth/page caps, include/exclude `*` patterns, `robots.txt`, four concurrent fetches with a polite delay, per-URL dedupe and `AtomicBool` cancellation. Reuses `NetworkConfig::client_for`, so proxy and credential settings apply. 14 unit tests run against a local HTTP server (relative/cross-host links, depth, page cap, filters, robots, cancel, pattern matching).
+- Grabber UI: ✅ New **Grabber** page (`Page::{Downloads, History, Grabber}`) with URL, depth, max pages, same-domain/robots toggles, preset file types (Video/Audio/Images/Archives/Documents/Programs) plus custom extensions, include/exclude filters, live results with per-file checkboxes and Select all/none/Clear, and **Add selected** (enqueues through the normal path: category routing, priority, `Referer: <page>`). The form persists in `settings.json` as `GrabberSettings`.
+- Helper tool discovery: ✅ `rg_resolve::find_tool` now searches `%LOCALAPPDATA%\Programs\RapidGrab\tools` → `<exe folder>\tools` → `PATH` → common install dirs, with unit tests; a manually dropped `yt-dlp.exe`/`ffmpeg.exe` is picked up first.
+- YouTube: resolver path unchanged. **Deferred:** vendoring pinned `yt-dlp.exe`/`ffmpeg.exe` (no bundling per decision) and therefore the offline-YouTube part of the gate.
+- Virus-check hook (launch AV on completion). **Deferred to Phase 6** per decision.
 
-Gate: grab all MP4s from a test site into a project; YouTube download works without system yt-dlp.
+Gate: grab all MP4s from a test site and batch-download them ✅ (manual: open Grabber, scan a page with MP4 links, tick the results, Add selected → files land in `Downloads\Video`). YouTube without a system yt-dlp ⏸ deferred with vendoring.
+`crates/rg-grab` — extraction, crawl traversal, depth/page caps, extension/pattern filters, robots, cancellation; `crates/rg-resolve` — bundled-tool search order.
 
 ## Phase 6 — Polish + release (2–3 days)
 - Tray icon, balloon notifications, auto-start, CLI parity (`rapidgrab get` exists).
+- Virus-check hook (deferred from Phase 5): `virus_check_command` with a `{file}` placeholder, Defender preset, result shown on the card, off by default.
 - Signed CRX + Firefox XPI via store channels.
 - Screenshots 1920×1080 + 640×520; manual checklist (popup per browser, resume, scheduler, grabber, Bengali titles).
 
