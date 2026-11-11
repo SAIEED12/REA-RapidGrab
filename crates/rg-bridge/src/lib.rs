@@ -61,6 +61,27 @@ pub struct CaptureRequest {
     /// How the capture was triggered: `click`, `link`, `intercept`, `page`.
     #[serde(default)]
     pub source: Option<String>,
+    /// Signed URL of the sibling audio DASH rendition, when the player's
+    /// MSE streams the video and audio separately (Facebook Reels). The
+    /// downloader merges the two into the final file; `None` means the main
+    /// URL is expected to carry audio on its own.
+    #[serde(default)]
+    pub audio_url: Option<String>,
+    /// `Content-Type` reported for the audio rendition.
+    #[serde(default)]
+    pub audio_content_type: Option<String>,
+    /// Full size of the audio rendition, when the CDN reported it.
+    #[serde(default)]
+    pub audio_content_length: Option<u64>,
+    /// Cookies scoped to the audio host, when it differs from the video
+    /// host's. Falls back to `cookies` when absent.
+    #[serde(default)]
+    pub audio_cookies: Option<String>,
+    /// True when the capture is a video-only DASH rendition and no sibling
+    /// audio track could be identified. The file is still downloaded (it may
+    /// be a muxed URL); this only tells the UI to show a warning.
+    #[serde(default)]
+    pub audio_missing: bool,
     /// True when the extension was told to let the browser download continue.
     #[serde(default)]
     pub auto_start: bool,
@@ -76,6 +97,85 @@ pub struct CaptureRequest {
     pub dont_ask_again: bool,
 }
 
+/// Facebook's CDN encodes byte-range requests in the URL itself
+/// (`bytestart`/`byteend`) for DASH/fMP4 playback. Downloading such a URL
+/// returns a fragment of the file — big enough to look plausible, never
+/// playable. Stripping the range parameters asks the CDN for the complete
+/// object, which is what a download needs. Only applied to the Facebook
+/// hosts that use these params.
+pub fn normalize_capture_url(url: &str) -> String {
+    let Some(host) = host_of(url) else {
+        return url.to_string();
+    };
+    if !is_facebook_host(&host) {
+        return url.to_string();
+    }
+    // url = base?query#fragment ; the fragment is not part of the request.
+    let (without_fragment, fragment) = match url.find('#') {
+        Some(h) => (&url[..h], &url[h..]),
+        None => (url, ""),
+    };
+    let Some(q) = without_fragment.find('?') else {
+        return url.to_string();
+    };
+    let base = &without_fragment[..q];
+    let query = &without_fragment[q + 1..];
+    let param_count = query.split('&').count();
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| {
+            let name = pair.split('=').next().unwrap_or("");
+            let lower = name.to_ascii_lowercase();
+            lower != "bytestart" && lower != "byteend"
+        })
+        .collect();
+    if kept.len() == param_count {
+        return url.to_string();
+    }
+    let mut out = String::with_capacity(url.len());
+    out.push_str(base);
+    if !kept.is_empty() {
+        out.push('?');
+        out.push_str(&kept.join("&"));
+    }
+    out.push_str(fragment);
+    out
+}
+
+/// Lower-case host (no userinfo/port/fragment) for `http(s)://` URLs.
+fn host_of(url: &str) -> Option<String> {
+    let scheme_end = url.find("://")?;
+    let host_start = scheme_end + 3;
+    let rest = &url[host_start..];
+    let end = rest
+        .find(|c| ['/', '?', '#'].contains(&c))
+        .unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+fn is_facebook_host(host: &str) -> bool {
+    host == "facebook.com"
+        || host.ends_with(".facebook.com")
+        || host == "fbcdn.net"
+        || host.ends_with(".fbcdn.net")
+}
+
+/// Normalize one captured frame's URLs (Facebook range params).
+fn normalize_request(mut req: CaptureRequest) -> CaptureRequest {
+    req.url = normalize_capture_url(&req.url);
+    if let Some(audio_url) = req.audio_url.take() {
+        req.audio_url = Some(normalize_capture_url(&audio_url));
+    }
+    req
+}
+
 /// Read one native-messaging frame: little-endian u32 length + JSON bytes.
 pub fn read_frame<R: Read>(mut r: R) -> Result<CaptureRequest> {
     let mut buf = [0u8; 4];
@@ -88,7 +188,7 @@ pub fn read_frame<R: Read>(mut r: R) -> Result<CaptureRequest> {
     r.read_exact(&mut body)?;
     let msg: CaptureRequest = serde_json::from_slice(&body)
         .with_context(|| format!("invalid capture JSON ({} bytes)", len))?;
-    Ok(msg)
+    Ok(normalize_request(msg))
 }
 
 /// Write one native-messaging frame.
@@ -123,12 +223,13 @@ pub fn write_ack_frame<W: Write>(mut w: W, ack: &HostAck) -> Result<()> {
 /// Native host side: connect to the GUI pipe and send one request.
 /// Returns an error if the GUI is not running.
 pub fn send_capture(req: &CaptureRequest) -> Result<()> {
+    let normalized = normalize_request(req.clone());
     let mut stream = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(PIPE_NAME)
         .with_context(|| format!("GUI pipe {PIPE_NAME} not available"))?;
-    write_frame(&mut stream, req)
+    write_frame(&mut stream, &normalized)
 }
 
 /// GUI side: bind the named pipe, spawn a listener thread, and return a guard
@@ -250,7 +351,9 @@ where
                     continue;
                 }
                 body.truncate(read as usize);
-                serde_json::from_slice::<CaptureRequest>(&body).ok()
+                serde_json::from_slice::<CaptureRequest>(&body)
+                    .ok()
+                    .map(normalize_request)
             };
             if let Some(req) = req {
                 (on_req)(req);
@@ -307,6 +410,11 @@ mod tests {
             output: None,
             confirmed: false,
             dont_ask_again: false,
+            audio_url: None,
+            audio_content_type: None,
+            audio_content_length: None,
+            audio_cookies: None,
+            audio_missing: false,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &req).unwrap();
@@ -322,10 +430,87 @@ mod tests {
     }
 
     #[test]
+    fn read_frame_normalizes_facebook_url() {
+        let req = CaptureRequest {
+            url: "https://video.fbcdn.net/v/abc.mp4?bytestart=100&byteend=200&oe=X".into(),
+            filename: None,
+            referer: None,
+            cookies: None,
+            user_agent: None,
+            title: None,
+            content_disposition_filename: None,
+            content_type: Some("video/mp4".into()),
+            content_length: Some(100),
+            source: Some("media".into()),
+            auto_start: false,
+            output: None,
+            confirmed: false,
+            dont_ask_again: false,
+            audio_url: Some(
+                "https://video.fbcdn.net/v/abc_audio.mp4?bytestart=10&bytestart=11&oe=Y".into(),
+            ),
+            audio_content_type: Some("audio/mp4".into()),
+            audio_content_length: Some(42),
+            audio_cookies: Some("k=v".into()),
+            audio_missing: true,
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &req).unwrap();
+        let back = read_frame(&buf[..]).unwrap();
+        assert_eq!(back.url, "https://video.fbcdn.net/v/abc.mp4?oe=X");
+        // The sibling DASH rendition gets the same range-param stripping.
+        assert_eq!(
+            back.audio_url.as_deref(),
+            Some("https://video.fbcdn.net/v/abc_audio.mp4?oe=Y")
+        );
+        assert_eq!(back.audio_content_type.as_deref(), Some("audio/mp4"));
+        assert_eq!(back.audio_content_length, Some(42));
+        assert_eq!(back.audio_cookies.as_deref(), Some("k=v"));
+        assert!(back.audio_missing);
+    }
+
+    #[test]
     fn frame_rejects_empty() {
         let mut buf = Vec::new();
         (0u32).to_le_bytes().iter().for_each(|b| buf.push(*b));
         assert!(read_frame(&buf[..]).is_err());
+    }
+
+    #[test]
+    fn strips_facebook_range_params() {
+        let n = normalize_capture_url(
+            "https://scontent.fdca24-5.fna.fbcdn.net/v/t39.25447-2/123456789_n.mp4?_nc_cat=1&bytestart=0&byteend=158272&oh=abc&oe=DEF",
+        );
+        assert_eq!(
+            n,
+            "https://scontent.fdca24-5.fna.fbcdn.net/v/t39.25447-2/123456789_n.mp4?_nc_cat=1&oh=abc&oe=DEF"
+        );
+        assert!(!n.contains("bytestart") && !n.contains("byteend"));
+
+        // Fragment is preserved.
+        let n = normalize_capture_url(
+            "https://video.fbcdn.net/v/abc.mp4?bytestart=1&oe=DEF#t=4",
+        );
+        assert_eq!(n, "https://video.fbcdn.net/v/abc.mp4?oe=DEF#t=4");
+
+        // Only range params: drops the query entirely.
+        let n = normalize_capture_url("https://video.fbcdn.net/v/abc.mp4?bytestart=1&byteend=2");
+        assert_eq!(n, "https://video.fbcdn.net/v/abc.mp4");
+    }
+
+    #[test]
+    fn leaves_other_hosts_alone() {
+        // bytestart/byteend are real query params elsewhere; keep them.
+        let n = normalize_capture_url("https://cdn.example.com/f.mp4?bytestart=1&byteend=2");
+        assert_eq!(n, "https://cdn.example.com/f.mp4?bytestart=1&byteend=2");
+        // Malformed / non-URL inputs pass through.
+        assert_eq!(normalize_capture_url("not a url"), "not a url");
+        assert_eq!(normalize_capture_url("https://video.fbcdn.net/v/abc.mp4"), "https://video.fbcdn.net/v/abc.mp4");
+        // Uppercase param names still stripped.
+        assert_eq!(
+            normalize_capture_url("https://facebook.com/video.mp4?ByteStart=1&BYTEEND=2"),
+            "https://facebook.com/video.mp4"
+        );
     }
 
     #[test]

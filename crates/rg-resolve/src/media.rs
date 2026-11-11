@@ -315,7 +315,7 @@ fn unique_path(path: PathBuf) -> PathBuf {
 }
 
 /// Stable sidecar path so a cancelled download can resume into the same file.
-fn sidecar_path(output: &Path, tag: &str, ext: &str) -> PathBuf {
+pub(crate) fn sidecar_path(output: &Path, tag: &str, ext: &str) -> PathBuf {
     let parent = output.parent().unwrap_or_else(|| Path::new(""));
     let stem = output
         .file_stem()
@@ -382,6 +382,8 @@ async fn run_stream(
     Ok(dl.run().await?)
 }
 
+/// Mux the two tracks with ffmpeg (`-c copy`); used by both the yt-dlp
+/// resolver and the browser's captured DASH audio/video streams.
 async fn merge(
     runner: &dyn Runner,
     ffmpeg: &Path,
@@ -390,6 +392,23 @@ async fn merge(
     output: &Path,
     cancel: Option<&Arc<AtomicBool>>,
     selection: &Selection,
+) -> Result<()> {
+    let faststart = selection.ext.eq_ignore_ascii_case("mp4")
+        || selection.ext.eq_ignore_ascii_case("mov");
+    merge_streams(runner, ffmpeg, video, audio, output, faststart, cancel).await
+}
+
+/// Mux `video` + `audio` into `output`. The two inputs are written
+/// separately and copied by the muxer; when the input video already carries
+/// an audio stream it is ignored (`-map 0:v:0 -map 1:a:0`).
+pub async fn merge_streams(
+    runner: &dyn Runner,
+    ffmpeg: &Path,
+    video: &Path,
+    audio: &Path,
+    output: &Path,
+    faststart: bool,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<()> {
     let mut args = vec![
         "-hide_banner".to_string(),
@@ -400,10 +419,14 @@ async fn merge(
         video.display().to_string(),
         "-i".to_string(),
         audio.display().to_string(),
+        "-map".to_string(),
+        "0:v:0".to_string(),
+        "-map".to_string(),
+        "1:a:0".to_string(),
         "-c".to_string(),
         "copy".to_string(),
     ];
-    if selection.ext.eq_ignore_ascii_case("mp4") || selection.ext.eq_ignore_ascii_case("mov") {
+    if faststart {
         args.push("-movflags".to_string());
         args.push("+faststart".to_string());
     }
@@ -454,7 +477,7 @@ async fn wait_cancelled(flag: &AtomicBool) {
     }
 }
 
-fn check_cancel(flag: &Option<Arc<AtomicBool>>) -> Result<()> {
+pub(crate) fn check_cancel(flag: &Option<Arc<AtomicBool>>) -> Result<()> {
     if flag
         .as_ref()
         .is_some_and(|flag| flag.load(Ordering::Relaxed))

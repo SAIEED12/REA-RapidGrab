@@ -9,7 +9,7 @@ use eframe::egui;
 use rg_config::{AfterAction, AppConfig, Category, Priority};
 use rg_core::{Credentials, Download, NetworkConfig, Progress, ProxyConfig, ProxyMode};
 use rg_grab::{GrabEvent, GrabFile, GrabRules, ScanOptions};
-use rg_resolve::{MediaEvent, MediaProgress, MediaRequest, MediaStage, Tools};
+use rg_resolve::{MediaEvent, MediaProgress, MediaRequest, MediaStage, PairRequest, Tools};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -84,6 +84,31 @@ pub struct DownloadUpdate {
     pub notice: Option<String>,
 }
 
+/// A separate audio DASH rendition captured alongside the video track
+/// (Facebook Reels). The GUI merges the two after the video download.
+#[derive(Debug, Clone)]
+pub struct AudioTrack {
+    pub url: String,
+    /// Cookies scoped to the audio host (fall back to the video cookies).
+    pub cookies: Option<String>,
+}
+
+impl AudioTrack {
+    fn from_capture(capture: &rg_bridge::CaptureRequest) -> Option<AudioTrack> {
+        let url = capture.audio_url.as_deref()?.trim().to_string();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return None;
+        }
+        Some(AudioTrack {
+            url,
+            cookies: capture
+                .audio_cookies
+                .clone()
+                .or_else(|| capture.cookies.clone()),
+        })
+    }
+}
+
 pub struct DownloadJob {
     pub id: usize,
     pub run: u64,
@@ -123,6 +148,9 @@ pub struct DownloadJob {
     /// Queue priority (High runs first) and auto-bucket category.
     pub priority: Priority,
     pub category: Category,
+    /// When set, the job downloads this separate audio track and merges it
+    /// into the final video with ffmpeg.
+    pub audio: Option<AudioTrack>,
     /// History entry already written for the current terminal state.
     pub history_recorded: bool,
     /// Phase 6: result of the post-download virus scan, if run.
@@ -476,6 +504,13 @@ struct PopupShared {
     copied_at: Option<Instant>,
     dont_ask_again: bool,
     action: Option<PopupAction>,
+    /// A sibling audio track will be merged into this download.
+    audio_present: bool,
+    /// The capture looks like a video-only DASH rendition; no audio track
+    /// could be identified.
+    audio_missing: bool,
+    /// Full size of the sibling audio track, when the CDN reported it.
+    audio_bytes: Option<u64>,
 }
 
 impl PopupShared {
@@ -496,6 +531,9 @@ impl PopupShared {
             copied_at: None,
             dont_ask_again: false,
             action: None,
+            audio_present: false,
+            audio_missing: false,
+            audio_bytes: None,
         }
     }
 }
@@ -913,6 +951,7 @@ impl RapidGrabApp {
                 cookie.clone(),
                 false,
                 None,
+                None,
             );
         }
         self.grabber.status = format!("Added {count} file(s) to the queue.");
@@ -1129,6 +1168,8 @@ impl RapidGrabApp {
                 restart: j.restart,
                 priority: j.priority,
                 category: j.category,
+                audio_url: j.audio.as_ref().map(|a| a.url.clone()),
+                audio_cookies: j.audio.as_ref().and_then(|a| a.cookies.clone()),
             })
             .collect();
         if let Err(error) = rg_config::save_queue(&specs) {
@@ -1141,6 +1182,10 @@ impl RapidGrabApp {
     /// safer than one that silently resumes after a crash.
     fn restore_queue(&mut self) {
         for spec in rg_config::load_queue() {
+            let audio = spec.audio_url.clone().map(|url| AudioTrack {
+                url,
+                cookies: spec.audio_cookies.clone().or_else(|| spec.cookie.clone()),
+            });
             self.enqueue_with_priority(
                 spec.url,
                 spec.output,
@@ -1153,6 +1198,7 @@ impl RapidGrabApp {
                 spec.restart,
                 None,
                 spec.priority,
+                audio,
             );
         }
     }
@@ -1237,6 +1283,7 @@ impl RapidGrabApp {
                         capture.cookies.clone(),
                         false,
                         None,
+                        AudioTrack::from_capture(&capture),
                     );
                 }
                 self.show_add_panel = true;
@@ -1276,6 +1323,7 @@ impl RapidGrabApp {
                     capture.cookies.clone(),
                     false,
                     None,
+                    AudioTrack::from_capture(&capture),
                 );
             } else {
                 // Always probe: the browser-reported Content-Length can be
@@ -1503,6 +1551,7 @@ impl RapidGrabApp {
             capture.cookies.clone(),
             false,
             None,
+            AudioTrack::from_capture(&capture),
         );
         // `later` already queues (pump_queue starts when a slot is free, the
         // same as Start in this build; IDM starts a part immediately while
@@ -1591,6 +1640,7 @@ impl RapidGrabApp {
             cookie,
             restart,
             credentials,
+            None,
         );
     }
 
@@ -1609,6 +1659,7 @@ impl RapidGrabApp {
         cookie: Option<String>,
         restart: bool,
         credentials: Option<Credentials>,
+        audio: Option<AudioTrack>,
     ) {
         self.enqueue_with_priority(
             url,
@@ -1622,6 +1673,7 @@ impl RapidGrabApp {
             restart,
             credentials,
             Priority::Normal,
+            audio,
         );
     }
 
@@ -1639,6 +1691,7 @@ impl RapidGrabApp {
         restart: bool,
         credentials: Option<Credentials>,
         priority: Priority,
+        audio: Option<AudioTrack>,
     ) {
         if url.trim().is_empty() || output.trim().is_empty() {
             return;
@@ -1687,6 +1740,7 @@ impl RapidGrabApp {
                 ),
                 history_recorded: false,
                 virus: None,
+                audio,
             },
         );
         self.persist_queue();
@@ -1733,6 +1787,7 @@ impl RapidGrabApp {
                 job.cookie.clone(),
                 restart,
                 job.network.clone(),
+                job.audio.clone(),
             )
         }) else {
             return;
@@ -1750,6 +1805,7 @@ impl RapidGrabApp {
             cookie,
             restart,
             network,
+            audio,
         ) = params;
         let task_cancel = cancel.clone();
 
@@ -1771,6 +1827,127 @@ impl RapidGrabApp {
                     notice: None,
                 });
             };
+
+            // Browser captures a DASH rendition pair (Facebook Reels): stream
+            // both, then mux with ffmpeg. Falls back to the regular direct
+            // download when the capture carries no separate audio URL.
+            if let Some(audio) = audio {
+                // Fail before downloading: a silent video is not an acceptable
+                // silent surprise. The configured path wins over PATH.
+                let ffmpeg = ffmpeg_path
+                    .clone()
+                    .or_else(|| rg_resolve::find_tool("ffmpeg"));
+                let Some(ffmpeg) = ffmpeg else {
+                    send(
+                        None,
+                        JobStatus::Failed,
+                        Some(
+                            "ffmpeg is required to merge this video's audio track; \
+                             install it or set its path in Settings"
+                                .to_string(),
+                        ),
+                        None,
+                        None,
+                    );
+                    return;
+                };
+
+                let page_url = referer.clone().unwrap_or_else(|| url.clone());
+                let mut request = PairRequest::new(
+                    page_url.clone(),
+                    url.clone(),
+                    audio.url.clone(),
+                    output.clone(),
+                )
+                .connections(connections)
+                .restart(restart)
+                .network(network.clone())
+                .audio_cookie(
+                    audio
+                        .cookies
+                        .clone()
+                        .or_else(|| cookie.clone())
+                        .unwrap_or_default(),
+                );
+                if let Some(limit) = speed_limit {
+                    request = request.speed_limit(limit);
+                }
+                if let Some(ua) = &user_agent {
+                    request = request.user_agent(ua.clone());
+                }
+                if let Some(r) = &referer {
+                    request = request.referer(r.clone());
+                }
+                if let Some(c) = &cookie {
+                    request = request.cookie(c.clone());
+                }
+                request = request.cancel_flag(task_cancel.clone());
+
+                let tx_pair = tx.clone();
+                let callback = move |event: MediaEvent| {
+                    let (status, progress, output, media) = match event {
+                        MediaEvent::Resolving => (JobStatus::Resolving, None, None, None),
+                        MediaEvent::Resolved { output, .. } => {
+                            (JobStatus::Merging, None, Some(output), None)
+                        }
+                        MediaEvent::Progress(progress) => {
+                            let status = if progress.stage == MediaStage::Merging {
+                                JobStatus::Merging
+                            } else {
+                                JobStatus::Downloading
+                            };
+                            (status, None, None, Some(progress))
+                        }
+                        MediaEvent::Merging => (JobStatus::Merging, None, None, None),
+                        MediaEvent::Done { output, .. } => {
+                            (JobStatus::Merging, None, Some(output), None)
+                        }
+                    };
+                    let _ = tx_pair.send(DownloadUpdate {
+                        id,
+                        run,
+                        progress,
+                        status,
+                        error: None,
+                        failure: FailureKind::Other,
+                        output,
+                        media,
+                        notice: None,
+                    });
+                };
+
+                match rg_resolve::download_pair(&ffmpeg, request, callback).await {
+                    Ok(path) => {
+                        send(None, JobStatus::Completed, None, Some(path), None);
+                    }
+                    Err(error) if error.is_cancelled() => {
+                        send(None, JobStatus::Cancelled, None, None, None);
+                    }
+                    Err(error) => {
+                        // Distinguish "install ffmpeg" from "ffmpeg ran and
+                        // the merge failed" — the latter usually means the
+                        // captured companion held no audio track.
+                        let hint = match &error {
+                            rg_resolve::ResolveError::FfmpegMissing => {
+                                "\nInstall ffmpeg or set its path in Settings."
+                            }
+                            _ => {
+                                "\nThe separate audio track could not be merged. \
+                                 The video is kept as a hidden .rgvideo sidecar \
+                                 next to the output and is resumed on retry."
+                            }
+                        };
+                        send(
+                            None,
+                            JobStatus::Failed,
+                            Some(format!("{error}{hint}")),
+                            None,
+                            None,
+                        );
+                    }
+                }
+                return;
+            }
 
             let mut dl = Download::new(url.clone(), output.clone())
                 .connections(connections)
@@ -2308,7 +2485,7 @@ impl RapidGrabApp {
                 }
                 Action::HistoryRetry(index) => {
                     if let Some(entry) = self.history_cache.get(index).cloned() {
-                        self.enqueue(entry.url.clone(), entry.output.clone(), self.settings.connections.max(1), None, entry.sha256.clone(), None, None, None, false, None);
+                        self.enqueue(entry.url.clone(), entry.output.clone(), self.settings.connections.max(1), None, entry.sha256.clone(), None, None, None, false, None, None);
                         self.page = Page::Downloads;
                     }
                 }
@@ -2549,8 +2726,20 @@ impl RapidGrabApp {
             // URL, which downloads directly just like any other file.
             let is_media_page = pending.capture.source.as_deref() == Some("media")
                 && !rg_bridge::is_media_file_url(&pending.capture.url);
+            let audio_bytes = pending.capture.audio_content_length;
+            let audio_present = pending
+                .capture
+                .audio_url
+                .as_deref()
+                .map(|url| url.starts_with("http://") || url.starts_with("https://"))
+                .unwrap_or(false);
+            let audio_missing = !audio_present && pending.capture.audio_missing;
+            let base_size = if pending.probing {
+                None
+            } else {
+                pending.size
+            };
             let (size_label, type_label) = if is_media_page {
-                // No probe type exists until Start; hide the empty chip.
                 ("Video page".to_string(), String::new())
             } else {
                 // While probing, the stored size may be the browser's
@@ -2559,7 +2748,8 @@ impl RapidGrabApp {
                 let size_label = if pending.probing {
                     "Resolving\u{2026}".to_string()
                 } else {
-                    match pending.size {
+                    let combined = base_size.map(|video| video + audio_bytes.unwrap_or(0));
+                    match combined {
                         Some(bytes) => human_bytes(bytes),
                         None => "Unknown size".to_string(),
                     }
@@ -2599,6 +2789,9 @@ impl RapidGrabApp {
                     pending.content_type.as_deref(),
                 );
                 shared.size_partial = pending.size_partial;
+                shared.audio_present = audio_present;
+                shared.audio_missing = audio_missing;
+                shared.audio_bytes = audio_bytes;
                 shared.folder = pending.folder.clone();
                 shared.name_stem = pending.name_stem.clone();
                 shared.name_ext = pending.name_ext.clone();
@@ -2636,6 +2829,9 @@ impl RapidGrabApp {
                 let full_url = state.url.clone();
                 let kind = state.file_kind;
                 let partial = state.size_partial;
+                let audio_only = state.file_kind == 2 && state.source_label == "media";
+                let audio_present = state.audio_present;
+                let audio_missing = state.audio_missing;
                 let size_label = state.size_label.clone();
                 let host_label = state.host_label.clone();
                 let copied_active = state
@@ -2838,6 +3034,37 @@ impl RapidGrabApp {
                                         )
                                         .on_hover_text(
                                             "The server didn't report a full size; the final size may differ.",
+                                        );
+                                    }
+                                    if audio_only {
+                                        widgets::chip(
+                                            ui,
+                                            "Audio only",
+                                            theme::WARNING,
+                                        )
+                                        .on_hover_text(
+                                            "Only an audio track was found for this player. The file is not a video.",
+                                        );
+                                    }
+                                    if audio_present {
+                                        widgets::chip(
+                                            ui,
+                                            "Video + audio",
+                                            theme::ACCENT,
+                                        )
+                                        .on_hover_text(
+                                            "The player streamed the video and audio tracks separately; \
+                                             they will be merged with ffmpeg automatically.",
+                                        );
+                                    } else if audio_missing {
+                                        widgets::chip(
+                                            ui,
+                                            "Video only",
+                                            theme::WARNING,
+                                        )
+                                        .on_hover_text(
+                                            "No separate audio track was found for this player; \
+                                             the file will not play any sound.",
                                         );
                                     }
                                 });

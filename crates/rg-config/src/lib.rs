@@ -414,6 +414,12 @@ pub struct QueuedJobSpec {
     pub priority: Priority,
     #[serde(default)]
     pub category: Category,
+    /// Separate audio DASH rendition to merge into the video after download
+    /// (Facebook Reels). Absent for normal single-URL jobs.
+    #[serde(default)]
+    pub audio_url: Option<String>,
+    #[serde(default)]
+    pub audio_cookies: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]

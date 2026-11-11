@@ -508,6 +508,11 @@ impl PopupApp {
             content_disposition_filename: self.capture.content_disposition_filename.clone(),
             content_type: self.capture.content_type.clone(),
             content_length: self.capture.content_length.clone(),
+            audio_url: self.capture.audio_url.clone(),
+            audio_content_type: self.capture.audio_content_type.clone(),
+            audio_content_length: self.capture.audio_content_length.clone(),
+            audio_cookies: self.capture.audio_cookies.clone(),
+            audio_missing: self.capture.audio_missing,
             source: self.capture.source.clone(),
             auto_start: false,
             output: Some(self.output_path()),
@@ -544,7 +549,13 @@ impl eframe::App for PopupApp {
             let size_label = if probe.probing {
                 "Resolving…".to_string()
             } else {
-                match probe.size {
+                let audio_bytes = self.capture.audio_content_length.unwrap_or(0);
+                // A DASH pair shows the merged (final) size.
+                let combined = probe
+                    .size
+                    .or(self.capture.content_length)
+                    .map(|video| video + audio_bytes);
+                match combined {
                     Some(bytes) => human_bytes(bytes),
                     None => "Unknown size".to_string(),
                 }
@@ -568,6 +579,19 @@ impl eframe::App for PopupApp {
             &self.display_name,
             probe.content_type.as_deref().or(self.capture.content_type.as_deref()),
         );
+        // A media-button capture that only produced an audio track is a
+        // problem to surface, not a video to start silently.
+        let is_audio_only =
+            self.capture.source.as_deref() == Some("media") && kind == FileKind::Audio;
+        // A DASH pair: the extension kept the sibling audio URL alongside the
+        // video one. The final file is the sum of both.
+        let audio_present = self
+            .capture
+            .audio_url
+            .as_deref()
+            .map(|url| url.starts_with("http://") || url.starts_with("https://"))
+            .unwrap_or(false);
+        let audio_missing = !audio_present && self.capture.audio_missing;
         // Short type chip: "MP4" not "video/mp4".
         let type_chip = type_label
             .rsplit('/')
@@ -735,6 +759,22 @@ impl eframe::App for PopupApp {
                             if probe.size_partial && !probe.probing {
                                 chip(ui, "Size may be incomplete", WARNING, 0.14).on_hover_text(
                                     "The server didn't report a full size; the final size may differ.",
+                                );
+                            }
+                            if is_audio_only {
+                                chip(ui, "Audio only", WARNING, 0.14).on_hover_text(
+                                    "Only an audio track was found for this player. The file is not a video.",
+                                );
+                            }
+                            if audio_present {
+                                chip(ui, "Video + audio", ACCENT, 0.14).on_hover_text(
+                                    "The player streamed the video and audio tracks separately; \
+                                     they will be merged with ffmpeg automatically.",
+                                );
+                            } else if audio_missing {
+                                chip(ui, "Video only", WARNING, 0.14).on_hover_text(
+                                    "No separate audio track was found for this player; \
+                                     the file will not play any sound.",
                                 );
                             }
                         });
@@ -1036,6 +1076,11 @@ fn main() -> Result<()> {
                 content_disposition_filename: None,
                 content_type: None,
                 content_length: None,
+                audio_url: None,
+                audio_content_type: None,
+                audio_content_length: None,
+                audio_cookies: None,
+                audio_missing: false,
                 source: None,
                 auto_start: false,
                 output: None,

@@ -174,6 +174,8 @@ pub fn is_generic_title(title: &str) -> bool {
             | "home"
             | "feed"
             | "reels"
+            | "reel viewer"
+            | "reels viewer"
             | "videoplayback"
             | "download"
             | "file"
@@ -427,12 +429,25 @@ fn extension_from_url(url: &str) -> Option<String> {
     (!ext.is_empty()).then_some(ext)
 }
 
+fn is_audio_type(content_type: &str) -> bool {
+    mime(content_type).starts_with("audio/")
+}
+
 fn choose_extension(url: &str, content_type: Option<&str>, media_capture: bool) -> String {
-    if let Some(ext) = extension_from_url(url) {
-        return ext;
-    }
+    let url_ext = extension_from_url(url);
     if let Some(ext) = content_type.and_then(extension_for_content_type) {
+        // A DASH audio track is often served from a *.mp4 URL. Never name it
+        // as a video file.
+        if content_type.is_some_and(is_audio_type) {
+            return format!(".{ext}");
+        }
+        if let Some(ext) = url_ext {
+            return ext;
+        }
         return format!(".{ext}");
+    }
+    if let Some(ext) = url_ext {
+        return ext;
     }
     if media_capture {
         return ".mp4".to_string();
@@ -712,6 +727,36 @@ mod tests {
     }
 
     #[test]
+    fn chooses_audio_extension_for_audio_tracks() {
+        // A DASH audio track is often served from a .mp4 URL: the name must
+        // not claim a video file.
+        let name = default_capture_name(&NamingContext {
+            title: Some("Cool reel post"),
+            content_disposition: None,
+            filename: None,
+            url: "https://video.fbcdn.net/v/t39.25447-2/abc_n.mp4?oe=DFE",
+            referer: None,
+            content_type: Some("audio/mp4"),
+            media_capture: true,
+        });
+        assert_eq!(name, "Cool reel post.m4a");
+    }
+
+    #[test]
+    fn keeps_video_extension_for_mp4_tracks() {
+        let name = default_capture_name(&NamingContext {
+            title: Some("Cool reel post"),
+            content_disposition: None,
+            filename: None,
+            url: "https://video.fbcdn.net/v/t39.25447-2/abc_n.mp4?oe=DFE",
+            referer: None,
+            content_type: Some("video/mp4"),
+            media_capture: true,
+        });
+        assert_eq!(name, "Cool reel post.mp4");
+    }
+
+    #[test]
     fn leaves_unknown_types_alone() {
         assert_eq!(
             infer_output_path(
@@ -744,6 +789,8 @@ mod tests {
             "player",
             "Untitled",
             "Facebook",
+            "Reels viewer",
+            "Reel viewer",
             "videoplayback",
             "download",
             "file",
