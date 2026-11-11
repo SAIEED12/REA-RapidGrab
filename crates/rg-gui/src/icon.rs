@@ -6,16 +6,16 @@ use std::sync::OnceLock;
 use eframe::egui;
 
 /// 1024x1024 master logo. Regenerate with `tools/make-logo.ps1`.
-const LOGO_PNG: &[u8] = include_bytes!("../../../assets/logo.png");
+pub const LOGO_PNG: &[u8] = include_bytes!("../../../assets/logo.png");
 
 /// Decoded RGBA8 pixels plus dimensions.
-struct Logo {
-    rgba: Vec<u8>,
-    width: u32,
-    height: u32,
+pub struct Logo {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
 }
 
-fn logo() -> &'static Logo {
+pub fn logo() -> &'static Logo {
     static LOGO: OnceLock<Logo> = OnceLock::new();
     LOGO.get_or_init(|| {
         let (rgba, width, height) =

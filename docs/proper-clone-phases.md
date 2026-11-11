@@ -58,11 +58,13 @@ Gate: schedule an overnight queue; category auto-routing verified. ✅ (manual: 
 Gate: grab all MP4s from a test site and batch-download them ✅ (manual: open Grabber, scan a page with MP4 links, tick the results, Add selected → files land in `Downloads\Video`). YouTube without a system yt-dlp ⏸ deferred with vendoring.
 `crates/rg-grab` — extraction, crawl traversal, depth/page caps, extension/pattern filters, robots, cancellation; `crates/rg-resolve` — bundled-tool search order.
 
-## Phase 6 — Polish + release (2–3 days)
-- Tray icon, balloon notifications, auto-start, CLI parity (`rapidgrab get` exists).
-- Virus-check hook (deferred from Phase 5): `virus_check_command` with a `{file}` placeholder, Defender preset, result shown on the card, off by default.
-- Signed CRX + Firefox XPI via store channels.
-- Screenshots 1920×1080 + 640×520; manual checklist (popup per browser, resume, scheduler, grabber, Bengali titles).
+## Phase 6 — Polish + release (2–3 days) ✅ IMPLEMENTED (manual verification/signing pending)
+- Tray icon, balloon notifications, auto-start, CLI parity. ✅ GUI: Win32 tray (`crates/rg-gui/src/tray.rs`) with show/start-stop queue/open downloads/exit menu, close-to-tray (`CancelClose` + hide), tray Exit, balloon notifications on complete/failure (suppressed behavior configurable), `--minimized` start. Application settings: tray/close-to-tray/notify toggles, Start with Windows (HKCU Run) + start minimized. CLI: `rapidgrab get` now accepts optional `--output` (derived via shared naming + `--dir`/`--title`), `--referer`, `--cookie`, and `--virus-check`/`--virus-command`.
+- Virus-check hook (deferred from Phase 5): `virus_check_command` with a `{file}` placeholder, Defender preset, off by default. ✅ GUI settings with Defender auto-detect/fill (`MpCmdRun.exe`, newest Platform preferred), background scan on completion and manual scan path, result stored on job (`Clean`/`Threat`/`Error` with message). CLI runs the same post-download scan when requested.
+- Signed CRX + Firefox XPI via store channels. ✅ Added `tools/rapidgrab-extension/manifest.firefox.json` (gecko id/background scripts), `tools/pack-extension.ps1` (Chrome zip + optional CRX, Firefox unsigned XPI, updates.xml template), and `docs/release.md` documenting CWS/Edge/AMO, self-hosted CRX policy limits, and native-host ID alignment.
+- Screenshots 1920×1080 + 640×520; manual checklist (popup per browser, resume, scheduler, grabber, Bengali titles). ✅ Added `tools/screenshots.ps1`, `docs/release-checklist.md` (includes tray/balloons/autostart/Defender/CLI cases); popup preview frames can be re-captured, GUI shots and full manual/browser/store sign-off remain to be completed on target environments.
+
+Note: implementation is uncommitted. Some Phase 6 UI polish items (e.g. dedicated virus-status chip/action rendering on every card) may need follow-up during manual verification.
 
 ## Analysis note (Ghidra)
 Static IDM pass used REA/Ghidra 12.1.4 (`IDMan.exe` overview `ev_17be9aca…`, string/procedure searches). Before Phase 1, targeted Ghidra pass: `IDMMsgHost.exe` stdio protocol, `Download File Info` dialog resources in `IDMan.exe` `.rsrc`, `content.js` heuristics in the Edge CRX — to mirror behavior, not copy assets.

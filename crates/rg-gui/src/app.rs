@@ -125,6 +125,8 @@ pub struct DownloadJob {
     pub category: Category,
     /// History entry already written for the current terminal state.
     pub history_recorded: bool,
+    /// Phase 6: result of the post-download virus scan, if run.
+    pub virus: Option<crate::virus::VirusResult>,
 }
 
 impl DownloadJob {
@@ -151,6 +153,7 @@ struct JobView {
     elapsed: Duration,
     priority: Priority,
     category: Category,
+    virus: Option<crate::virus::VirusResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +203,27 @@ struct Settings {
     schedule_stop: String,
     #[serde(default)]
     after_queue: AfterAction,
+
+    // --- Phase 6: tray, notifications, auto-start, virus check ---
+    #[serde(default = "default_true")]
+    tray_enabled: bool,
+    #[serde(default = "default_true")]
+    close_to_tray: bool,
+    #[serde(default = "default_true")]
+    notify_on_complete: bool,
+    #[serde(default = "default_true")]
+    notify_on_failure: bool,
+    /// Run at Windows sign-in (HKCU Run).
+    #[serde(default)]
+    start_with_windows: bool,
+    /// When started with Windows, launch minimized to tray.
+    #[serde(default = "default_true")]
+    start_minimized: bool,
+    #[serde(default)]
+    virus_check_enabled: bool,
+    /// Command template with `{file}` placeholder.
+    #[serde(default)]
+    virus_check_command: String,
 }
 
 fn default_auto_resolve() -> bool {
@@ -207,6 +231,10 @@ fn default_auto_resolve() -> bool {
 }
 
 fn default_organize() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -239,6 +267,14 @@ impl Default for Settings {
             schedule_start: String::new(),
             schedule_stop: String::new(),
             after_queue: AfterAction::None,
+            tray_enabled: true,
+            close_to_tray: true,
+            notify_on_complete: true,
+            notify_on_failure: true,
+            start_with_windows: false,
+            start_minimized: true,
+            virus_check_enabled: false,
+            virus_check_command: String::new(),
         }
     }
 }
@@ -258,6 +294,7 @@ enum Action {
     HistoryRetry(usize),
     HistoryOpen(usize),
     HistoryFolder(usize),
+    VirusCheck(usize),
     ClearHistory,
     GrabStart,
     GrabCancel,
@@ -348,6 +385,14 @@ pub struct RapidGrabApp {
     probe_tx: Sender<(String, Option<u64>, Option<String>, bool)>,
     grab_rx: Receiver<GrabEvent>,
     grab_tx: Sender<GrabEvent>,
+    virus_rx: Receiver<(usize, u64, crate::virus::VirusResult)>,
+    virus_tx: Sender<(usize, u64, crate::virus::VirusResult)>,
+    tray_rx: Receiver<crate::tray::TrayCommand>,
+    tray: Option<crate::tray::TrayHandle>,
+    /// Shared queue-paused flag observed by the tray menu for live state/label.
+    tray_paused: Arc<AtomicBool>,
+    /// Becomes true if the user explicitly exits via tray/menu (bypasses close-to-tray).
+    exiting: bool,
     #[allow(dead_code)]
     pipe_guard: Option<rg_bridge::PipeGuard>,
     jobs: HashMap<usize, DownloadJob>,
@@ -598,6 +643,8 @@ impl RapidGrabApp {
         let (capture_tx, capture_rx) = unbounded::<rg_bridge::CaptureRequest>();
         let (probe_tx, probe_rx) = unbounded::<(String, Option<u64>, Option<String>, bool)>();
         let (grab_tx, grab_rx) = unbounded::<GrabEvent>();
+        let (virus_tx, virus_rx) = unbounded::<(usize, u64, crate::virus::VirusResult)>();
+        let (tray_tx, tray_rx) = unbounded::<crate::tray::TrayCommand>();
         let repaint_ctx = cc.egui_ctx.clone();
         let pipe_guard = if cfg!(windows) {
             rg_bridge::listen(move |req| {
@@ -621,7 +668,7 @@ impl RapidGrabApp {
         // is the source of truth and overlays the eframe copy (migration).
         let shared = AppConfig::load();
         let shared_exists = rg_config::settings_path().is_file();
-        let settings = Settings {
+        let mut settings = Settings {
             max_concurrent: settings.max_concurrent.clamp(1, 8),
             connections: settings.connections.clamp(1, 16),
             organize_by_category: if shared_exists {
@@ -667,6 +714,18 @@ impl RapidGrabApp {
             ..settings
         };
 
+        // Reflect actual registry state so the UI toggle is never stale.
+        #[cfg(windows)]
+        {
+            settings.start_with_windows = crate::autostart::is_enabled();
+        }
+        let tray_paused = Arc::new(AtomicBool::new(settings.queue_paused));
+        let tray = if settings.tray_enabled {
+            crate::tray::start(cc.egui_ctx.clone(), tray_tx, tray_paused.clone())
+        } else {
+            None
+        };
+
         let mut app = Self {
             rt,
             update_rx,
@@ -676,6 +735,12 @@ impl RapidGrabApp {
             probe_tx,
             grab_rx,
             grab_tx,
+            virus_rx,
+            virus_tx,
+            tray_rx,
+            tray,
+            tray_paused,
+            exiting: false,
             pipe_guard,
             jobs: HashMap::new(),
             next_id: 1,
@@ -731,6 +796,12 @@ impl RapidGrabApp {
         if let Err(error) = self.shared_config().save() {
             tracing::warn!("could not save shared config: {error}");
         }
+    }
+
+    /// Update the logical queue-paused state and keep the tray menu in sync.
+    fn apply_queue_paused(&mut self, paused: bool) {
+        self.settings.queue_paused = paused;
+        self.tray_paused.store(paused, Ordering::Relaxed);
     }
 
     /// Crawl rules built from the Grabber form.
@@ -849,6 +920,151 @@ impl RapidGrabApp {
     }
 
     /// Drains scanner events (called from both `logic` and `ui`).
+    fn pump_tray_commands(&mut self, ctx: &egui::Context) {
+        while let Ok(cmd) = self.tray_rx.try_recv() {
+            match cmd {
+                crate::tray::TrayCommand::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                crate::tray::TrayCommand::ToggleQueue => {
+                    let paused = !self.settings.queue_paused;
+                    self.apply_queue_paused(paused);
+                    self.last_notice = Some(if paused {
+                        "Queue stopped".to_string()
+                    } else {
+                        "Queue started".to_string()
+                    });
+                    self.persist_shared();
+                }
+                crate::tray::TrayCommand::OpenDownloads => {
+                    let dir = dirs::download_dir()
+                        .or_else(|| {
+                            self.settings
+                                .last_dir
+                                .is_empty()
+                                .then_some(std::path::PathBuf::from("."))
+                                .or_else(|| Some(std::path::PathBuf::from(&self.settings.last_dir)))
+                        })
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    let _ = open::that(dir);
+                }
+                crate::tray::TrayCommand::Exit => {
+                    self.exiting = true;
+                    if let Some(tray) = &self.tray {
+                        tray.shutdown();
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    fn pump_virus_events(&mut self) {
+        while let Ok((id, run, result)) = self.virus_rx.try_recv() {
+            if let Some(job) = self.jobs.get_mut(&id) {
+                if job.run == run {
+                    let is_threat = result.status == crate::virus::VirusStatus::Threat;
+                    let threat_msg = result.message.clone();
+                    let name = job
+                        .output
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "download".to_string());
+                    job.virus = Some(result);
+                    if is_threat {
+                        self.last_notice = Some(format!("Threat detected: {name}"));
+                        if let Some(tray) = &self.tray {
+                            let msg = truncate_url(&format!("{name}: {threat_msg}"), 220);
+                            tray.notify(
+                                "Threat detected",
+                                &msg,
+                                crate::tray::BalloonKind::Warning,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn maybe_notify_complete(&self, file_name: &str, bytes: u64) {
+        if !self.settings.notify_on_complete {
+            return;
+        }
+        // Suppress balloons while the window is focused/visible enough to see.
+        // (We can't easily know focus here without ctx; keep simple: notify always
+        // unless tray disabled. Better: check visibility via ctx in logic, but this
+        // method has no ctx - acceptable tradeoff.)
+        if let Some(tray) = &self.tray {
+            let msg = if bytes > 0 {
+                format!("{} ({})", file_name, human_bytes(bytes))
+            } else {
+                file_name.to_string()
+            };
+            tray.notify("Download complete", &msg, crate::tray::BalloonKind::Info);
+        }
+    }
+
+    fn maybe_notify_failure(&self, path: &std::path::Path, error: &str) {
+        if !self.settings.notify_on_failure {
+            return;
+        }
+        if let Some(tray) = &self.tray {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "download".to_string());
+            let msg = truncate_url(&format!("{name}: {error}"), 220);
+            tray.notify("Download failed", &msg, crate::tray::BalloonKind::Warning);
+        }
+    }
+
+    fn maybe_start_virus_scan(&self, id: usize, run: u64, output: &std::path::Path) {
+        if !self.settings.virus_check_enabled {
+            return;
+        }
+        let cmd = self.settings.virus_check_command.trim();
+        if cmd.is_empty() {
+            return;
+        }
+        let cmd = cmd.to_string();
+        let path = output.to_path_buf();
+        let tx = self.virus_tx.clone();
+        std::thread::Builder::new()
+            .name("rapidgrab-virus-scan".into())
+            .spawn(move || {
+                let result = crate::virus::run_scan(&cmd, &path);
+                let _ = tx.send((id, run, result));
+            })
+            .ok();
+    }
+
+    fn start_virus_scan_for(&self, id: usize) {
+        let Some(job) = self.jobs.get(&id) else {
+            return;
+        };
+        if !matches!(job.status, JobStatus::Completed) {
+            return;
+        }
+        let cmd = self.settings.virus_check_command.trim();
+        if cmd.is_empty() {
+            return;
+        }
+        let cmd = cmd.to_string();
+        let path = job.output.clone();
+        let run = job.run;
+        let tx = self.virus_tx.clone();
+        std::thread::Builder::new()
+            .name("rapidgrab-virus-scan".into())
+            .spawn(move || {
+                let result = crate::virus::run_scan(&cmd, &path);
+                let _ = tx.send((id, run, result));
+            })
+            .ok();
+    }
+
     fn pump_grab_events(&mut self) {
         while let Ok(event) = self.grab_rx.try_recv() {
             match event {
@@ -1470,6 +1686,7 @@ impl RapidGrabApp {
                         .unwrap_or(""),
                 ),
                 history_recorded: false,
+                virus: None,
             },
         );
         self.persist_queue();
@@ -1969,11 +2186,13 @@ impl RapidGrabApp {
                 if let Some(started) = job.started_at.take() {
                     job.elapsed += started.elapsed();
                 }
-                let bytes = if bytes_done > 0 {
-                    bytes_done
-                } else {
-                    std::fs::metadata(&job.output).map(|m| m.len()).unwrap_or(0)
-                };
+                // The last progress sample can be far smaller than the final
+                // file (a fast single-stream download may complete before the
+                // next 500 ms progress tick), so prefer the on-disk size,
+                // which is authoritative once the download has finished.
+                let bytes = std::fs::metadata(&job.output)
+                    .map(|m| m.len())
+                    .unwrap_or(bytes_done);
                 Self::record_history(job, "completed", bytes);
                 // Daily cap bookkeeping.
                 if bytes > 0 {
@@ -1983,21 +2202,32 @@ impl RapidGrabApp {
                         tracing::warn!("could not record daily usage: {error}");
                     }
                 }
+                let output_path = job.output.clone();
+                let file_name = output_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "download".to_string());
                 job.progress = None;
                 job.media = None;
                 job.status = JobStatus::Completed;
                 job.error = None;
+                // Phase 6: notification + optional virus scan.
+                self.maybe_notify_complete(&file_name, bytes);
+                self.maybe_start_virus_scan(update.id, update.run, &output_path);
             }
             JobStatus::Failed => {
                 if let Some(started) = job.started_at.take() {
                     job.elapsed += started.elapsed();
                 }
                 Self::record_history(job, "failed", bytes_done);
+                let err = update.error.clone().unwrap_or_else(|| "Download failed".to_string());
+                let output_path = job.output.clone();
                 job.progress = None;
                 job.media = None;
                 job.status = JobStatus::Failed;
                 job.error = update.error;
                 job.failure = update.failure;
+                self.maybe_notify_failure(&output_path, &err);
             }
             _ => {}
         }
@@ -2067,7 +2297,7 @@ impl RapidGrabApp {
                     queue_changed = true;
                 }
                 Action::ToggleQueue => {
-                    self.settings.queue_paused = !self.settings.queue_paused;
+                    self.apply_queue_paused(!self.settings.queue_paused);
                     self.persist_shared();
                 }
                 Action::ShowPage(page) => {
@@ -2101,6 +2331,7 @@ impl RapidGrabApp {
                 Action::GrabStart => self.start_grab(),
                 Action::GrabCancel => self.cancel_grab(),
                 Action::GrabAdd => self.add_selected(),
+                Action::VirusCheck(id) => self.start_virus_scan_for(id),
             }
         }
         if queue_changed {
@@ -2121,11 +2352,11 @@ impl RapidGrabApp {
                 rg_config::parse_hhmm(&self.settings.schedule_stop),
             );
             if inside && self.settings.queue_paused {
-                self.settings.queue_paused = false;
+                self.apply_queue_paused(false);
                 self.persist_shared();
                 self.last_notice = None;
             } else if !inside && !self.settings.queue_paused {
-                self.settings.queue_paused = true;
+                self.apply_queue_paused(true);
                 self.persist_shared();
                 self.last_notice = Some("Scheduler: queue stopped outside the configured window".into());
             }
@@ -2219,6 +2450,7 @@ impl RapidGrabApp {
                 elapsed: j.total_elapsed(),
                 priority: j.priority,
                 category: j.category,
+                virus: j.virus.clone(),
             })
             .collect();
         views.sort_by_key(|v| v.id);
@@ -2788,9 +3020,22 @@ impl eframe::App for RapidGrabApp {
     /// Runs even when the main window is minimized/hidden (unlike `ui()`),
     /// so captures still open the popup while the GUI stays out of the way.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Close-to-tray: intercept the window close button.
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.settings.tray_enabled
+            && self.settings.close_to_tray
+            && self.tray.is_some()
+            && !self.exiting
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
         while let Ok(update) = self.update_rx.try_recv() {
             self.apply_update(update);
         }
+        self.pump_virus_events();
+        self.pump_tray_commands(ctx);
         self.pump_grab_events();
         self.handle_captures();
         self.pump_queue();
@@ -2800,6 +3045,14 @@ impl eframe::App for RapidGrabApp {
         }
         if self.grabber.scanning {
             ctx.request_repaint_after(Duration::from_millis(150));
+        }
+        // Keep ticking while the window is minimized/hidden (close-to-tray).
+        // `ui()` is not called then, so without this repaint request the
+        // engine's progress/completion updates would sit unprocessed in the
+        // channel until the window is shown again — the download would look
+        // stuck and history/queue would not update.
+        if self.jobs.values().any(|j| j.status.is_active()) {
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
     }
 
@@ -2825,8 +3078,23 @@ impl eframe::App for RapidGrabApp {
             schedule_start: self.settings.schedule_start.clone(),
             schedule_stop: self.settings.schedule_stop.clone(),
             after_queue: self.settings.after_queue,
+            tray_enabled: self.settings.tray_enabled,
+            close_to_tray: self.settings.close_to_tray,
+            notify_on_complete: self.settings.notify_on_complete,
+            notify_on_failure: self.settings.notify_on_failure,
+            start_with_windows: self.settings.start_with_windows,
+            start_minimized: self.settings.start_minimized,
+            virus_check_enabled: self.settings.virus_check_enabled,
+            virus_check_command: self.settings.virus_check_command.clone(),
         };
         eframe::set_value(storage, SETTINGS_KEY, &settings);
+        #[cfg(windows)]
+        {
+            let _ = crate::autostart::set_enabled(
+                self.settings.start_with_windows,
+                self.settings.start_minimized,
+            );
+        }
         // Mirror the shared fields for the standalone popup process.
         self.persist_shared();
         self.persist_queue();
@@ -3424,6 +3692,83 @@ fn add_download_card(ui: &mut egui::Ui, app: &mut RapidGrabApp) {
 
         widgets::divider(ui);
 
+        widgets::collapsible(ui, "rg-application", "Application", false, |ui| {
+            ui.spacing_mut().item_spacing.y = theme::SP_XS;
+            widgets::checkbox(
+                ui,
+                "rg-tray-enabled",
+                &mut app.settings.tray_enabled,
+                "Show tray icon",
+            );
+            widgets::checkbox(
+                ui,
+                "rg-close-to-tray",
+                &mut app.settings.close_to_tray,
+                "Minimize to tray when the window is closed",
+            );
+            ui.add_space(theme::SP_XS);
+            widgets::checkbox(
+                ui,
+                "rg-notify-complete",
+                &mut app.settings.notify_on_complete,
+                "Notify when a download completes",
+            );
+            widgets::checkbox(
+                ui,
+                "rg-notify-failure",
+                &mut app.settings.notify_on_failure,
+                "Notify when a download fails",
+            );
+            ui.add_space(theme::SP_XS);
+            widgets::checkbox(
+                ui,
+                "rg-start-windows",
+                &mut app.settings.start_with_windows,
+                "Start RapidGrab with Windows",
+            );
+            widgets::checkbox(
+                ui,
+                "rg-start-minimized",
+                &mut app.settings.start_minimized,
+                "Start minimized to tray",
+            );
+            ui.add_space(theme::SP_XS);
+            widgets::checkbox(
+                ui,
+                "rg-virus-enabled",
+                &mut app.settings.virus_check_enabled,
+                "Scan completed downloads with an external antivirus command",
+            );
+            ui.add(egui::Label::new(theme::label("Virus-check command ({file} placeholder)")));
+            widgets::text_field(
+                ui,
+                widgets::Field::new("rg-virus-cmd", "scanner \"{file}\""),
+                &mut app.settings.virus_check_command,
+            );
+            if widgets::button(
+                ui,
+                "Use Windows Defender",
+                widgets::ButtonKind::Secondary,
+                true,
+            )
+            .clicked()
+            {
+                if let Some(path) = crate::virus::find_defender() {
+                    app.settings.virus_check_command = crate::virus::defender_template(&path);
+                    app.settings.virus_check_enabled = true;
+                } else {
+                    app.last_notice = Some(
+                        "Windows Defender (MpCmdRun.exe) was not found on this system.".to_string(),
+                    );
+                }
+            }
+            ui.add(egui::Label::new(theme::caption_tertiary(
+                "Runs after a download completes. {file} is replaced with the downloaded file path; if omitted, the path is appended. Off by default.",
+            )));
+        });
+
+        widgets::divider(ui);
+
         if app.settings.auto_resolve {
             widgets::info_line(
                 ui,
@@ -3943,8 +4288,9 @@ fn downloads_section(
         return;
     }
 
+    let virus_scan_available = !app.settings.virus_check_command.trim().is_empty();
     for view in views {
-        job_card(ui, view, actions);
+        job_card(ui, view, actions, virus_scan_available);
         ui.add_space(theme::SP_M);
     }
 }
@@ -4150,7 +4496,12 @@ fn job_actions(ui: &mut egui::Ui, view: &JobView, actions: &mut Vec<Action>) {
 }
 
 /// One download card in the queue.
-fn job_card(ui: &mut egui::Ui, view: &JobView, actions: &mut Vec<Action>) {
+fn job_card(
+    ui: &mut egui::Ui,
+    view: &JobView,
+    actions: &mut Vec<Action>,
+    virus_scan_available: bool,
+) {
     let name = view_name(&view.url, &view.output);
     let progress = progress_view(view);
 
@@ -4196,6 +4547,57 @@ fn job_card(ui: &mut egui::Ui, view: &JobView, actions: &mut Vec<Action>) {
                 fraction,
                 progress.color,
             );
+            ui.add_space(theme::SP_XS);
+        }
+
+        if view.status == JobStatus::Completed {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = theme::SP_S;
+                match &view.virus {
+                    Some(result) => {
+                        let color = match result.status {
+                            crate::virus::VirusStatus::Clean => theme::SUCCESS,
+                            crate::virus::VirusStatus::Threat => theme::ERROR,
+                            crate::virus::VirusStatus::Error => theme::WARNING,
+                        };
+                        widgets::chip(ui, result.status.label(), color)
+                            .on_hover_text(&result.message);
+                        if virus_scan_available {
+                            if widgets::button(
+                                ui,
+                                "Scan again",
+                                widgets::ButtonKind::Secondary,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                actions.push(Action::VirusCheck(view.id));
+                            }
+                        }
+                    }
+                    None => {
+                        if virus_scan_available {
+                            widgets::chip(ui, "Not scanned", theme::TEXT_SECONDARY);
+                            if widgets::button(
+                                ui,
+                                "Run scan",
+                                widgets::ButtonKind::Secondary,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                actions.push(Action::VirusCheck(view.id));
+                            }
+                        }
+                    }
+                }
+            });
+            if let Some(result) = &view.virus {
+                if result.status == crate::virus::VirusStatus::Threat {
+                    ui.add_space(theme::SP_XS);
+                    widgets::alert(ui, &result.message, theme::ERROR);
+                }
+            }
             ui.add_space(theme::SP_XS);
         }
 

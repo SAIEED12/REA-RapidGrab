@@ -2,13 +2,17 @@
 
 mod app;
 mod args;
+mod autostart;
 mod icon;
+mod tray;
 mod ui;
+mod virus;
 
 use eframe::egui;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> eframe::Result<()> {
+    let start_minimized = std::env::args().any(|a| a == "--minimized");
     // Daily rolling file log under %APPDATA%\RapidGrab\logs\ (Phase 4), in
     // addition to the console logger in debug builds.
     let log_dir = rg_config::logs_dir();
@@ -24,12 +28,15 @@ fn main() -> eframe::Result<()> {
         .with_ansi(false)
         .init();
 
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([860.0, 720.0])
+        .with_min_inner_size([640.0, 520.0])
+        .with_title("RapidGrab")
+        .with_icon(icon::window_icon())
+        .with_visible(!start_minimized);
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([860.0, 720.0])
-            .with_min_inner_size([640.0, 520.0])
-            .with_title("RapidGrab")
-            .with_icon(icon::window_icon()),
+        viewport,
         ..Default::default()
     };
 

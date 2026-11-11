@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+﻿use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -22,9 +22,12 @@ enum Command {
     /// Download a URL (resumes automatically when parts exist)
     Get {
         url: String,
-        /// Output file path
+        /// Output file path (derived from title/URL when omitted)
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
+        /// Directory for the derived output name (defaults to Downloads)
+        #[arg(long)]
+        dir: Option<PathBuf>,
         /// Parallel connections
         #[arg(short = 'n', long, default_value_t = rg_core::DEFAULT_CONNECTIONS)]
         connections: usize,
@@ -40,7 +43,16 @@ enum Command {
         /// Override the User-Agent header
         #[arg(long)]
         user_agent: Option<String>,
-        /// Manual proxy endpoint (`host:port`, `http://…`, `socks5://…`)
+        /// Referer header (useful for protected downloads)
+        #[arg(long)]
+        referer: Option<String>,
+        /// Cookie header value
+        #[arg(long)]
+        cookie: Option<String>,
+        /// Page/video title used to derive the output name when --output is omitted
+        #[arg(long)]
+        title: Option<String>,
+        /// Manual proxy endpoint (`host:port`, `http://â€¦`, `socks5://â€¦`)
         #[arg(long, value_name = "URL")]
         proxy: Option<String>,
         /// Proxy username (Basic auth)
@@ -82,6 +94,12 @@ enum Command {
         /// Extra argument passed to yt-dlp, for example --yt-dlp-arg=--cookies-from-browser
         #[arg(long = "yt-dlp-arg", value_name = "ARG")]
         yt_dlp_args: Vec<String>,
+        /// Scan the completed file with an external command (off by default)
+        #[arg(long)]
+        virus_check: bool,
+        /// Virus-check command template with {file} placeholder (implies --virus-check)
+        #[arg(long, value_name = "CMD")]
+        virus_command: Option<String>,
     },
     /// Resolve a media page and print the selected streams without downloading
     Resolve {
@@ -116,11 +134,15 @@ async fn main() -> Result<()> {
         Command::Get {
             url,
             output,
+            dir,
             connections,
             limit,
             restart,
             sha256,
             user_agent,
+            referer,
+            cookie,
+            title,
             proxy,
             proxy_user,
             proxy_pass,
@@ -135,7 +157,25 @@ async fn main() -> Result<()> {
             yt_dlp,
             ffmpeg,
             yt_dlp_args,
+            virus_check,
+            virus_command,
         } => {
+            let output = output.unwrap_or_else(|| {
+                let base = dir
+                    .or_else(dirs::download_dir)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let name = rg_core::default_capture_name(&rg_core::NamingContext {
+                    title: title.as_deref(),
+                    content_disposition: None,
+                    filename: None,
+                    url: &url,
+                    referer: referer.as_deref(),
+                    content_type: None,
+                    media_capture: false,
+                });
+                let name = rg_core::unique_file_name(&base, &name);
+                base.join(name)
+            });
             let network = network_config(
                 proxy,
                 proxy_user,
@@ -154,11 +194,15 @@ async fn main() -> Result<()> {
                 restart,
                 sha256.as_deref(),
                 user_agent.as_deref(),
+                referer.as_deref(),
+                cookie.as_deref(),
                 allow_html,
                 &network,
             )
             .await;
 
+            let run_virus = virus_check || virus_command.as_ref().is_some_and(|s| !s.trim().is_empty());
+            let virus_cmd = virus_command.clone();
             match direct {
                 Ok(stats) => {
                     eprintln!();
@@ -170,6 +214,9 @@ async fn main() -> Result<()> {
                         stats.ranged,
                         stats.output.display()
                     );
+                    if run_virus {
+                        run_cli_virus_check(&stats.output, virus_cmd.as_deref());
+                    }
                 }
                 Err(rg_core::Error::WebPage {
                     content_type,
@@ -202,6 +249,9 @@ async fn main() -> Result<()> {
                         started.elapsed().as_secs_f64(),
                         path.display()
                     );
+                    if run_virus {
+                        run_cli_virus_check(&path, virus_cmd.as_deref());
+                    }
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -351,6 +401,8 @@ async fn direct_download(
     restart: bool,
     sha256: Option<&str>,
     user_agent: Option<&str>,
+    referer: Option<&str>,
+    cookie: Option<&str>,
     allow_html: bool,
     network: &NetworkConfig,
 ) -> std::result::Result<rg_core::Stats, rg_core::Error> {
@@ -367,6 +419,12 @@ async fn direct_download(
     }
     if let Some(ua) = user_agent {
         dl = dl.user_agent(ua.to_string());
+    }
+    if let Some(r) = referer.filter(|s| !s.trim().is_empty()) {
+        dl = dl.referer(r.to_string());
+    }
+    if let Some(c) = cookie.filter(|s| !s.trim().is_empty()) {
+        dl = dl.cookie(c.to_string());
     }
     dl = dl.on_progress(|p: Progress| {
         let pct = if p.total > 0 {
@@ -430,5 +488,106 @@ fn print_media_event(event: MediaEvent) {
             eprintln!();
             eprintln!("saved {} bytes to {}", bytes, output.display());
         }
+    }
+}
+
+fn split_cli_args(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut has_content = false;
+    let mut quote = '\0';
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if quoted {
+            if ch == quote {
+                quoted = false;
+            } else if quote == '"' && ch == '\\' {
+                match chars.next() {
+                    Some('"') => current.push('"'),
+                    Some(next) => { current.push('\\'); current.push(next); }
+                    None => current.push('\\'),
+                }
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if ch.is_whitespace() {
+            if has_content { args.push(std::mem::take(&mut current)); has_content = false; }
+        } else if ch == '\'' || ch == '"' {
+            quote = ch; quoted = true; has_content = true;
+        } else { current.push(ch); has_content = true; }
+    }
+    if has_content { args.push(current); }
+    args
+}
+
+#[cfg(windows)]
+fn find_defender_cli() -> Option<PathBuf> {
+    let platform_root = PathBuf::from(r"C:\ProgramData\Microsoft\Windows Defender\Platform");
+    if let Ok(entries) = std::fs::read_dir(&platform_root) {
+        let mut candidates: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().join("MpCmdRun.exe"))
+            .filter(|p| p.exists())
+            .collect();
+        candidates.sort();
+        if let Some(p) = candidates.pop() { return Some(p); }
+    }
+    for fallback in [
+        r"C:\Program Files\Windows Defender\MpCmdRun.exe",
+        r"C:\Program Files (x86)\Windows Defender\MpCmdRun.exe",
+    ] {
+        let p = PathBuf::from(fallback);
+        if p.exists() { return Some(p); }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn find_defender_cli() -> Option<PathBuf> { None }
+
+fn run_cli_virus_check(file: &Path, command: Option<&str>) {
+    let template = command
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            find_defender_cli().map(|p| format!("\"{}\" -Scan -ScanType 3 -File \"{{file}}\"", p.display()))
+        });
+    let Some(template) = template else {
+        eprintln!("virus check: no scanner configured (pass --virus-command or install Windows Defender)");
+        return;
+    };
+    let file_str = file.display().to_string();
+    let substituted = if template.contains("{file}") {
+        template.replace("{file}", &file_str)
+    } else {
+        format!("{} \"{}\"", template.trim(), file_str)
+    };
+    let parts = split_cli_args(&substituted);
+    let Some((program, args)) = parts.split_first() else {
+        eprintln!("virus check: empty command");
+        return;
+    };
+    eprintln!("virus check: scanning {}", file.display());
+    match std::process::Command::new(program).args(args).output() {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let text = if stdout.trim().is_empty() { stderr.trim() } else { stdout.trim() };
+            match out.status.code() {
+                Some(0) => println!("virus check: clean"),
+                Some(2) => {
+                    println!("virus check: THREAT DETECTED");
+                    if !text.is_empty() { println!("{text}"); }
+                }
+                code => {
+                    println!("virus check: error (exit {:?})", code);
+                    if !text.is_empty() { println!("{text}"); }
+                }
+            }
+        }
+        Err(e) => eprintln!("virus check: could not start scanner: {e}"),
     }
 }
