@@ -7,6 +7,8 @@ Run on a machine with the desktop app installed and the extension loaded for the
 - [ ] **Popup — Chrome:** click a direct download link and a media player button; popup appears with correct title/extension, no `RESOLVED ON START` chip, full-name tooltip, wrapped chips; Start and Download Later work.
 - [ ] **Popup — Edge:** same as Chrome.
 - [ ] **Popup — Firefox:** same as Chrome (native host registered with the Firefox extension ID).
+- [ ] **No popup storm after boot:** sign out/in (Chrome auto-starts in the background) — restored download history must not open any RapidGrab window.
+- [ ] **Popup serialization:** start three downloads within a few seconds — windows appear one at a time, never stacked.
 - [ ] **Intercepted download:** a `Content-Disposition: attachment; filename="..."` download keeps the server filename (unless generic) and starts in the chosen category folder.
 - [ ] **Bengali titles:** YouTube/Facebook Bengali titles render without tofu boxes in the popup and GUI (Nirmala UI fallback); grapheme truncation does not break conjuncts.
 - [ ] **Collision naming:** saving to a folder where the name exists suggests `name (1).ext` (and increments).

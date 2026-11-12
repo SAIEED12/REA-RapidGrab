@@ -56,6 +56,12 @@ const NAVIGATION_TYPES = new Set(["main_frame", "sub_frame", "object"]);
 const recentCaptures = new Map();
 const CAPTURE_WINDOW_MS = 30000;
 
+// Chrome re-fires `downloads.onCreated` for every item restored from the
+// download history when the browser starts. A restored item keeps the start
+// time of the original attempt, while a new capture's start time is "now", so
+// anything older than this is history and must not open a RapidGrab window.
+const RESTORED_DOWNLOAD_GRACE_MS = 2 * 60 * 1000;
+
 // tabId -> [{ url, kind, type, time }] (newest first): the recent streaming
 // media responses seen on that tab, classified. MSE players (Facebook, …)
 // play from blob: URLs, so the player button cannot read `currentSrc`; this is
@@ -537,8 +543,21 @@ async function handleIntercept(details) {
 /// response headers. The header path above usually fires first (and gets the
 /// richer file name); this catches flows the headers miss.
 function onDownloadCreated(downloadItem) {
-  const url = stripRangeParams(downloadItem.finalUrl || downloadItem.url || "");
   const when = Date.now();
+
+  // Only a download that just started is a capture. Chrome replays the whole
+  // download history through this event on startup (complete and cancelled
+  // entries included), which used to open one confirm window per entry — the
+  // stack of "New download — RapidGrab" windows after every boot.
+  const startedAt = Date.parse(downloadItem.startTime || "");
+  if (Number.isFinite(startedAt) && when - startedAt > RESTORED_DOWNLOAD_GRACE_MS) {
+    return;
+  }
+  if (downloadItem.state && downloadItem.state !== "in_progress") return;
+  // Duplicates we cancelled ourselves must never reopen the popup.
+  if (downloadItem.byExtensionId && downloadItem.byExtensionId === api.runtime.id) return;
+
+  const url = stripRangeParams(downloadItem.finalUrl || downloadItem.url || "");
   pruneMap(capturedDownloads, when, 60000);
   pruneMap(ackedUrls, when, 60000);
 

@@ -19,9 +19,64 @@ fn popup_exe_path() -> Option<std::path::PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+/// Serializes confirm windows across host processes.
+///
+/// Chrome starts one host per capture, so a burst of downloads would otherwise
+/// stack one "New download" window per capture. A named mutex keeps a single
+/// RapidGrab window on screen at a time; the other hosts wait their turn.
+#[cfg(windows)]
+struct PopupLock(winapi::um::winnt::HANDLE);
+
+#[cfg(windows)]
+impl PopupLock {
+    fn acquire() -> Option<Self> {
+        use winapi::um::handleapi::CloseHandle;
+        use winapi::um::synchapi::{CreateMutexW, WaitForSingleObject};
+        use winapi::um::winbase::{WAIT_ABANDONED, WAIT_OBJECT_0};
+
+        let name: Vec<u16> = "Local\\RapidGrab-Popup\0".encode_utf16().collect();
+        let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return None;
+        }
+        // Abandoned means the previous popup process died without releasing;
+        // the mutex is granted to us in that case too.
+        let waited = unsafe { WaitForSingleObject(handle, 5 * 60 * 1000) };
+        if waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED {
+            Some(Self(handle))
+        } else {
+            unsafe { CloseHandle(handle) };
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PopupLock {
+    fn drop(&mut self) {
+        unsafe {
+            winapi::um::synchapi::ReleaseMutex(self.0);
+            winapi::um::handleapi::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+struct PopupLock;
+
+#[cfg(not(windows))]
+impl PopupLock {
+    fn acquire() -> Option<Self> {
+        Some(Self)
+    }
+}
+
 fn run_popup(request: &rg_bridge::CaptureRequest) -> Result<rg_bridge::CaptureRequest> {
     let exe = popup_exe_path()
         .ok_or_else(|| anyhow::anyhow!("rapidgrab-popup.exe not found next to the host"))?;
+    // Wait for the previous capture's window to close before showing ours.
+    // The lock is held until this popup exits (dropped at the end of the fn).
+    let _lock = PopupLock::acquire();
     let mut child = Command::new(exe)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
