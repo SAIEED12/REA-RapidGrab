@@ -10,7 +10,7 @@ use rg_core::{Download, Error as CoreError, NetworkConfig, Progress};
 
 use crate::error::{ResolveError, Result};
 use crate::metadata::{self, SelectedStream, Selection};
-use crate::tools::{Runner, SystemRunner, Tools};
+use crate::tools::{find_tool, Runner, SystemRunner, Tools};
 
 /// Everything needed for one media download.
 #[derive(Debug, Clone)]
@@ -432,6 +432,13 @@ pub async fn merge_streams(
     }
     args.push(output.display().to_string());
 
+    tracing::info!(
+        video = %video.display(),
+        audio = %audio.display(),
+        output = %output.display(),
+        "muxing the video and audio tracks"
+    );
+
     let run = runner.run(ffmpeg, &args);
     tokio::pin!(run);
 
@@ -461,6 +468,75 @@ pub async fn merge_streams(
             } else {
                 message
             },
+        });
+    }
+
+    // `-c copy` succeeds even when the input expected to hold the audio is a
+    // second video rendition: the result is a perfectly valid, silent file.
+    // Never report that as a successful merge.
+    if let Err(error) = verify_audio_track(runner, ffmpeg, output).await {
+        let _ = tokio::fs::remove_file(output).await;
+        return Err(error);
+    }
+    tracing::info!(
+        output = %output.display(),
+        "merged file verified: audio stream present"
+    );
+    Ok(())
+}
+
+/// Locate `ffprobe`, preferring the copy shipped next to the configured
+/// `ffmpeg` (portable builds keep the pair together).
+fn ffprobe_beside(ffmpeg: &Path) -> Option<PathBuf> {
+    if let Some(dir) = ffmpeg.parent() {
+        for name in ["ffprobe.exe", "ffprobe"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    find_tool("ffprobe")
+}
+
+/// Confirm the muxed file really carries an audio stream.
+///
+/// `Ok(())` when `ffprobe` is unavailable or cannot read the file: the merge
+/// itself succeeded, and a missing probe must not fail the job. It fails only
+/// when the probe runs and reports no audio stream.
+async fn verify_audio_track(runner: &dyn Runner, ffmpeg: &Path, output: &Path) -> Result<()> {
+    let Some(ffprobe) = ffprobe_beside(ffmpeg) else {
+        tracing::debug!("ffprobe not found; skipping the merged-audio check");
+        return Ok(());
+    };
+    let args = vec![
+        "-v".to_string(),
+        "error".to_string(),
+        "-select_streams".to_string(),
+        "a".to_string(),
+        "-show_entries".to_string(),
+        "stream=index".to_string(),
+        "-of".to_string(),
+        "csv=p=0".to_string(),
+        output.display().to_string(),
+    ];
+    let result = match runner.run(&ffprobe, &args).await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::warn!("could not run ffprobe to verify the merged audio: {error}");
+            return Ok(());
+        }
+    };
+    if !result.success {
+        tracing::warn!(
+            "ffprobe could not read {}; skipping the merged-audio check",
+            output.display()
+        );
+        return Ok(());
+    }
+    if String::from_utf8_lossy(&result.stdout).trim().is_empty() {
+        return Err(ResolveError::NoAudio {
+            path: output.display().to_string(),
         });
     }
     Ok(())

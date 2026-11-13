@@ -36,6 +36,9 @@ pub enum ResolveError {
     #[error("yt-dlp found no usable {kind} stream")]
     NoStream { kind: &'static str },
 
+    #[error("the merged file has no audio stream: {path}")]
+    NoAudio { path: String },
+
     #[error("yt-dlp returned invalid JSON: {0}")]
     Json(#[from] serde_json::Error),
 

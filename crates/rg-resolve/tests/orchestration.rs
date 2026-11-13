@@ -333,11 +333,23 @@ async fn downloads_video_and_audio_then_merges() {
     assert!(progress.iter().all(|p| (0.0..=0.97).contains(&p.overall)));
 
     let calls = runner.calls();
-    assert_eq!(calls.len(), 2, "expected resolve + merge");
-    assert!(calls[1].0.contains("ffmpeg"));
-    assert!(calls[1].1.iter().any(|arg| arg == "-c"));
-    assert!(calls[1].1.iter().any(|arg| arg == "copy"));
-    assert!(calls[1].1.iter().any(|arg| arg == "+faststart"));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|(name, _)| name.contains("yt-dlp"))
+            .count(),
+        1,
+        "expected exactly one resolve"
+    );
+    // The merge is followed by an optional ffprobe audio check, so select the
+    // ffmpeg call by name instead of assuming it is the last one.
+    let merge = calls
+        .iter()
+        .find(|(name, _)| name.contains("ffmpeg"))
+        .expect("expected a merge call");
+    assert!(merge.1.iter().any(|arg| arg == "-c"));
+    assert!(merge.1.iter().any(|arg| arg == "copy"));
+    assert!(merge.1.iter().any(|arg| arg == "+faststart"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

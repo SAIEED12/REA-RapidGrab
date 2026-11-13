@@ -140,7 +140,7 @@ pub async fn download_pair_with(
     let video_tmp = media::sidecar_path(&request.output, "rgvideo", &video_ext);
     let audio_tmp = media::sidecar_path(&request.output, "rgaudio", &audio_ext);
 
-    tracing::debug!(
+    tracing::info!(
         "paired media download: video={video_tmp:?} audio={audio_tmp:?} output={:?}",
         request.output
     );

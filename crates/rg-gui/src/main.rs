@@ -21,12 +21,29 @@ fn main() -> eframe::Result<()> {
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("rg_core=info,rg_gui=info")),
+            // `rg_resolve` carries the stream-pairing and mux decisions; without
+            // it a silent (video-only) download leaves no trace in the log.
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // The GUI binary target is `rapidgrab-gui`, so its tracing
+                // target is `rapidgrab_gui` (not the package name `rg_gui`).
+                EnvFilter::new("rg_core=info,rg_resolve=info,rapidgrab_gui=info,rg_gui=info")
+            }),
         )
         .with_writer(non_blocking)
         .with_ansi(false)
         .init();
+
+    // Which binary is actually running: a stale build (for example an old
+    // `target\debug` copy) silently ignores capture fields it does not know,
+    // so the version and path belong in every log.
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        profile = if cfg!(debug_assertions) { "debug" } else { "release" },
+        exe = %std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "unknown".to_string()),
+        "RapidGrab starting"
+    );
 
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([860.0, 720.0])

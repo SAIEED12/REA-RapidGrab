@@ -95,8 +95,12 @@ pub struct AudioTrack {
 
 impl AudioTrack {
     fn from_capture(capture: &rg_bridge::CaptureRequest) -> Option<AudioTrack> {
-        let url = capture.audio_url.as_deref()?.trim().to_string();
+        let raw = capture.audio_url.as_deref()?;
+        let url = raw.trim().to_string();
         if !(url.starts_with("http://") || url.starts_with("https://")) {
+            // A present-but-unusable audio URL means the capture expected a
+            // mux; staying quiet here would produce a silent video.
+            tracing::warn!("capture carried an unusable audio URL; pairing skipped: {raw:?}");
             return None;
         }
         Some(AudioTrack {
